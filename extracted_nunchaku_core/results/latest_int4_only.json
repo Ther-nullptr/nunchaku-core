@@ -1,0 +1,10 @@
+{
+  "m": 4096,
+  "in_features": 4096,
+  "out_features": 4096,
+  "dtype": "fp16",
+  "fp16_ms": 0.6395251214504242,
+  "int4_only_ms": 1.1040921592712403,
+  "int4_only_speedup_vs_fp16": 0.5792316484454929,
+  "int4_only_mae_vs_fp16": 11.381354331970215
+}

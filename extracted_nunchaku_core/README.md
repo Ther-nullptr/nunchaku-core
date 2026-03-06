@@ -31,3 +31,9 @@ The benchmark reports:
 
 - `svdq_speedup_vs_fp16`: INT4 main + FP16 low-rank branch
 - `int4_only_speedup_vs_fp16`: INT4 main only
+
+For the dedicated 4-bit-only extraction path (without low-rank branch):
+
+```bash
+python benchmarks/benchmark_int4_only.py --dtype fp16
+```

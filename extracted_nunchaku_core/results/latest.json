@@ -1,0 +1,14 @@
+{
+  "m": 4096,
+  "in_features": 4096,
+  "out_features": 4096,
+  "rank": 32,
+  "dtype": "fp16",
+  "fp16_ms": 0.6381222414970398,
+  "svdq_ms": 1.2909273552894591,
+  "int4_only_ms": 1.094520320892334,
+  "svdq_speedup_vs_fp16": 0.49431305245983914,
+  "int4_only_speedup_vs_fp16": 0.5830154354528524,
+  "svdq_mae_vs_fp16": 11.296113014221191,
+  "int4_only_mae_vs_fp16": 11.381354331970215
+}

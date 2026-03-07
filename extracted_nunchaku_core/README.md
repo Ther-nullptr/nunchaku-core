@@ -37,3 +37,16 @@ For the dedicated 4-bit-only extraction path (without low-rank branch):
 ```bash
 python benchmarks/benchmark_int4_only.py --dtype fp16
 ```
+
+## Native FP4 Operators
+
+This directory also includes native nunchaku FP4 wrappers:
+
+- `native_fp4.NunchakuFP4GemmOp`: pure FP4 GEMM operator.
+- `native_fp4.NunchakuFP4LowRankOp`: FP4 main branch + FP16 low-rank branch.
+
+Benchmark against PyTorch FP16:
+
+```bash
+python benchmarks/benchmark_nunchaku_native_fp4.py --dtype fp16
+```

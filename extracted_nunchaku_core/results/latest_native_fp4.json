@@ -1,0 +1,14 @@
+{
+  "m": 4096,
+  "in_features": 4096,
+  "out_features": 4096,
+  "rank": 32,
+  "dtype": "fp16",
+  "fp16_ms": 0.645347843170166,
+  "fp4_gemm_ms": 0.1419308802485466,
+  "fp4_hybrid_ms": 0.18985216051340104,
+  "fp4_gemm_speedup_vs_fp16": 4.546916372533203,
+  "fp4_hybrid_speedup_vs_fp16": 3.3992125316088413,
+  "fp4_gemm_mae_vs_fp16": 73.5331039428711,
+  "fp4_hybrid_mae_vs_fp16": 73.01144409179688
+}

@@ -233,6 +233,9 @@ class NunchakuFP4LowRankOp(NunchakuFP4GemmOp):
         lora_down_packed = pack_lowrank_weight(lora_down_dense, down=True)
         lora_up_packed = pack_lowrank_weight(lora_up_dense, down=False)
 
+        # Keep dense low-rank factors for validation/debug (not saved in checkpoints).
+        self.register_buffer("lora_down_dense", lora_down_dense.contiguous(), persistent=False)
+        self.register_buffer("lora_up_dense", lora_up_dense.contiguous(), persistent=False)
         self.register_buffer("lora_down_packed", lora_down_packed.contiguous(), persistent=True)
         self.register_buffer("lora_up_packed", lora_up_packed.contiguous(), persistent=True)
         self._lora_scales = [1.0] * ceil_divide(rank, 16)

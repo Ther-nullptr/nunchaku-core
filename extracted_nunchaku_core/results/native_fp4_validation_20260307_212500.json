@@ -1,0 +1,48 @@
+{
+  "shape": {
+    "m": 333,
+    "in_features": 3072,
+    "out_features": 3584,
+    "rank": 32,
+    "dtype": "fp16"
+  },
+  "errors": {
+    "pure_wrapper_vs_manual": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "hybrid_wrapper_vs_manual": {
+      "max_abs": 0.125,
+      "mae": 5.554671588470228e-06,
+      "rel_l2": 7.234044766937435e-06
+    },
+    "zero_up_invariant": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "zero_down_invariant": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "pure_vs_fp16": {
+      "max_abs": 402.375,
+      "mae": 63.59251022338867,
+      "rel_l2": 1.4383576660019681
+    },
+    "hybrid_vs_fp16": {
+      "max_abs": 398.1875,
+      "mae": 63.02505874633789,
+      "rel_l2": 1.4257356432330088
+    }
+  },
+  "checks": {
+    "pure_wrapper_rel_l2_lt_1e-7": true,
+    "hybrid_wrapper_rel_l2_lt_2e-5": true,
+    "zero_up_rel_l2_lt_2e-5": true,
+    "zero_down_rel_l2_lt_2e-5": true
+  },
+  "all_passed": true
+}

@@ -1,0 +1,48 @@
+{
+  "shape": {
+    "m": 1024,
+    "in_features": 4096,
+    "out_features": 4096,
+    "rank": 32,
+    "dtype": "fp16"
+  },
+  "errors": {
+    "pure_wrapper_vs_manual": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "hybrid_wrapper_vs_manual": {
+      "max_abs": 0.125,
+      "mae": 4.036173777421936e-06,
+      "rel_l2": 5.889808833772634e-06
+    },
+    "zero_up_invariant": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "zero_down_invariant": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "pure_vs_fp16": {
+      "max_abs": 459.125,
+      "mae": 73.56670379638672,
+      "rel_l2": 1.440193883329647
+    },
+    "hybrid_vs_fp16": {
+      "max_abs": 451.75,
+      "mae": 73.04283905029297,
+      "rel_l2": 1.429877996461068
+    }
+  },
+  "checks": {
+    "pure_wrapper_rel_l2_lt_1e-7": true,
+    "hybrid_wrapper_rel_l2_lt_2e-5": true,
+    "zero_up_rel_l2_lt_2e-5": true,
+    "zero_down_rel_l2_lt_2e-5": true
+  },
+  "all_passed": true
+}

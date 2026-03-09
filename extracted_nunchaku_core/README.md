@@ -67,3 +67,9 @@ Benchmark against PyTorch FP16:
 ```bash
 python benchmarks/benchmark_nunchaku_native_fp4.py --dtype fp16
 ```
+
+FP4+BF16 fusion ablation (fused vs non-fused low-rank branch):
+
+```bash
+python benchmarks/benchmark_fp4_bf16_fusion_ablation.py --dtype fp16 --lowrank-dtype bf16
+```

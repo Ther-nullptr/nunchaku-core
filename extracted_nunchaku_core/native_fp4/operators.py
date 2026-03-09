@@ -287,3 +287,52 @@ class NunchakuFP4LowRankOp(NunchakuFP4GemmOp):
 
         out = out[: x2d_src.shape[0], : self.out_features]
         return out.reshape(*orig_shape[:-1], self.out_features)
+
+
+class NunchakuFP4LowRankUnfusedOp(NunchakuFP4LowRankOp):
+    """FP4 main branch + standalone BF16/FP16 low-rank branch (no kernel fusion)."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        rank: int = 32,
+        lowrank_dtype: torch.dtype = torch.bfloat16,
+    ):
+        if lowrank_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("lowrank_dtype must be float16 or bfloat16")
+        super().__init__(weight=weight, bias=bias, rank=rank)
+        self.lowrank_dtype = lowrank_dtype
+        self.register_buffer(
+            "lora_up_dense_lr",
+            self.lora_up_dense.to(lowrank_dtype).contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lora_down_dense_lr",
+            self.lora_down_dense.to(lowrank_dtype).contiguous(),
+            persistent=False,
+        )
+
+    def lowrank_only_padded(self, x2d: torch.Tensor) -> torch.Tensor:
+        x_lr = x2d.to(self.lowrank_dtype)
+        lora_act = torch.matmul(x_lr, self.lora_down_dense_lr.t())
+        lora_out = torch.matmul(lora_act, self.lora_up_dense_lr.t())
+        return lora_out.to(self.weight_pad.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.in_features:
+            raise ValueError(f"Expected input last dim = {self.in_features}, got {x.shape[-1]}")
+
+        orig_shape = x.shape
+        x2d_src = x.reshape(-1, self.in_features)
+        x2d = x2d_src
+        if self.k_pad != self.in_features:
+            x2d = pad_tensor(x2d, divisor=self.k_pad, dim=1)
+
+        qact, ascales = self.quantize_input(x2d)
+        out_main = self.forward_prequantized(qact, ascales)
+        out = out_main + self.lowrank_only_padded(x2d)
+
+        out = out[: x2d_src.shape[0], : self.out_features]
+        return out.reshape(*orig_shape[:-1], self.out_features)

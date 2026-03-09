@@ -1,0 +1,22 @@
+{
+  "m": 4096,
+  "in_features": 4096,
+  "out_features": 4096,
+  "rank": 64,
+  "dtype": "fp16",
+  "lowrank_dtype": "bf16",
+  "fp16_ms": 0.6437450667222341,
+  "fp4_only_ms": 0.13732906728982924,
+  "fp4_bf16_fused_ms": 0.19243626594543456,
+  "fp4_bf16_unfused_ms": 0.30372479955355325,
+  "lowrank_only_unfused_ms": 0.12395626828074455,
+  "fp4_only_speedup_vs_fp16": 4.687609691279907,
+  "fused_speedup_vs_fp16": 3.3452377781263354,
+  "unfused_speedup_vs_fp16": 2.1195011657542566,
+  "unfused_over_fused": 1.5783137240860547,
+  "fused_over_fp4_only": 1.4012784747114249,
+  "unfused_over_fp4_only": 2.2116570479034157,
+  "fused_mae_vs_fp16": 72.5107192993164,
+  "unfused_mae_vs_fp16": 72.5107421875,
+  "unfused_vs_fused_mae": 0.045663051307201385
+}

@@ -1,29 +1,20 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 import torch
 
 
-def _load_nunchaku_c_ops():
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates = sorted((repo_root / "nunchaku").glob("_C*.so"))
-    if not candidates:
-        raise RuntimeError(f"Cannot find nunchaku extension under {repo_root / 'nunchaku'}")
-
-    so_path = candidates[0]
-    # Extension exports PyInit__C.
-    spec = importlib.util.spec_from_file_location("_C", so_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load extension spec: {so_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.ops
+def _load_fp4_backend_ops():
+    try:
+        from nunchaku_core import _fp4_native_cuda as module
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import nunchaku_core._fp4_native_cuda. "
+            "Please build extracted_nunchaku_core with `python setup.py build_ext --inplace` first."
+        ) from exc
+    return module
 
 
-_OPS = _load_nunchaku_c_ops()
+_OPS = _load_fp4_backend_ops()
 
 
 def ceil_divide(x: int, y: int) -> int:

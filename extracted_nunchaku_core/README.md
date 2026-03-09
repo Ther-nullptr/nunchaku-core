@@ -40,10 +40,27 @@ python benchmarks/benchmark_int4_only.py --dtype fp16
 
 ## Native FP4 Operators
 
-This directory also includes native nunchaku FP4 wrappers:
+This directory now contains a fully self-contained native FP4 backend:
+
+- Backend CUDA/C++ source: `fp4_backend/src/`
+- PyBind entry: `csrc/fp4_native_ops.cpp`
+- Built extension: `nunchaku_core._fp4_native_cuda`
+
+The FP4 MMA execution path is inside:
+
+- `fp4_backend/src/kernels/zgemm/gemm_w4a4.cuh` (`mma_fp4` + `mma.sync...mxf4nvf4`)
+
+Python wrappers:
 
 - `native_fp4.NunchakuFP4GemmOp`: pure FP4 GEMM operator.
 - `native_fp4.NunchakuFP4LowRankOp`: FP4 main branch + FP16 low-rank branch.
+
+Build native extensions in-place:
+
+```bash
+conda activate triton
+python setup.py build_ext --inplace
+```
 
 Benchmark against PyTorch FP16:
 

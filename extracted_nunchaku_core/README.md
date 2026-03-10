@@ -12,6 +12,10 @@ This directory isolates the key SVDQuant idea from Nunchaku (paper: https://arxi
 - `benchmarks/`: speed benchmark vs FP16 baseline.
 - `results/`: benchmark outputs.
 
+Optimization summary:
+
+- `OPTIMIZATION_SUMMARY.md`: forward extraction, fusion ablations, backward optimizations, and measured gains on RTX 5090.
+
 ## Build
 
 ```bash

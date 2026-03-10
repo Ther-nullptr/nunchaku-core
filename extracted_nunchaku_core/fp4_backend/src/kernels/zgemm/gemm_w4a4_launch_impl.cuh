@@ -444,6 +444,7 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
                                                                     Tensor oscales,
                                                                     Tensor lora_down,
                                                                     Tensor lora_act_out,
+                                                                    Tensor lora_act_out_dense,
                                                                     Tensor smooth,
                                                                     bool fuse_glu,
                                                                     bool fp4) {
@@ -474,8 +475,16 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
     // assert(lora_down.shape[1] == Lora::LORA_RANK);
     assert(lora_act_out.shape[0] == M);
     assert(lora_act_out.shape[1] == rank);
+    if (lora_act_out_dense.valid()) {
+        assert(lora_act_out_dense.dtype() == Tensor::FP32);
+        assert(lora_act_out_dense.shape[0] == M);
+        assert(lora_act_out_dense.shape[1] == rank);
+    }
 
     lora_act_out.zero_();
+    if (lora_act_out_dense.valid()) {
+        lora_act_out_dense.zero_();
+    }
 
     dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
 
@@ -499,6 +508,7 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
                 .oscales       = oscales.data_ptr<typename kernel::oscales_t>(),
                 .lora_wgt_down = lora_down.data_ptr<packed_fpsum_t>(),
                 .lora_act      = lora_act_out.data_ptr<float>(),
+                .lora_act_dense = lora_act_out_dense.valid() ? lora_act_out_dense.data_ptr<float>() : nullptr,
                 .lora_rank     = rank,
                 .M             = M,
                 .N             = N,

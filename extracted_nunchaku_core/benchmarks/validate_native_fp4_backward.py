@@ -95,6 +95,7 @@ def main() -> None:
     full_shared_recompute = hybrid_dx.backward_full_shared(x, dy)
     full_shared_cached = hybrid_dx.backward_full_shared(x, dy, forward_lora_act=forward_lora_cache)
     full_shared_packed = hybrid_dx.backward_full_shared_packed(x, dy, forward_lora_act=forward_lora_cache)
+    full_shared_dual = hybrid_dx.backward_full_shared_dual(x, dy, forward_lora_act=forward_lora_cache)
 
     x_lr = x.to(dtype)
     dy_lr = dy.to(dtype)
@@ -104,6 +105,10 @@ def main() -> None:
         dy if hybrid_dx.n_pad == hybrid_dx.out_features else torch.nn.functional.pad(dy, (0, hybrid_dx.n_pad - hybrid_dx.out_features))
     )
     dense_dy_up = hybrid_dx.decode_packed_lowrank_act(packed_dy_up)[: dy.shape[0], : hybrid_dx.rank].to(dtype)
+    _, _, packed_dy_up_dual, dense_dy_up_dual = hybrid_dx.quantize_grad_with_lora_dual(
+        dy if hybrid_dx.n_pad == hybrid_dx.out_features else torch.nn.functional.pad(dy, (0, hybrid_dx.n_pad - hybrid_dx.out_features))
+    )
+    dense_dy_up_dual = dense_dy_up_dual[: dy.shape[0], : hybrid_dx.rank].to(dtype)
     full_ref = {
         "dx": dx_hybrid_ref,
         "lora_up_grad": torch.matmul(dy_lr.t(), lora_act),
@@ -152,6 +157,23 @@ def main() -> None:
         < 1e-5,
         "full_shared_packed_down_rel_l2_lt_5e-4": tensor_error(
             full_shared_packed["lora_down_grad"], full_ref["lora_down_grad"]
+        )["rel_l2"]
+        < 5e-4,
+        "dual_dy_up_rel_l2_lt_5e-4": tensor_error(dense_dy_up_dual, dy_up)["rel_l2"] < 5e-4,
+        "dual_packed_matches_standard_rel_l2_lt_5e-4": tensor_error(
+            packed_dy_up_dual.float(), packed_dy_up.float()
+        )["rel_l2"]
+        < 5e-4,
+        "full_shared_dual_dx_matches_fused_rel_l2_lt_5e-4": tensor_error(
+            full_shared_dual["dx"], full_fused["dx"]
+        )["rel_l2"]
+        < 5e-4,
+        "full_shared_dual_up_rel_l2_lt_1e-5": tensor_error(
+            full_shared_dual["lora_up_grad"], full_ref["lora_up_grad"]
+        )["rel_l2"]
+        < 1e-5,
+        "full_shared_dual_down_rel_l2_lt_5e-4": tensor_error(
+            full_shared_dual["lora_down_grad"], full_ref["lora_down_grad"]
         )["rel_l2"]
         < 5e-4,
         "pure_dx_all_finite": bool(torch.isfinite(dx_pure).all().item()),
@@ -205,6 +227,22 @@ def main() -> None:
             ),
             "full_shared_packed_down_vs_fused": tensor_error(
                 full_shared_packed["lora_down_grad"], full_fused["lora_down_grad"]
+            ),
+            "dual_dy_up_vs_reference": tensor_error(dense_dy_up_dual, dy_up),
+            "dual_packed_vs_standard": tensor_error(packed_dy_up_dual.float(), packed_dy_up.float()),
+            "full_shared_dual_dx_vs_reference": tensor_error(full_shared_dual["dx"], full_ref["dx"]),
+            "full_shared_dual_up_vs_reference": tensor_error(
+                full_shared_dual["lora_up_grad"], full_ref["lora_up_grad"]
+            ),
+            "full_shared_dual_down_vs_reference": tensor_error(
+                full_shared_dual["lora_down_grad"], full_ref["lora_down_grad"]
+            ),
+            "full_shared_dual_dx_vs_fused": tensor_error(full_shared_dual["dx"], full_fused["dx"]),
+            "full_shared_dual_up_vs_fused": tensor_error(
+                full_shared_dual["lora_up_grad"], full_fused["lora_up_grad"]
+            ),
+            "full_shared_dual_down_vs_fused": tensor_error(
+                full_shared_dual["lora_down_grad"], full_fused["lora_down_grad"]
             ),
         },
         "checks": checks,

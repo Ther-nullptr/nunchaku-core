@@ -116,6 +116,9 @@ def main() -> None:
     def fp4_full_backward_shared_packed_fn() -> dict[str, torch.Tensor]:
         return hybrid_dx.backward_full_shared_packed(x, dy, forward_lora_act=forward_lora_cache)
 
+    def fp4_full_backward_shared_dual_fn() -> dict[str, torch.Tensor]:
+        return hybrid_dx.backward_full_shared_dual(x, dy, forward_lora_act=forward_lora_cache)
+
     with torch.no_grad():
         dx_ref = fp16_dx_fn().float()
         dx_fp4 = fp4_dx_fn().float()
@@ -139,6 +142,9 @@ def main() -> None:
     fp4_full_backward_shared_packed_ms = time_cuda(
         fp4_full_backward_shared_packed_fn, warmup=args.warmup, iters=args.iters
     )
+    fp4_full_backward_shared_dual_ms = time_cuda(
+        fp4_full_backward_shared_dual_fn, warmup=args.warmup, iters=args.iters
+    )
 
     payload = {
         "m": args.m,
@@ -158,6 +164,7 @@ def main() -> None:
         "fp4_full_backward_shared_recompute_ms": fp4_full_backward_shared_recompute_ms,
         "fp4_full_backward_shared_cached_ms": fp4_full_backward_shared_cached_ms,
         "fp4_full_backward_shared_packed_ms": fp4_full_backward_shared_packed_ms,
+        "fp4_full_backward_shared_dual_ms": fp4_full_backward_shared_dual_ms,
         "fp4_dx_speedup_vs_fp16": fp16_dx_ms / fp4_dx_ms,
         "fp4_dx_hybrid_unfused_speedup_vs_fp16": fp16_dx_ms / fp4_dx_hybrid_unfused_ms,
         "fp4_dx_hybrid_fused_speedup_vs_fp16": fp16_dx_ms / fp4_dx_hybrid_fused_ms,
@@ -166,6 +173,7 @@ def main() -> None:
         "fp4_full_backward_shared_recompute_speedup_vs_fp16": fp16_full_backward_ms / fp4_full_backward_shared_recompute_ms,
         "fp4_full_backward_shared_cached_speedup_vs_fp16": fp16_full_backward_ms / fp4_full_backward_shared_cached_ms,
         "fp4_full_backward_shared_packed_speedup_vs_fp16": fp16_full_backward_ms / fp4_full_backward_shared_packed_ms,
+        "fp4_full_backward_shared_dual_speedup_vs_fp16": fp16_full_backward_ms / fp4_full_backward_shared_dual_ms,
         "repack_speedup_vs_python": repack_python_ms / repack_ms,
         "repack_over_fp4_dx": repack_ms / fp4_dx_ms,
         "repack_over_fp4_dx_hybrid_fused": repack_ms / fp4_dx_hybrid_fused_ms,
@@ -174,6 +182,8 @@ def main() -> None:
         "shared_recompute_over_fused_full_backward": fp4_full_backward_shared_recompute_ms / fp4_full_backward_fused_ms,
         "shared_packed_over_fused_full_backward": fp4_full_backward_shared_packed_ms / fp4_full_backward_fused_ms,
         "shared_packed_over_cached_full_backward": fp4_full_backward_shared_packed_ms / fp4_full_backward_shared_cached_ms,
+        "shared_dual_over_fused_full_backward": fp4_full_backward_shared_dual_ms / fp4_full_backward_fused_ms,
+        "shared_dual_over_packed_full_backward": fp4_full_backward_shared_dual_ms / fp4_full_backward_shared_packed_ms,
         "fp4_dx_mae_vs_fp16": float((dx_fp4 - dx_ref).abs().mean().item()),
         "fp4_dx_hybrid_mae_vs_fp16": float((dx_hybrid - dx_ref).abs().mean().item()),
     }

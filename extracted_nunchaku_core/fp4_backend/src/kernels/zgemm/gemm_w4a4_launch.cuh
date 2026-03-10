@@ -53,6 +53,7 @@ public:
                                             Tensor oscales,
                                             Tensor lora_down,
                                             Tensor lora_act_out,
+                                            Tensor lora_act_out_dense,
                                             Tensor smooth,
                                             bool fuse_glu,
                                             bool fp4);

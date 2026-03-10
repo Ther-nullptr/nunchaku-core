@@ -93,6 +93,31 @@ public:
         });
     }
 
+    __device__ __forceinline__ static void
+    reduce_lora_act_dense(float *ptr, int bm, int rtile, lora_act_warp val, int rank, bool pred) {
+        const int laneId = threadIdx.x % WARP_SIZE;
+        const int warpId = threadIdx.x / WARP_SIZE;
+
+        const int lane_row       = laneId / 4;
+        const int lane_col_group = laneId % 4;
+        const int block_row_base = bm * BLOCK_M + warpId * WARP_M;
+        const int block_col_base = rtile * WARP_R;
+
+        unrolled_loop<LORA_M_TILES>([&]<int m>() {
+            auto &pack = val[m * LORA_R_TILES + 0];
+            unrolled_loop<8>([&]<int j>() {
+                constexpr int pair_col    = j & 1;
+                constexpr int upper_rows  = (j >> 1) & 1;
+                constexpr int upper_cols  = (j >> 2) & 1;
+                const int row_in_tile     = lane_row + (upper_rows ? 8 : 0);
+                const int col_in_tile     = lane_col_group * 2 + pair_col + (upper_cols ? 8 : 0);
+
+                float *addr = &ptr[(block_row_base + m * 16 + row_in_tile) * rank + block_col_base + col_in_tile];
+                reduce_add_pred(addr, pack.data[j], pred);
+            });
+        });
+    }
+
     // __device__ __forceinline__
     // static void reduce_lora_act(float *ptr, lora_act_warp val, int m) {
     //     const int laneId = threadIdx.x % WARP_SIZE;
@@ -244,6 +269,7 @@ public:
         struct Arguments {
             const packed_fpsum_t *lora_wgt_down;
             float *lora_act;
+            float *lora_act_dense;
 
             int rank;
 
@@ -251,7 +277,14 @@ public:
         };
 
         __device__ __forceinline__ static void
-        apply_lora_down(fpsum_warp &fpsum, float *act, const packed_fpsum_t *wgt, int rank, bool alwaysfalse) {
+        apply_lora_down(
+            const BlockInfo binfo,
+            fpsum_warp &fpsum,
+            float *act,
+            float *act_dense,
+            const packed_fpsum_t *wgt,
+            int rank,
+            bool alwaysfalse) {
             constexpr int NUM_STAGES = 2;
 
             const int laneId = threadIdx.x % WARP_SIZE;
@@ -321,6 +354,9 @@ public:
                     lora_act_warp lora_act = compute(lora_wgt[k2], fpsum);
 
                     reduce_lora_act(act, k1 + k2, lora_act, true);
+                    if (act_dense != nullptr) {
+                        reduce_lora_act_dense(act_dense, binfo.bm, k1 + k2, lora_act, rank, true);
+                    }
                 }
             }
 
@@ -343,9 +379,11 @@ public:
             const int bm = binfo.bm;
             const int bn = binfo.bn;
 
-            apply_lora_down(fpsum,
+            apply_lora_down(binfo,
+                            fpsum,
                             args.lora_act +
                                 bm * (args.rank / WARP_R) * (NUM_WARPS * LORA_M_TILES * LORA_R_TILES * 8 * WARP_SIZE),
+                            args.lora_act_dense,
                             args.lora_wgt_down + bn * (BLOCK_N / 16) * (args.rank / 16) * WARP_SIZE,
                             args.rank,
                             args.alwaysfalse);

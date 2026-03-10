@@ -41,6 +41,7 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor oscales,
                                  Tensor lora_down,
                                  Tensor lora_act_out,
+                                 Tensor lora_act_out_dense = {},
                                  Tensor smooth = {},
                                  bool fuse_glu = false,
                                  bool fp4      = false);

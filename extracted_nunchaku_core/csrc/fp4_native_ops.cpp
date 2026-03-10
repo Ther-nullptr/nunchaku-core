@@ -101,6 +101,34 @@ void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
         getTensor(oscales),
         getTensor(lora_down),
         getTensor(lora_act_out),
+        Tensor{},
+        getTensor(smooth),
+        fuse_glu,
+        fp4);
+}
+
+void quantize_w4a4_act_fuse_lora_dual(std::optional<torch::Tensor> input,
+                                      std::optional<torch::Tensor> output,
+                                      std::optional<torch::Tensor> oscales,
+                                      std::optional<torch::Tensor> lora_down,
+                                      std::optional<torch::Tensor> lora_act_out,
+                                      std::optional<torch::Tensor> lora_act_out_dense,
+                                      std::optional<torch::Tensor> smooth,
+                                      bool fuse_glu,
+                                      bool fp4) {
+    TorchOpContext ctx;
+
+    auto getTensor = [](std::optional<torch::Tensor>& t) {
+        return t.has_value() ? from_torch(t.value()) : Tensor{};
+    };
+
+    nunchaku::kernels::quantize_w4a4_act_fuse_lora(
+        getTensor(input),
+        getTensor(output),
+        getTensor(oscales),
+        getTensor(lora_down),
+        getTensor(lora_act_out),
+        getTensor(lora_act_out_dense),
         getTensor(smooth),
         fuse_glu,
         fp4);
@@ -152,6 +180,7 @@ void decode_lora_act(torch::Tensor packed_lora_act, torch::Tensor dense_lora_act
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_w4a4", nunchaku_core::ops::gemm_w4a4);
     m.def("quantize_w4a4_act_fuse_lora", nunchaku_core::ops::quantize_w4a4_act_fuse_lora);
+    m.def("quantize_w4a4_act_fuse_lora_dual", nunchaku_core::ops::quantize_w4a4_act_fuse_lora_dual);
     m.def("fp4_repack_backward", nunchaku_core::ops::fp4_repack_backward);
     m.def("decode_lora_act", nunchaku_core::ops::decode_lora_act);
 }

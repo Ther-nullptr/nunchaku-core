@@ -97,6 +97,43 @@ def quantize_fp4_act_with_lora(
     return qout, oscales, lora_act_out
 
 
+def quantize_fp4_act_with_lora_dual(
+    x: torch.Tensor,
+    lora_down_packed: torch.Tensor,
+    smooth: torch.Tensor,
+    pad_size: int,
+    dense_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.dim() != 2:
+        raise ValueError(f"Expected x to be 2D, got shape={tuple(x.shape)}")
+    if dense_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("dense_dtype must be float16, bfloat16, or float32")
+
+    batch_size, channels = x.shape
+    rank = lora_down_packed.shape[1]
+    batch_size_pad = ceil_divide(batch_size, pad_size) * pad_size
+
+    qout = torch.empty(batch_size_pad, channels // 2, dtype=torch.uint8, device=x.device)
+    oscales = torch.empty(channels // 16, batch_size_pad, dtype=torch.float8_e4m3fn, device=x.device)
+    lora_act_out = torch.empty(batch_size_pad, rank, dtype=torch.float32, device=x.device)
+    lora_act_dense = torch.empty(batch_size_pad, rank, dtype=torch.float32, device=x.device)
+
+    _OPS.quantize_w4a4_act_fuse_lora_dual(
+        x,
+        qout,
+        oscales,
+        lora_down_packed,
+        lora_act_out,
+        lora_act_dense,
+        smooth,
+        False,
+        True,
+    )
+    if dense_dtype != torch.float32:
+        lora_act_dense = lora_act_dense.to(dense_dtype)
+    return qout, oscales, lora_act_out, lora_act_dense
+
+
 class NunchakuFP4GemmOp(torch.nn.Module):
     """Native nunchaku FP4 GEMM operator (main branch only)."""
 
@@ -507,6 +544,18 @@ class NunchakuFP4LowRankBackwardDXOp(NunchakuFP4BackwardDXOp):
         _OPS.decode_lora_act(packed_lora_act, dense)
         return dense
 
+    def quantize_grad_with_lora_dual(
+        self,
+        dy2d: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return quantize_fp4_act_with_lora_dual(
+            dy2d,
+            lora_down_packed=self.lora_down_bwd_packed,
+            smooth=self.smooth_bwd,
+            pad_size=256,
+            dense_dtype=self.lowrank_dtype,
+        )
+
     def build_forward_lowrank_cache(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.in_features:
             raise ValueError(f"Expected x last dim = {self.in_features}, got {x.shape[-1]}")
@@ -669,6 +718,54 @@ class NunchakuFP4LowRankBackwardDXOp(NunchakuFP4BackwardDXOp):
 
         x_lr = x2d_src.to(self.lowrank_dtype)
         dense_dy_up = self.decode_packed_lowrank_act(packed_dy_up)[: dy2d_src.shape[0], : self.rank]
+
+        if forward_lora_act is None:
+            forward_lora_act_lr = self.build_forward_lowrank_cache(x)
+        else:
+            if forward_lora_act.shape[-1] != self.rank:
+                raise ValueError(f"Expected forward_lora_act last dim = {self.rank}, got {forward_lora_act.shape[-1]}")
+            if forward_lora_act.reshape(-1, self.rank).shape[0] != x2d_src.shape[0]:
+                raise ValueError("forward_lora_act batch size mismatch with x")
+            forward_lora_act_lr = forward_lora_act.reshape(-1, self.rank).to(self.lowrank_dtype).contiguous()
+
+        d_up = torch.matmul(dy2d_src.to(self.lowrank_dtype).t(), forward_lora_act_lr)
+        d_down = torch.matmul(dense_dy_up.t(), x_lr)
+
+        return {
+            "dx": dX,
+            "lora_up_grad": d_up[: self.out_features, : self.rank].to(self.compute_dtype),
+            "lora_down_grad": d_down[: self.rank, : self.in_features].to(self.compute_dtype),
+        }
+
+    def backward_full_shared_dual(
+        self,
+        x: torch.Tensor,
+        dy: torch.Tensor,
+        forward_lora_act: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if x.shape[-1] != self.in_features:
+            raise ValueError(f"Expected x last dim = {self.in_features}, got {x.shape[-1]}")
+        if dy.shape[-1] != self.out_features:
+            raise ValueError(f"Expected dy last dim = {self.out_features}, got {dy.shape[-1]}")
+
+        x2d_src = x.reshape(-1, self.in_features)
+        dy2d_src = dy.reshape(-1, self.out_features)
+        dy2d = dy2d_src if self.n_pad == self.out_features else pad_tensor(dy2d_src, divisor=self.n_pad, dim=1)
+
+        qdy, ascales, packed_dy_up, dense_dy_up = self.quantize_grad_with_lora_dual(dy2d)
+        qweight_bwd = self.repack_qweight_for_backward()
+        dX_pad = self.backward_prequantized(
+            qdy,
+            ascales,
+            qweight_bwd,
+            lora_act=packed_dy_up,
+            lora_up=self.lora_up_bwd_packed,
+            lora_scales=self._lora_scales,
+        )
+        dX = dX_pad[: dy2d_src.shape[0], : self.in_features].reshape(*dy.shape[:-1], self.in_features)
+
+        x_lr = x2d_src.to(self.lowrank_dtype)
+        dense_dy_up = dense_dy_up[: dy2d_src.shape[0], : self.rank].to(self.lowrank_dtype)
 
         if forward_lora_act is None:
             forward_lora_act_lr = self.build_forward_lowrank_cache(x)

@@ -115,12 +115,13 @@ void quantize_w4a4_act_fuse_lora(Tensor input,
                                  Tensor oscales,
                                  Tensor lora_down,
                                  Tensor lora_act_out,
+                                 Tensor lora_act_out_dense,
                                  Tensor smooth,
                                  bool fuse_glu,
                                  bool fp4) {
     invoke_launch(input.dtype(), fp4, false, [&]<typename Config, bool USE_FP4>() {
         GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(
-            input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4);
+            input, output, oscales, lora_down, lora_act_out, lora_act_out_dense, smooth, fuse_glu, fp4);
     });
 }
 

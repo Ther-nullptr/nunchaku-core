@@ -1110,6 +1110,7 @@ public:
             oscales_t *oscales;
             const packed_fpsum_t *lora_wgt_down;
             float *lora_act;
+            float *lora_act_dense;
 
             int lora_rank;
 
@@ -1166,6 +1167,7 @@ public:
                                typename EpilogueLoraDown::Arguments{
                                    .lora_wgt_down = args.lora_wgt_down,
                                    .lora_act      = args.lora_act,
+                                   .lora_act_dense = args.lora_act_dense,
                                    .rank          = args.lora_rank,
                                    .alwaysfalse   = args.alwaysfalse,
                                });

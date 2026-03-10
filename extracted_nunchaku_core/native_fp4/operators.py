@@ -737,6 +737,77 @@ class NunchakuFP4LowRankBackwardDXOp(NunchakuFP4BackwardDXOp):
             "lora_down_grad": d_down[: self.rank, : self.in_features].to(self.compute_dtype),
         }
 
+    def backward_full_shared_packed_overlap(
+        self,
+        x: torch.Tensor,
+        dy: torch.Tensor,
+        forward_lora_act: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if x.shape[-1] != self.in_features:
+            raise ValueError(f"Expected x last dim = {self.in_features}, got {x.shape[-1]}")
+        if dy.shape[-1] != self.out_features:
+            raise ValueError(f"Expected dy last dim = {self.out_features}, got {dy.shape[-1]}")
+
+        x2d_src = x.reshape(-1, self.in_features)
+        dy2d_src = dy.reshape(-1, self.out_features)
+        dy2d = dy2d_src if self.n_pad == self.out_features else pad_tensor(dy2d_src, divisor=self.n_pad, dim=1)
+
+        if forward_lora_act is None:
+            forward_lora_act_lr = self.build_forward_lowrank_cache(x)
+        else:
+            if forward_lora_act.shape[-1] != self.rank:
+                raise ValueError(f"Expected forward_lora_act last dim = {self.rank}, got {forward_lora_act.shape[-1]}")
+            if forward_lora_act.reshape(-1, self.rank).shape[0] != x2d_src.shape[0]:
+                raise ValueError("forward_lora_act batch size mismatch with x")
+            forward_lora_act_lr = forward_lora_act.reshape(-1, self.rank).to(self.lowrank_dtype).contiguous()
+
+        current_stream = torch.cuda.current_stream(device=dy.device)
+        repack_stream = torch.cuda.Stream(device=dy.device)
+        dx_stream = torch.cuda.Stream(device=dy.device)
+        up_stream = torch.cuda.Stream(device=dy.device)
+        down_stream = torch.cuda.Stream(device=dy.device)
+        repack_done = torch.cuda.Event()
+        quant_done = torch.cuda.Event()
+
+        with torch.cuda.stream(repack_stream):
+            qweight_bwd = self.repack_qweight_for_backward()
+            repack_done.record(repack_stream)
+
+        with torch.cuda.stream(up_stream):
+            d_up = torch.matmul(dy2d_src.to(self.lowrank_dtype).t(), forward_lora_act_lr)
+
+        qdy, ascales, packed_dy_up = self.quantize_grad_with_lora(dy2d)
+        quant_done.record(current_stream)
+
+        with torch.cuda.stream(down_stream):
+            down_stream.wait_event(quant_done)
+            dense_dy_up = self.decode_packed_lowrank_act(packed_dy_up)[: dy2d_src.shape[0], : self.rank]
+            d_down = torch.matmul(dense_dy_up.t(), x2d_src.to(self.lowrank_dtype))
+
+        with torch.cuda.stream(dx_stream):
+            dx_stream.wait_event(quant_done)
+            dx_stream.wait_event(repack_done)
+            dX_pad = self.backward_prequantized(
+                qdy,
+                ascales,
+                qweight_bwd,
+                lora_act=packed_dy_up,
+                lora_up=self.lora_up_bwd_packed,
+                lora_scales=self._lora_scales,
+            )
+
+        current_stream.wait_stream(up_stream)
+        current_stream.wait_stream(down_stream)
+        current_stream.wait_stream(dx_stream)
+
+        dX = dX_pad[: dy2d_src.shape[0], : self.in_features].reshape(*dy.shape[:-1], self.in_features)
+
+        return {
+            "dx": dX,
+            "lora_up_grad": d_up[: self.out_features, : self.rank].to(self.compute_dtype),
+            "lora_down_grad": d_down[: self.rank, : self.in_features].to(self.compute_dtype),
+        }
+
     def backward_full_shared_dual(
         self,
         x: torch.Tensor,

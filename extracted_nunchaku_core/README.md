@@ -15,6 +15,7 @@ This directory isolates the key SVDQuant idea from Nunchaku (paper: https://arxi
 Optimization summary:
 
 - `OPTIMIZATION_SUMMARY.md`: forward extraction, fusion ablations, backward optimizations, and measured gains on RTX 5090.
+- `OPTIMIZATION_SUMMARY_ZH.md`: 中文版优化总结与收益报告。
 
 ## Build
 

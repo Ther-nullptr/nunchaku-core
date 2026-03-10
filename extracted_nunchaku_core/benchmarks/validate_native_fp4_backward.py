@@ -91,6 +91,9 @@ def main() -> None:
 
     full_fused = hybrid_dx.backward_full(x, dy, fused_dx=True)
     full_unfused = hybrid_dx.backward_full(x, dy, fused_dx=False)
+    forward_lora_cache = hybrid_dx.build_forward_lowrank_cache(x)
+    full_shared_recompute = hybrid_dx.backward_full_shared(x, dy)
+    full_shared_cached = hybrid_dx.backward_full_shared(x, dy, forward_lora_act=forward_lora_cache)
 
     x_lr = x.to(dtype)
     dy_lr = dy.to(dtype)
@@ -113,6 +116,26 @@ def main() -> None:
         "full_down_rel_l2_lt_1e-5": tensor_error(full_fused["lora_down_grad"], full_ref["lora_down_grad"])["rel_l2"]
         < 1e-5,
         "full_fused_vs_unfused_dx_rel_l2_lt_5e-4": tensor_error(full_fused["dx"], full_unfused["dx"])["rel_l2"] < 5e-4,
+        "full_shared_cached_dx_matches_fused_rel_l2_lt_5e-4": tensor_error(
+            full_shared_cached["dx"], full_fused["dx"]
+        )["rel_l2"]
+        < 5e-4,
+        "full_shared_cached_up_rel_l2_lt_1e-5": tensor_error(
+            full_shared_cached["lora_up_grad"], full_ref["lora_up_grad"]
+        )["rel_l2"]
+        < 1e-5,
+        "full_shared_cached_down_rel_l2_lt_5e-4": tensor_error(
+            full_shared_cached["lora_down_grad"], full_ref["lora_down_grad"]
+        )["rel_l2"]
+        < 5e-4,
+        "full_shared_cached_vs_recompute_dx_rel_l2_lt_5e-4": tensor_error(
+            full_shared_cached["dx"], full_shared_recompute["dx"]
+        )["rel_l2"]
+        < 5e-4,
+        "full_shared_cached_vs_recompute_down_rel_l2_lt_5e-4": tensor_error(
+            full_shared_cached["lora_down_grad"], full_shared_recompute["lora_down_grad"]
+        )["rel_l2"]
+        < 5e-4,
         "pure_dx_all_finite": bool(torch.isfinite(dx_pure).all().item()),
         "hybrid_dx_all_finite": bool(torch.isfinite(dx_fused).all().item()),
     }
@@ -136,6 +159,20 @@ def main() -> None:
                 full_fused["lora_down_grad"], full_ref["lora_down_grad"]
             ),
             "full_dx_fused_vs_unfused": tensor_error(full_fused["dx"], full_unfused["dx"]),
+            "full_shared_cached_dx_vs_reference": tensor_error(full_shared_cached["dx"], full_ref["dx"]),
+            "full_shared_cached_up_vs_reference": tensor_error(
+                full_shared_cached["lora_up_grad"], full_ref["lora_up_grad"]
+            ),
+            "full_shared_cached_down_vs_reference": tensor_error(
+                full_shared_cached["lora_down_grad"], full_ref["lora_down_grad"]
+            ),
+            "full_shared_cached_dx_vs_fused": tensor_error(full_shared_cached["dx"], full_fused["dx"]),
+            "full_shared_cached_up_vs_fused": tensor_error(
+                full_shared_cached["lora_up_grad"], full_fused["lora_up_grad"]
+            ),
+            "full_shared_cached_down_vs_fused": tensor_error(
+                full_shared_cached["lora_down_grad"], full_fused["lora_down_grad"]
+            ),
         },
         "checks": checks,
         "all_passed": all(checks.values()),

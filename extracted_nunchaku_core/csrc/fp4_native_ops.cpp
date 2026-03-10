@@ -11,6 +11,7 @@ torch::Tensor fp4_repack_backward_cuda(
     torch::Tensor qweight,
     torch::Tensor fwd_scales_logical,
     torch::Tensor bwd_scales_logical);
+void decode_lora_act_cuda(torch::Tensor packed_lora_act, torch::Tensor dense_lora_act);
 
 void gemm_w4a4(
     std::optional<torch::Tensor> act,
@@ -127,10 +128,30 @@ torch::Tensor fp4_repack_backward(
     return fp4_repack_backward_cuda(qweight, fwd_scales_logical, bwd_scales_logical);
 }
 
+void decode_lora_act(torch::Tensor packed_lora_act, torch::Tensor dense_lora_act) {
+    TORCH_CHECK(packed_lora_act.is_cuda(), "packed_lora_act must be a CUDA tensor");
+    TORCH_CHECK(packed_lora_act.is_contiguous(), "packed_lora_act must be contiguous");
+    TORCH_CHECK(packed_lora_act.dim() == 2, "packed_lora_act must be 2D [M_pad, rank]");
+    TORCH_CHECK(packed_lora_act.scalar_type() == torch::kFloat, "packed_lora_act dtype must be float32");
+
+    TORCH_CHECK(dense_lora_act.is_cuda(), "dense_lora_act must be a CUDA tensor");
+    TORCH_CHECK(dense_lora_act.is_contiguous(), "dense_lora_act must be contiguous");
+    TORCH_CHECK(dense_lora_act.dim() == 2, "dense_lora_act must be 2D [M_pad, rank]");
+    TORCH_CHECK(
+        dense_lora_act.scalar_type() == torch::kHalf || dense_lora_act.scalar_type() == torch::kBFloat16,
+        "dense_lora_act dtype must be float16 or bfloat16");
+    TORCH_CHECK(
+        packed_lora_act.sizes() == dense_lora_act.sizes(),
+        "packed_lora_act and dense_lora_act must have the same shape");
+
+    decode_lora_act_cuda(packed_lora_act, dense_lora_act);
+}
+
 } // namespace nunchaku_core::ops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_w4a4", nunchaku_core::ops::gemm_w4a4);
     m.def("quantize_w4a4_act_fuse_lora", nunchaku_core::ops::quantize_w4a4_act_fuse_lora);
     m.def("fp4_repack_backward", nunchaku_core::ops::fp4_repack_backward);
+    m.def("decode_lora_act", nunchaku_core::ops::decode_lora_act);
 }

@@ -46,6 +46,7 @@ ext_modules = [
         name="nunchaku_core._fp4_native_cuda",
         sources=[
             "csrc/fp4_native_ops.cpp",
+            "csrc/fp4_lora_decode_cuda.cu",
             "csrc/fp4_repack_cuda.cu",
             "fp4_backend/src/interop/torch.cpp",
             "fp4_backend/src/kernels/zgemm/gemm_w4a4.cu",

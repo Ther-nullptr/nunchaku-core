@@ -1,0 +1,57 @@
+{
+  "shape": {
+    "m": 64,
+    "in_features": 512,
+    "out_features": 512,
+    "rank": 32,
+    "dtype": "fp16"
+  },
+  "errors": {
+    "pure_dx_vs_fp16": {
+      "max_abs": 135.6875,
+      "mae": 25.24056625366211,
+      "rel_l2": 1.4100747870320416
+    },
+    "hybrid_dx_vs_reference": {
+      "max_abs": 135.6875,
+      "mae": 25.24053955078125,
+      "rel_l2": 1.1141502793531446
+    },
+    "hybrid_dx_fused_vs_unfused": {
+      "max_abs": 0.0625,
+      "mae": 0.002010957570746541,
+      "rel_l2": 0.00023625086023469508
+    },
+    "full_dx_vs_reference": {
+      "max_abs": 135.6875,
+      "mae": 25.24053955078125,
+      "rel_l2": 1.1141502793531446
+    },
+    "full_lora_up_grad_vs_reference": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "full_lora_down_grad_vs_reference": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "full_dx_fused_vs_unfused": {
+      "max_abs": 0.0625,
+      "mae": 0.002010957570746541,
+      "rel_l2": 0.00023625086023469508
+    }
+  },
+  "checks": {
+    "qweight_roundtrip_exact": true,
+    "wscale_roundtrip_exact": true,
+    "hybrid_dx_fused_vs_unfused_rel_l2_lt_5e-4": true,
+    "full_up_rel_l2_lt_1e-5": true,
+    "full_down_rel_l2_lt_1e-5": true,
+    "full_fused_vs_unfused_dx_rel_l2_lt_5e-4": true,
+    "pure_dx_all_finite": true,
+    "hybrid_dx_all_finite": true
+  },
+  "all_passed": true
+}

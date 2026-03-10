@@ -1,0 +1,57 @@
+{
+  "shape": {
+    "m": 256,
+    "in_features": 4096,
+    "out_features": 4096,
+    "rank": 32,
+    "dtype": "fp16"
+  },
+  "errors": {
+    "pure_dx_vs_fp16": {
+      "max_abs": 468.375,
+      "mae": 73.74181365966797,
+      "rel_l2": 1.446328091653875
+    },
+    "hybrid_dx_vs_reference": {
+      "max_abs": 468.375,
+      "mae": 73.74185180664062,
+      "rel_l2": 1.3851443554070226
+    },
+    "hybrid_dx_fused_vs_unfused": {
+      "max_abs": 0.25,
+      "mae": 0.00388550478965044,
+      "rel_l2": 0.00018564335582283236
+    },
+    "full_dx_vs_reference": {
+      "max_abs": 468.375,
+      "mae": 73.74185180664062,
+      "rel_l2": 1.3851443554070226
+    },
+    "full_lora_up_grad_vs_reference": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "full_lora_down_grad_vs_reference": {
+      "max_abs": 0.0,
+      "mae": 0.0,
+      "rel_l2": 0.0
+    },
+    "full_dx_fused_vs_unfused": {
+      "max_abs": 0.25,
+      "mae": 0.0038852705620229244,
+      "rel_l2": 0.0001856395385768881
+    }
+  },
+  "checks": {
+    "qweight_roundtrip_exact": true,
+    "wscale_roundtrip_exact": true,
+    "hybrid_dx_fused_vs_unfused_rel_l2_lt_5e-4": true,
+    "full_up_rel_l2_lt_1e-5": true,
+    "full_down_rel_l2_lt_1e-5": true,
+    "full_fused_vs_unfused_dx_rel_l2_lt_5e-4": true,
+    "pure_dx_all_finite": true,
+    "hybrid_dx_all_finite": true
+  },
+  "all_passed": true
+}

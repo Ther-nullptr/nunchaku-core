@@ -80,7 +80,7 @@ def main() -> None:
         lora_up: torch.Tensor | None,
         lora_scales: list[float],
     ) -> torch.Tensor:
-        out_pad = torch.empty(qact.shape[0], hybrid.n_pad, dtype=hybrid.weight_pad.dtype, device=qact.device)
+        out_pad = torch.empty(qact.shape[0], hybrid.n_pad, dtype=hybrid.compute_dtype, device=qact.device)
         _OPS.gemm_w4a4(
             qact,
             hybrid.qweight,

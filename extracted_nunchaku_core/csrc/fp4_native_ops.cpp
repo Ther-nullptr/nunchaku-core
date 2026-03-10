@@ -7,6 +7,11 @@
 
 namespace nunchaku_core::ops {
 
+torch::Tensor fp4_repack_backward_cuda(
+    torch::Tensor qweight,
+    torch::Tensor fwd_scales_logical,
+    torch::Tensor bwd_scales_logical);
+
 void gemm_w4a4(
     std::optional<torch::Tensor> act,
     std::optional<torch::Tensor> wgt,
@@ -100,9 +105,32 @@ void quantize_w4a4_act_fuse_lora(std::optional<torch::Tensor> input,
         fp4);
 }
 
+torch::Tensor fp4_repack_backward(
+    torch::Tensor qweight,
+    torch::Tensor fwd_scales_logical,
+    torch::Tensor bwd_scales_logical) {
+    TORCH_CHECK(qweight.is_cuda(), "qweight must be a CUDA tensor");
+    TORCH_CHECK(qweight.is_contiguous(), "qweight must be contiguous");
+    TORCH_CHECK(qweight.dim() == 2, "qweight must be 2D [N, K/2]");
+    TORCH_CHECK(qweight.scalar_type() == torch::kUInt8, "qweight dtype must be uint8");
+
+    TORCH_CHECK(fwd_scales_logical.is_cuda(), "fwd_scales_logical must be a CUDA tensor");
+    TORCH_CHECK(fwd_scales_logical.is_contiguous(), "fwd_scales_logical must be contiguous");
+    TORCH_CHECK(fwd_scales_logical.dim() == 2, "fwd_scales_logical must be 2D [N, K/16]");
+    TORCH_CHECK(fwd_scales_logical.scalar_type() == torch::kHalf, "fwd_scales_logical dtype must be float16");
+
+    TORCH_CHECK(bwd_scales_logical.is_cuda(), "bwd_scales_logical must be a CUDA tensor");
+    TORCH_CHECK(bwd_scales_logical.is_contiguous(), "bwd_scales_logical must be contiguous");
+    TORCH_CHECK(bwd_scales_logical.dim() == 2, "bwd_scales_logical must be 2D [K, N/16]");
+    TORCH_CHECK(bwd_scales_logical.scalar_type() == torch::kHalf, "bwd_scales_logical dtype must be float16");
+
+    return fp4_repack_backward_cuda(qweight, fwd_scales_logical, bwd_scales_logical);
+}
+
 } // namespace nunchaku_core::ops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_w4a4", nunchaku_core::ops::gemm_w4a4);
     m.def("quantize_w4a4_act_fuse_lora", nunchaku_core::ops::quantize_w4a4_act_fuse_lora);
+    m.def("fp4_repack_backward", nunchaku_core::ops::fp4_repack_backward);
 }

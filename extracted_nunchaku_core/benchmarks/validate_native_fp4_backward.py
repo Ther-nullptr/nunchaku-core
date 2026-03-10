@@ -16,6 +16,7 @@ from native_fp4 import NunchakuFP4BackwardDXOp, NunchakuFP4LowRankBackwardDXOp  
 from native_fp4.layout import (  # noqa: E402
     pack_fp4_weight_codes,
     pack_fp4_weight_scales,
+    repack_fp4_weight_for_backward,
     unpack_fp4_weight_codes,
     unpack_fp4_weight_scales,
 )
@@ -66,6 +67,14 @@ def main() -> None:
     qweight_roundtrip = pack_fp4_weight_codes(unpack_fp4_weight_codes(pure_dx.qweight))
     fwd_wscale_logical = unpack_fp4_weight_scales(pure_dx.wscales, pure_dx.n_pad, pure_dx.k_pad)
     wscale_roundtrip = pack_fp4_weight_scales(fwd_wscale_logical)
+    qweight_bwd_ref = repack_fp4_weight_for_backward(
+        qweight=pure_dx.qweight,
+        packed_wscales=pure_dx.wscales,
+        out_features=pure_dx.n_pad,
+        in_features=pure_dx.k_pad,
+        logical_scales_t=pure_dx.wscales_bwd_logical,
+    )
+    qweight_bwd_cuda = pure_dx.repack_qweight_for_backward()
 
     dx_ref = torch.matmul(dy, w)
     dx_pure = pure_dx(dy)
@@ -98,6 +107,7 @@ def main() -> None:
         "wscale_roundtrip_exact": bool(
             torch.equal(wscale_roundtrip.view(torch.uint8), pure_dx.wscales.view(torch.uint8))
         ),
+        "qweight_bwd_cuda_matches_reference": bool(torch.equal(qweight_bwd_cuda, qweight_bwd_ref)),
         "hybrid_dx_fused_vs_unfused_rel_l2_lt_5e-4": hybrid_dx_internal_err["rel_l2"] < 5e-4,
         "full_up_rel_l2_lt_1e-5": tensor_error(full_fused["lora_up_grad"], full_ref["lora_up_grad"])["rel_l2"] < 1e-5,
         "full_down_rel_l2_lt_1e-5": tensor_error(full_fused["lora_down_grad"], full_ref["lora_down_grad"])["rel_l2"]
@@ -119,6 +129,7 @@ def main() -> None:
             "pure_dx_vs_fp16": pure_dx_err,
             "hybrid_dx_vs_reference": hybrid_dx_ref_err,
             "hybrid_dx_fused_vs_unfused": hybrid_dx_internal_err,
+            "qweight_bwd_cuda_vs_reference": tensor_error(qweight_bwd_cuda.float(), qweight_bwd_ref.float()),
             "full_dx_vs_reference": tensor_error(full_fused["dx"], full_ref["dx"]),
             "full_lora_up_grad_vs_reference": tensor_error(full_fused["lora_up_grad"], full_ref["lora_up_grad"]),
             "full_lora_down_grad_vs_reference": tensor_error(

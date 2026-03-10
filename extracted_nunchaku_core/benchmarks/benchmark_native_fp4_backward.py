@@ -13,6 +13,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from native_fp4 import NunchakuFP4BackwardDXOp, NunchakuFP4LowRankBackwardDXOp  # noqa: E402
+from native_fp4.layout import repack_fp4_weight_for_backward  # noqa: E402
 
 
 def time_cuda(fn, warmup: int, iters: int) -> float:
@@ -70,6 +71,15 @@ def main() -> None:
     def repack_only_fn() -> torch.Tensor:
         return pure_dx.repack_qweight_for_backward()
 
+    def repack_python_only_fn() -> torch.Tensor:
+        return repack_fp4_weight_for_backward(
+            qweight=pure_dx.qweight,
+            packed_wscales=pure_dx.wscales,
+            out_features=pure_dx.n_pad,
+            in_features=pure_dx.k_pad,
+            logical_scales_t=pure_dx.wscales_bwd_logical,
+        )
+
     def fp4_dx_fn() -> torch.Tensor:
         return pure_dx(dy)
 
@@ -101,6 +111,7 @@ def main() -> None:
         dx_fp4 = fp4_dx_fn().float()
         dx_hybrid = fp4_dx_hybrid_fused_fn().float()
 
+    repack_python_ms = time_cuda(repack_python_only_fn, warmup=args.warmup, iters=args.iters)
     repack_ms = time_cuda(repack_only_fn, warmup=args.warmup, iters=args.iters)
     fp16_dx_ms = time_cuda(fp16_dx_fn, warmup=args.warmup, iters=args.iters)
     fp4_dx_ms = time_cuda(fp4_dx_fn, warmup=args.warmup, iters=args.iters)
@@ -116,6 +127,7 @@ def main() -> None:
         "out_features": args.out_features,
         "rank": args.rank,
         "dtype": args.dtype,
+        "repack_python_ms": repack_python_ms,
         "repack_ms": repack_ms,
         "fp16_dx_ms": fp16_dx_ms,
         "fp4_dx_ms": fp4_dx_ms,
@@ -129,8 +141,10 @@ def main() -> None:
         "fp4_dx_hybrid_fused_speedup_vs_fp16": fp16_dx_ms / fp4_dx_hybrid_fused_ms,
         "fp4_full_backward_unfused_speedup_vs_fp16": fp16_full_backward_ms / fp4_full_backward_unfused_ms,
         "fp4_full_backward_fused_speedup_vs_fp16": fp16_full_backward_ms / fp4_full_backward_fused_ms,
+        "repack_speedup_vs_python": repack_python_ms / repack_ms,
         "repack_over_fp4_dx": repack_ms / fp4_dx_ms,
         "repack_over_fp4_dx_hybrid_fused": repack_ms / fp4_dx_hybrid_fused_ms,
+        "repack_python_over_fp4_dx": repack_python_ms / fp4_dx_ms,
         "fp4_dx_mae_vs_fp16": float((dx_fp4 - dx_ref).abs().mean().item()),
         "fp4_dx_hybrid_mae_vs_fp16": float((dx_hybrid - dx_ref).abs().mean().item()),
     }

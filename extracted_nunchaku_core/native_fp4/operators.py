@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .layout import build_backward_scales_from_forward_quant, repack_fp4_weight_for_backward
+from .layout import build_backward_scales_from_forward_quant, repack_fp4_weight_for_backward, unpack_fp4_weight_scales
 
 
 def _load_fp4_backend_ops():
@@ -347,18 +347,16 @@ class NunchakuFP4BackwardDXOp(NunchakuFP4GemmOp):
     def __init__(self, weight: torch.Tensor, dummy_rank: int = 16):
         super().__init__(weight=weight, bias=None, dummy_rank=dummy_rank)
 
-        self.register_buffer(
-            "wscales_bwd_logical",
-            torch.empty(self.k_pad, self.n_pad // 16, dtype=torch.float16, device=weight.device),
-            persistent=False,
-        )
+        wscales_fwd_logical = unpack_fp4_weight_scales(self.wscales, self.n_pad, self.k_pad).to(torch.float16).contiguous()
+        self.register_buffer("wscales_fwd_logical", wscales_fwd_logical, persistent=False)
+
         logical_scales_bwd, packed_scales_bwd = build_backward_scales_from_forward_quant(
             qweight=self.qweight,
             packed_wscales=self.wscales,
             out_features=self.n_pad,
             in_features=self.k_pad,
         )
-        self.wscales_bwd_logical = logical_scales_bwd.to(torch.float16).contiguous()
+        self.register_buffer("wscales_bwd_logical", logical_scales_bwd.to(torch.float16).contiguous(), persistent=False)
         self.register_buffer("wscales_bwd_packed", packed_scales_bwd.contiguous(), persistent=True)
 
         smooth_bwd = torch.ones(self.n_pad, dtype=self.compute_dtype, device=weight.device)
@@ -378,6 +376,12 @@ class NunchakuFP4BackwardDXOp(NunchakuFP4GemmOp):
         return qact, ascales
 
     def repack_qweight_for_backward(self) -> torch.Tensor:
+        if hasattr(_OPS, "fp4_repack_backward"):
+            return _OPS.fp4_repack_backward(
+                self.qweight,
+                self.wscales_fwd_logical,
+                self.wscales_bwd_logical,
+            )
         return repack_fp4_weight_for_backward(
             qweight=self.qweight,
             packed_wscales=self.wscales,

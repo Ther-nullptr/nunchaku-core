@@ -196,9 +196,16 @@ def load_tokenizer(model_dir: str):
 def load_model(model_dir: str, dtype: torch.dtype):
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=dtype)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        dtype=dtype,
+        low_cpu_mem_usage=True,
+        device_map={"": "cuda:0"},
+    )
     model.eval()
-    model.to("cuda")
     return model
 
 
@@ -493,9 +500,11 @@ def run_variant(
     baseline_ppl_token_count: int,
     logits_refs: list[LogitsReference] | None,
     generation_refs: list[GenerationReference] | None,
+    preloaded_model: nn.Module | None = None,
 ) -> dict[str, object]:
     torch.cuda.empty_cache()
-    model = load_model(model_dir=model_dir, dtype=dtype)
+    model = preloaded_model if preloaded_model is not None else load_model(model_dir=model_dir, dtype=dtype)
+    loaded_here = preloaded_model is None
     payload: dict[str, object] = {"variant": variant}
 
     if variant != "fp16":
@@ -547,7 +556,8 @@ def run_variant(
             generation_refs=generation_refs,
         )
 
-    cleanup_model(model)
+    if loaded_here:
+        cleanup_model(model)
     return payload
 
 
@@ -617,8 +627,6 @@ def main() -> None:
         generate_steps=args.generation_steps,
         offset_tokens=generation_offset_tokens,
     )
-    cleanup_model(fp16_model)
-
     results = {
         "model_id": args.model_id,
         "model_dir": model_dir,
@@ -673,7 +681,11 @@ def main() -> None:
             baseline_ppl_token_count=baseline_ppl_token_count,
             logits_refs=logits_refs if variant != "fp16" else None,
             generation_refs=generation_refs if variant != "fp16" else None,
+            preloaded_model=fp16_model if variant == "fp16" else None,
         )
+        if variant == "fp16":
+            cleanup_model(fp16_model)
+            fp16_model = None
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(args.results_dir, f"llama_fp4_inference_{stamp}.json")

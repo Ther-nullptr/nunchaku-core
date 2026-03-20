@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -67,6 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--svd-lowrank-niter", type=int, default=2)
     parser.add_argument("--linear-prefix", type=str, default="model.layers.")
     parser.add_argument("--include-lm-head", action="store_true")
+    parser.add_argument("--replace-layer-start", type=int, default=None)
+    parser.add_argument("--replace-layer-end", type=int, default=None)
+    parser.add_argument("--replace-name-substrings", type=str, nargs="*", default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--prefill-lengths", type=int, nargs="+", default=[128, 512, 1024])
     parser.add_argument("--decode-prompt-length", type=int, default=512)
@@ -123,6 +127,32 @@ def should_replace_module(full_name: str, linear_prefix: str, include_lm_head: b
     return full_name.startswith(linear_prefix) or (include_lm_head and full_name == "lm_head")
 
 
+def extract_layer_index(full_name: str, linear_prefix: str) -> int | None:
+    if not full_name.startswith(linear_prefix):
+        return None
+    match = re.match(rf"^{re.escape(linear_prefix)}(\d+)\.", full_name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def layer_is_selected(full_name: str, linear_prefix: str, layer_start: int | None, layer_end: int | None) -> bool:
+    layer_idx = extract_layer_index(full_name, linear_prefix)
+    if layer_idx is None:
+        return True
+    if layer_start is not None and layer_idx < layer_start:
+        return False
+    if layer_end is not None and layer_idx >= layer_end:
+        return False
+    return True
+
+
+def name_is_selected(full_name: str, name_substrings: list[str] | None) -> bool:
+    if not name_substrings:
+        return True
+    return any(substring in full_name for substring in name_substrings)
+
+
 def replace_linear_modules(
     module: nn.Module,
     variant: str,
@@ -130,6 +160,9 @@ def replace_linear_modules(
     rank: int,
     linear_prefix: str,
     include_lm_head: bool,
+    layer_start: int | None,
+    layer_end: int | None,
+    name_substrings: list[str] | None,
     factor_mode: str,
     svd_lowrank_oversample: int,
     svd_lowrank_niter: int,
@@ -140,7 +173,12 @@ def replace_linear_modules(
 
     for child_name, child in list(module.named_children()):
         full_name = f"{prefix}.{child_name}" if prefix else child_name
-        if isinstance(child, nn.Linear) and should_replace_module(full_name, linear_prefix, include_lm_head):
+        if (
+            isinstance(child, nn.Linear)
+            and should_replace_module(full_name, linear_prefix, include_lm_head)
+            and layer_is_selected(full_name, linear_prefix, layer_start, layer_end)
+            and name_is_selected(full_name, name_substrings)
+        ):
             weight = child.weight.detach().to(device="cuda", dtype=dtype).contiguous()
             bias = None
             if child.bias is not None:
@@ -173,6 +211,9 @@ def replace_linear_modules(
                 rank=rank,
                 linear_prefix=linear_prefix,
                 include_lm_head=include_lm_head,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                name_substrings=name_substrings,
                 factor_mode=factor_mode,
                 svd_lowrank_oversample=svd_lowrank_oversample,
                 svd_lowrank_niter=svd_lowrank_niter,
@@ -484,6 +525,9 @@ def run_variant(
     rank: int,
     linear_prefix: str,
     include_lm_head: bool,
+    layer_start: int | None,
+    layer_end: int | None,
+    name_substrings: list[str] | None,
     factor_mode: str,
     svd_lowrank_oversample: int,
     svd_lowrank_niter: int,
@@ -516,6 +560,9 @@ def run_variant(
             rank=rank,
             linear_prefix=linear_prefix,
             include_lm_head=include_lm_head,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            name_substrings=name_substrings,
             factor_mode=factor_mode,
             svd_lowrank_oversample=svd_lowrank_oversample,
             svd_lowrank_niter=svd_lowrank_niter,
@@ -636,6 +683,9 @@ def main() -> None:
         "lowrank_mode": args.lowrank_mode,
         "linear_prefix": args.linear_prefix,
         "include_lm_head": args.include_lm_head,
+        "replace_layer_start": args.replace_layer_start,
+        "replace_layer_end": args.replace_layer_end,
+        "replace_name_substrings": args.replace_name_substrings,
         "batch_size": args.batch_size,
         "prefill_lengths": args.prefill_lengths,
         "decode_prompt_length": args.decode_prompt_length,
@@ -665,6 +715,9 @@ def main() -> None:
             rank=args.rank,
             linear_prefix=args.linear_prefix,
             include_lm_head=args.include_lm_head,
+            layer_start=args.replace_layer_start,
+            layer_end=args.replace_layer_end,
+            name_substrings=args.replace_name_substrings,
             factor_mode=args.lowrank_mode,
             svd_lowrank_oversample=args.svd_lowrank_oversample,
             svd_lowrank_niter=args.svd_lowrank_niter,

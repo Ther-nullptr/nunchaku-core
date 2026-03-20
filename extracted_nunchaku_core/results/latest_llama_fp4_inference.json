@@ -1,0 +1,165 @@
+{
+  "model_id": "NousResearch/Llama-2-7b-hf",
+  "model_dir": "/home/wyj24/projects/nunchaku/extracted_nunchaku_core/models/Llama-2-7b-hf",
+  "dtype": "fp16",
+  "rank": 32,
+  "variants_requested": [
+    "fp16",
+    "fp4",
+    "fp4_hybrid"
+  ],
+  "lowrank_mode": "svd_lowrank",
+  "linear_prefix": "model.layers.",
+  "include_lm_head": false,
+  "batch_size": 1,
+  "prefill_lengths": [
+    128,
+    512,
+    1024
+  ],
+  "decode_prompt_length": 128,
+  "decode_steps": 64,
+  "dataset_name": "wikitext",
+  "dataset_config": "wikitext-2-raw-v1",
+  "dataset_split": "test",
+  "accuracy_seq_len": 256,
+  "accuracy_num_seqs": 8,
+  "logits_num_seqs": 2,
+  "generation_prompt_length": 128,
+  "generation_steps": 16,
+  "generation_num_prompts": 2,
+  "token_stream_tokens": 338535,
+  "variants": {
+    "fp16": {
+      "variant": "fp16",
+      "conversion_seconds": 0.0,
+      "replaced_modules": 0,
+      "replaced_params": 0,
+      "prefill": [
+        {
+          "batch_size": 1,
+          "seq_len": 128,
+          "ms": 19.798677444458008,
+          "tokens_per_s": 6465.078304300038
+        },
+        {
+          "batch_size": 1,
+          "seq_len": 512,
+          "ms": 52.427050272623696,
+          "tokens_per_s": 9765.950922998154
+        },
+        {
+          "batch_size": 1,
+          "seq_len": 1024,
+          "ms": 98.24628194173177,
+          "tokens_per_s": 10422.786285259297
+        }
+      ],
+      "decode": {
+        "batch_size": 1,
+        "prompt_len": 128,
+        "decode_steps": 64,
+        "prefill_ms": 19.86403210957845,
+        "prefill_plus_decode_ms": 1085.722412109375,
+        "decode_only_ms": 1065.8583799997966,
+        "decode_ms_per_token": 16.654037187496822,
+        "decode_tokens_per_s": 60.045500603947225
+      },
+      "accuracy": null
+    },
+    "fp4": {
+      "variant": "fp4",
+      "conversion_seconds": 0.048860982060432434,
+      "replaced_modules": 224,
+      "replaced_params": 6476005376,
+      "prefill": [
+        {
+          "batch_size": 1,
+          "seq_len": 128,
+          "ms": 17.733739217122395,
+          "tokens_per_s": 7217.879908621449
+        },
+        {
+          "batch_size": 1,
+          "seq_len": 512,
+          "ms": 24.757322947184246,
+          "tokens_per_s": 20680.749735836518
+        },
+        {
+          "batch_size": 1,
+          "seq_len": 1024,
+          "ms": 33.596543629964195,
+          "tokens_per_s": 30479.32582822929
+        }
+      ],
+      "decode": {
+        "batch_size": 1,
+        "prompt_len": 128,
+        "decode_steps": 64,
+        "prefill_ms": 19.722036997477215,
+        "prefill_plus_decode_ms": 1023.7979939778646,
+        "decode_only_ms": 1004.0759569803874,
+        "decode_ms_per_token": 15.688686827818554,
+        "decode_tokens_per_s": 63.740197696268616
+      },
+      "accuracy": {
+        "baseline_nll": 2.3839114320044423,
+        "variant_nll": 12.071110026041667,
+        "baseline_perplexity": 10.847248077392578,
+        "variant_perplexity": 174749.671875,
+        "perplexity_ratio": 16110.05078125,
+        "logits_mae": 3.24950244140625,
+        "logits_rel_l2": 1.0896896092826363,
+        "top1_agreement": 0.0,
+        "generation_token_agreement": 0.0
+      }
+    },
+    "fp4_hybrid": {
+      "variant": "fp4_hybrid",
+      "conversion_seconds": 1.20318572409451,
+      "replaced_modules": 224,
+      "replaced_params": 6476005376,
+      "prefill": [
+        {
+          "batch_size": 1,
+          "seq_len": 128,
+          "ms": 23.164906183878582,
+          "tokens_per_s": 5525.599757838886
+        },
+        {
+          "batch_size": 1,
+          "seq_len": 512,
+          "ms": 30.715552012125652,
+          "tokens_per_s": 16669.080203991663
+        },
+        {
+          "batch_size": 1,
+          "seq_len": 1024,
+          "ms": 41.29343922932943,
+          "tokens_per_s": 24798.12820416966
+        }
+      ],
+      "decode": {
+        "batch_size": 1,
+        "prompt_len": 128,
+        "decode_steps": 64,
+        "prefill_ms": 23.580981572469074,
+        "prefill_plus_decode_ms": 1369.2660725911458,
+        "decode_only_ms": 1345.6850910186768,
+        "decode_ms_per_token": 21.026329547166824,
+        "decode_tokens_per_s": 47.559418193117025
+      },
+      "accuracy": {
+        "baseline_nll": 2.3839114320044423,
+        "variant_nll": 11.377682554955577,
+        "baseline_perplexity": 10.847248077392578,
+        "variant_perplexity": 87350.3828125,
+        "perplexity_ratio": 8052.77099609375,
+        "logits_mae": 3.18705078125,
+        "logits_rel_l2": 1.0701948313155585,
+        "top1_agreement": 0.0,
+        "generation_token_agreement": 0.0
+      }
+    }
+  }
+}

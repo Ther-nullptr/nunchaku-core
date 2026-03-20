@@ -218,3 +218,6 @@ dev/
 metrics.json
 *use_count.txt
 *use_record.txt
+
+# extracted_nunchaku_core experiment artifacts
+extracted_nunchaku_core/results/*.json

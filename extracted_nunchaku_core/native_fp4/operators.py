@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from .layout import build_backward_scales_from_forward_quant, repack_fp4_weight_for_backward, unpack_fp4_weight_scales
+from .layout import (
+    build_backward_scales_from_forward_quant,
+    dequantize_fp4_weight,
+    repack_fp4_weight_for_backward,
+    unpack_fp4_weight_scales,
+)
 
 
 def _load_fp4_backend_ops():
@@ -242,14 +247,46 @@ class NunchakuFP4GemmOp(torch.nn.Module):
 class NunchakuFP4LowRankOp(NunchakuFP4GemmOp):
     """Native nunchaku FP4 + FP16 low-rank hybrid operator."""
 
-    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None = None, rank: int = 32):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        rank: int = 32,
+        factor_mode: str = "full_svd",
+        svd_lowrank_oversample: int = 8,
+        svd_lowrank_niter: int = 2,
+    ):
         rank = max(16, ceil_divide(rank, 16) * 16)
+        if factor_mode not in ("full_svd", "svd_lowrank"):
+            raise ValueError("factor_mode must be 'full_svd' or 'svd_lowrank'")
+        if svd_lowrank_oversample < 0:
+            raise ValueError("svd_lowrank_oversample must be non-negative")
+        if svd_lowrank_niter < 0:
+            raise ValueError("svd_lowrank_niter must be non-negative")
         super().__init__(weight=weight, bias=bias, dummy_rank=rank)
         self.rank = rank
+        self.factor_mode = factor_mode
+        self.svd_lowrank_oversample = svd_lowrank_oversample
+        self.svd_lowrank_niter = svd_lowrank_niter
 
-        # Build low-rank branch by truncated SVD on padded FP16 weight.
+        # Build low-rank branch from the FP4 quantization residual rather than the full weight.
+        # This matches the intended "4-bit main branch + 16-bit residual branch" decomposition.
         weight_pad = pad_tensor(weight, divisor=(128, 128), dim=(0, 1))
-        u, s, vh = torch.linalg.svd(weight_pad.float(), full_matrices=False)
+        weight_hat, _ = dequantize_fp4_weight(
+            qweight=self.qweight,
+            packed_wscales=self.wscales,
+            out_features=self.n_pad,
+            in_features=self.k_pad,
+            dtype=self.compute_dtype,
+        )
+        residual = (weight_pad - weight_hat).float()
+        if factor_mode == "full_svd":
+            u, s, vh = torch.linalg.svd(residual, full_matrices=False)
+        else:
+            q = min(rank + svd_lowrank_oversample, min(residual.shape))
+            q = max(rank, q)
+            u, s, v = torch.svd_lowrank(residual, q=q, niter=svd_lowrank_niter)
+            vh = v.transpose(0, 1).contiguous()
         eff_rank = min(rank, s.numel())
 
         lora_up_dense = (u[:, :eff_rank] * s[:eff_rank].unsqueeze(0)).to(self.compute_dtype)
@@ -338,10 +375,20 @@ class NunchakuFP4LowRankUnfusedOp(NunchakuFP4LowRankOp):
         bias: torch.Tensor | None = None,
         rank: int = 32,
         lowrank_dtype: torch.dtype = torch.bfloat16,
+        factor_mode: str = "full_svd",
+        svd_lowrank_oversample: int = 8,
+        svd_lowrank_niter: int = 2,
     ):
         if lowrank_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("lowrank_dtype must be float16 or bfloat16")
-        super().__init__(weight=weight, bias=bias, rank=rank)
+        super().__init__(
+            weight=weight,
+            bias=bias,
+            rank=rank,
+            factor_mode=factor_mode,
+            svd_lowrank_oversample=svd_lowrank_oversample,
+            svd_lowrank_niter=svd_lowrank_niter,
+        )
         self.lowrank_dtype = lowrank_dtype
         self.register_buffer(
             "lora_up_dense_lr",

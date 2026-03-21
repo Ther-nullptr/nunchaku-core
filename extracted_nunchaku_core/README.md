@@ -4,6 +4,7 @@
 
 - 原生 FP4 GEMM
 - FP4 + 16-bit 低秩分支混合算子
+- 原生 FP8 GEMM
 - fused / unfused 低秩分支消融
 - FP4 backward `dX`
 - 完整 LoRA backward 的多种优化版本
@@ -22,6 +23,8 @@
   - PyTorch extension 入口，以及补充的 repack / decode CUDA 实现
 - `native_fp4/`
   - Python 封装，主要实验接口都在这里
+- `native_fp8/`
+  - 最小 FP8 GEMM Python 封装，后端使用 CUDA/cuBLASLt 的 `torch._scaled_mm`
 - `benchmarks/`
   - benchmark 和 validation 脚本
 - `results/`
@@ -78,15 +81,77 @@ pip install -e .
 - `nunchaku_core._int4_cuda`
 - `nunchaku_core._fp4_native_cuda`
 
+`native_fp8/` 不依赖新的自定义 `.so`，只要求当前 PyTorch 版本支持：
+
+- `torch.float8_e4m3fn`
+- `torch._scaled_mm`
+
 ## 5. 最小导入检查
 
 先确认 Python 封装能正常导入：
 
 ```bash
-python -c "from native_fp4 import NunchakuFP4GemmOp, NunchakuFP4LowRankOp, NunchakuFP4BackwardDXOp, NunchakuFP4LowRankBackwardDXOp; print('import ok')"
+python -c "from native_fp4 import NunchakuFP4GemmOp, NunchakuFP4LowRankOp, NunchakuFP4BackwardDXOp, NunchakuFP4LowRankBackwardDXOp; from native_fp8 import NunchakuFP8GemmOp; print('import ok')"
 ```
 
 如果这里失败，不要急着跑 benchmark，先回去重编译。
+
+## 5.1 Native FP8 最小验证
+
+FP8 当前是最小可用版本：
+
+- 数据格式：`float8_e4m3fn`
+- 输出类型：跟权重一致（`fp16` 或 `bf16`）
+- 后端：`torch._scaled_mm`
+- 当前量化方式：`per-tensor scale`
+
+先做 correctness：
+
+```bash
+python benchmarks/validate_native_fp8_ops.py \
+  --m 333 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --dtype bf16
+```
+
+结果会写到：
+
+- `results/latest_native_fp8_validation.json`
+
+重点字段：
+
+- `all_passed`
+- `wrapper_vs_manual`
+- `fp8_vs_fp16`
+
+再做 benchmark：
+
+```bash
+python benchmarks/benchmark_native_fp8.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --dtype fp16 \
+  --warmup 20 \
+  --iters 50
+```
+
+结果会写到：
+
+- `results/latest_native_fp8.json`
+
+重点字段：
+
+- `fp8_gemm_ms`
+- `fp8_gemm_prequantized_ms`
+- `fp8_gemm_speedup_vs_fp16`
+- `fp8_gemm_prequantized_speedup_vs_fp16`
+
+说明：
+
+- `fp8_gemm_ms`：在线量化 + FP8 GEMM 的端到端时间
+- `fp8_gemm_prequantized_ms`：只测 FP8 GEMM 本体，不含输入量化
 
 ## 6. 先做 correctness，再做 benchmark
 

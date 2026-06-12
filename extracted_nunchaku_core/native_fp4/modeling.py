@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .training import LoRAInitMode, NunchakuFP4LoRALinear
+from .training import FrozenResidualInitMode, LoRAInitMode, NunchakuFP4LoRALinear
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,8 @@ class FP4LoRAConfig:
     lora_alpha: float | None = None
     lowrank_dtype: torch.dtype = torch.bfloat16
     init: LoRAInitMode = "zero"
+    frozen_residual_rank: int = 0
+    frozen_residual_init: FrozenResidualInitMode = "none"
     train_bias: bool = False
     cache_lora_act: bool = True
     fuse_lora_dx: bool = False
@@ -80,6 +82,8 @@ def convert_linear_to_fp4_lora(
                         lora_alpha=cfg.lora_alpha,
                         lowrank_dtype=cfg.lowrank_dtype,
                         init=cfg.init,
+                        frozen_residual_rank=cfg.frozen_residual_rank,
+                        frozen_residual_init=cfg.frozen_residual_init,
                         train_bias=cfg.train_bias,
                         cache_lora_act=cfg.cache_lora_act,
                         fuse_lora_dx=cfg.fuse_lora_dx,

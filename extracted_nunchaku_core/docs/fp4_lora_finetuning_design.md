@@ -5,10 +5,14 @@
 把当前已经独立出来的 Nunchaku FP4 推理/反向算子推进到可接入微调的接口层：
 
 ```text
-y = FP4_GEMM(x, W0) + scaling * (x @ A.T) @ B.T + bias
+y = FP4_GEMM(x, W0)
+  + (x @ R_down.T) @ R_up.T
+  + scaling * (x @ A.T) @ B.T
+  + bias
 ```
 
 - `W0` 是冻结的 FP4 backbone 权重。
+- `R_down/R_up` 是可选 frozen BF16/FP16 residual branch，用来固定量化补偿。
 - `A/B` 是可训练的 BF16/FP16 LoRA 权重。
 - forward 的 FP4 主分支复用现有 `gemm_w4a4` CUDA kernel。
 - backward 的 `dX_main = dY @ W0` 复用现有 transient repack + FP4 GEMM 路径。
@@ -44,6 +48,14 @@ backward: dX = dY @ Q4(W0)   + dY @ B @ A
           dA = (dY @ B).T @ x
 ```
 
+推荐的微调形态是 personal-vault 里“方案 B”：
+
+```text
+forward: y = x @ Q4(W0).T + x @ R_down.T @ R_up.T + scaling * x @ A.T @ B.T
+```
+
+其中 `R_down/R_up` 冻结，用 `W - dequant(Q4(W))` 的低秩 SVD 初始化，持续承担量化误差补偿；`A/B` 是 zero-init task LoRA，只负责下游任务适配。
+
 - 主要工程风险：
   - backward 不能常驻保存第二份 transposed FP4 packed weight，否则压缩权重内存接近翻倍。
   - 如果完全不缓存 forward LoRA activation，`dB` 需要重算 `x @ A.T`。
@@ -78,6 +90,8 @@ op = NunchakuFP4LoRALinear(
     rank=32,
     lowrank_dtype=torch.bfloat16,
     init="zero",
+    frozen_residual_rank=32,
+    frozen_residual_init="residual_svd",
 )
 y = op(x)
 ```
@@ -90,6 +104,9 @@ from native_fp4 import FP4LoRAConfig, convert_linear_to_fp4_lora
 cfg = FP4LoRAConfig(
     rank=32,
     lowrank_dtype=torch.bfloat16,
+    init="zero",
+    frozen_residual_rank=32,
+    frozen_residual_init="residual_svd",
     fuse_lora_dx=True,
     cache_fused_lora_dx=True,
 )
@@ -115,6 +132,7 @@ checkpoint 边界：
 
 - `fp4_lora_state_dict` 只导出 `lora_down/lora_up` 和可选 trainable bias。
 - 不导出 `qweight/wscales/wscales_bwd_*` 等 frozen FP4 backbone buffers。
+- 不导出 `frozen_residual_down/frozen_residual_up`；它们属于 quantized base model 的 frozen compensation branch，不属于 task adapter。
 - `load_fp4_lora_state_dict` 加载后会清空 packed LoRA dX cache，避免 adapter 参数与 cache 不一致。
 
 Optimizer 示例：
@@ -150,6 +168,9 @@ optimizer 边界：
   - `zero`：标准 LoRA 零效果初始化，`A` Kaiming，`B` 为 0。
   - `gaussian`：`A/B` 都用小方差正态，用于 correctness/压力测试。
   - `residual_svd`：用 `W0 - dequant(Q4(W0))` 的低秩 SVD 初始化 LoRA，贴近 SVDQuant residual branch。
+- `frozen_residual_rank/frozen_residual_init`：
+  - `0/"none"`：只使用 trainable task LoRA。
+  - `rank/"residual_svd"`：额外构造 frozen residual branch，推荐与 `init="zero"` 搭配，避免训练破坏量化补偿。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
 - `target_modules/exclude_modules`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA。
 
@@ -159,8 +180,10 @@ P0 backward 的计算拆分如下：
 
 ```text
 dX_main = NunchakuFP4BackwardDXOp(dY)
+dy_res  = dY @ R_up
+res_dX  = dy_res @ R_down
 dy_up   = dY @ B
-dX      = dX_main + scaling * dy_up @ A
+dX      = dX_main + res_dX + scaling * dy_up @ A
 dB      = scaling * dY.T @ lora_act
 dA      = scaling * dy_up.T @ x
 ```
@@ -168,8 +191,9 @@ dA      = scaling * dy_up.T @ x
 其中：
 
 - `dX_main` 调 CUDA FP4 kernel。
-- `dX_lora/dA/dB` 暂时调 PyTorch matmul。
+- `dX_residual/dX_lora/dA/dB` 暂时调 PyTorch matmul。
 - 当前没有训练 FP4 backbone，也不会产生 backbone `dW`。
+- frozen residual branch 是 buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
 - 当前默认不预存 backward packed weight；沿用 transient CUDA repack，符合“不让常驻内存乘 2”的约束。
 - `NunchakuFP4LoRALinear` 会让 forward/backward op 共享同一份 resident `qweight/wscales`，只额外保存 backward scale metadata。
 
@@ -279,11 +303,13 @@ P4：加入 activation cache policy：
 - `recompute_lora_act`：只保存 `x`，少存一个 `[M, rank]`。
 - `checkpoint`：进一步重算上游 activation，面向长序列微调。
 
-P5：加入 outlier-aware FP4 训练策略：
+P5：dual-branch residual/task LoRA 初始化已落地 P0；后续优化是把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue，避免当前 residual branch 的 dense PyTorch matmul。
+
+P6：加入 outlier-aware FP4 训练策略：
 
 - activation smooth / online scale 统计。
 - 对敏感 projection 保留 BF16。
-- residual LoRA 初始化和 task LoRA 初始化分离。
+- residual LoRA 初始化和 task LoRA 初始化分离后的 scale/outlier 策略。
 
 ## 验证命令
 
@@ -296,12 +322,25 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16
+
+conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
+  --m 129 \
+  --in-features 512 \
+  --out-features 768 \
+  --rank 32 \
+  --frozen-residual-rank 32 \
+  --frozen-residual-init residual_svd \
+  --init zero \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx
 ```
 
 验证项：
 
 如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`；如果要验证 fused dX 路径，追加 `--fuse-lora-dx`；如果要验证 packed LoRA dX cache，追加 `--cache-fused-lora-dx`。
 
-- forward wrapper 是否等价于手写 `FP4 main + LoRA dense branch`。
-- `dX` 是否等价于 `FP4 backward dX + LoRA dense dX`。
+- forward wrapper 是否等价于手写 `FP4 main + frozen residual branch + LoRA dense branch`。
+- `dX` 是否等价于 `FP4 backward dX + frozen residual dX + LoRA dense dX`。
 - `dA/dB/bias` 是否等价于手写 BF16/FP16 matmul 梯度。

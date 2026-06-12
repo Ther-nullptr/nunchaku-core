@@ -55,8 +55,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--rank", type=int, default=32)
+    p.add_argument("--frozen-residual-rank", type=int, default=0)
+    p.add_argument("--frozen-residual-init", choices=["none", "residual_svd"], default="none")
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -77,7 +80,9 @@ def main() -> None:
     cfg = FP4LoRAConfig(
         rank=args.rank,
         lowrank_dtype=lowrank_dtype,
-        init="gaussian",
+        init=args.init,
+        frozen_residual_rank=args.frozen_residual_rank,
+        frozen_residual_init=args.frozen_residual_init,
         train_bias=False,
         cache_lora_act=True,
         fuse_lora_dx=args.fuse_lora_dx,
@@ -100,6 +105,18 @@ def main() -> None:
     loss.backward()
 
     fp4_modules = dict(iter_fp4_lora_modules(model))
+    frozen_residual_modules = {
+        name: child for name, child in fp4_modules.items() if child.has_frozen_residual
+    }
+    expected_frozen_residual_count = len(replaced) if args.frozen_residual_init != "none" else 0
+    frozen_residual_params = {
+        name for name, _ in model.named_parameters() if "frozen_residual" in name
+    }
+    frozen_residual_buffers_finite = all(
+        bool(torch.isfinite(child.frozen_residual_down).all())
+        and bool(torch.isfinite(child.frozen_residual_up).all())
+        for child in frozen_residual_modules.values()
+    )
     trainable_named = {name for name, param in model.named_parameters() if param.requires_grad}
     grad_named = {name for name, param in model.named_parameters() if param.grad is not None}
     expected_replaced = {
@@ -131,7 +148,7 @@ def main() -> None:
     )
 
     adapter_state = fp4_lora_state_dict(model)
-    adapter_state_finite = all(torch.isfinite(value).all() for value in adapter_state.values())
+    adapter_state_finite = all(bool(torch.isfinite(value).all()) for value in adapter_state.values())
     model2 = TinyModel(args.hidden, dtype).cuda()
     model2, replaced2 = convert_linear_to_fp4_lora(
         model2,
@@ -167,6 +184,9 @@ def main() -> None:
         "cache_count_matches": refreshed == expected_cache_count,
         "clear_count_matches": cleared == len(replaced),
         "refresh_after_clear_matches": refreshed_after_clear == expected_cache_count,
+        "frozen_residual_count_matches": len(frozen_residual_modules) == expected_frozen_residual_count,
+        "frozen_residual_not_parameter": frozen_residual_params == set(),
+        "frozen_residual_buffers_finite": frozen_residual_buffers_finite,
         "lora_named_parameters_match_trainable": set(named_lora_params) == set(trainable),
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
         "optimizer_pre_step_refresh_count_matches": pre_step_refreshed == expected_cache_count,
@@ -174,6 +194,7 @@ def main() -> None:
         "optimizer_hook_caches_current": optimizer_hook_caches_current,
         "adapter_state_finite": adapter_state_finite,
         "adapter_state_keys_match": set(adapter_state) == expected_adapter_keys,
+        "adapter_state_excludes_frozen_residual": not any("frozen_residual" in key for key in adapter_state),
         "adapter_state_load_missing_empty": missing == [],
         "adapter_state_load_unexpected_empty": unexpected == [],
         "adapter_state_loaded_matches": loaded_matches,
@@ -185,14 +206,18 @@ def main() -> None:
             "batch": args.batch,
             "hidden": args.hidden,
             "rank": args.rank,
+            "frozen_residual_rank": args.frozen_residual_rank,
+            "frozen_residual_init": args.frozen_residual_init,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
+            "init": args.init,
             "fuse_lora_dx": args.fuse_lora_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
         },
         "replaced": replaced,
         "trainable": trainable,
         "grad_named": sorted(grad_named),
+        "frozen_residual_modules": sorted(frozen_residual_modules),
         "cache_counts": {
             "refreshed": refreshed,
             "cleared": cleared,

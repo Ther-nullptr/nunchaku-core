@@ -31,8 +31,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--in-features", type=int, default=3072)
     p.add_argument("--out-features", type=int, default=3584)
     p.add_argument("--rank", type=int, default=32)
+    p.add_argument("--frozen-residual-rank", type=int, default=0)
+    p.add_argument("--frozen-residual-init", choices=["none", "residual_svd"], default="none")
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-cache-lora-act", action="store_true")
     p.add_argument("--fuse-lora-dx", action="store_true")
@@ -61,7 +64,9 @@ def main() -> None:
         bias=bias,
         rank=args.rank,
         lowrank_dtype=lowrank_dtype,
-        init="gaussian",
+        init=args.init,
+        frozen_residual_rank=args.frozen_residual_rank,
+        frozen_residual_init=args.frozen_residual_init,
         train_bias=True,
         cache_lora_act=not args.no_cache_lora_act,
         fuse_lora_dx=args.fuse_lora_dx,
@@ -100,10 +105,20 @@ def main() -> None:
         y_main = op.fp4_forward(x.detach())
         lora_act = torch.matmul(x_lr, down_lr.t())
         y_lora = torch.matmul(lora_act, up_lr.t()).mul(op.scaling).to(dtype)
-        y_ref = y_main + y_lora.reshape_as(y_main) + op.bias.detach().to(dtype)
+        y_ref = y_main + y_lora.reshape_as(y_main)
 
         dy_up = torch.matmul(dy_lr, up_lr)
         dx_ref = op.fp4_backward(dy) + torch.matmul(dy_up, down_lr).mul(op.scaling).reshape_as(x).to(dtype)
+        if op.has_frozen_residual:
+            residual_down_lr = op.frozen_residual_down.detach().to(lowrank_dtype)
+            residual_up_lr = op.frozen_residual_up.detach().to(lowrank_dtype)
+            residual_act = torch.matmul(x_lr, residual_down_lr.t())
+            y_residual = torch.matmul(residual_act, residual_up_lr.t()).mul(op.frozen_residual_scaling)
+            y_ref = y_ref + y_residual.reshape_as(y_main).to(dtype)
+            dy_residual_up = torch.matmul(dy_lr, residual_up_lr)
+            dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(op.frozen_residual_scaling)
+            dx_ref = dx_ref + dx_residual.reshape_as(x).to(dtype)
+        y_ref = y_ref + op.bias.detach().to(dtype)
         d_up_ref = torch.matmul(dy_lr.t(), lora_act).mul(op.scaling).to(op.lora_up.dtype)
         d_down_ref = torch.matmul(dy_up.t(), x_lr).mul(op.scaling).to(op.lora_down.dtype)
         d_bias_ref = dy2d.sum(dim=0).to(op.bias.dtype)
@@ -127,6 +142,11 @@ def main() -> None:
             and torch.isfinite(x.grad).all()
             and torch.isfinite(op.lora_up.grad).all()
             and torch.isfinite(op.lora_down.grad).all()
+            and (not op.has_frozen_residual or bool(torch.isfinite(op.frozen_residual_down).all()))
+            and (not op.has_frozen_residual or bool(torch.isfinite(op.frozen_residual_up).all()))
+        ),
+        "frozen_residual_is_buffer": not any(
+            name.startswith("frozen_residual") for name, _ in op.named_parameters()
         ),
         "cache_refresh_after_param_update": cache_refresh_check,
     }
@@ -138,8 +158,12 @@ def main() -> None:
             "out_features": args.out_features,
             "rank": args.rank,
             "effective_rank": op.rank,
+            "frozen_residual_rank": args.frozen_residual_rank,
+            "effective_frozen_residual_rank": op.frozen_residual_rank,
+            "frozen_residual_init": args.frozen_residual_init,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
+            "init": args.init,
             "cache_lora_act": not args.no_cache_lora_act,
             "fuse_lora_dx": args.fuse_lora_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,

@@ -155,10 +155,11 @@ class NunchakuFP4GemmOp(torch.nn.Module):
 
         self.out_features, self.in_features = weight.shape
         self.k_pad = ceil_divide(self.in_features, 128) * 128
-        self.n_pad = ceil_divide(self.out_features, 128) * 128
+        # BF16 FP4 weight quantization uses a 256-row M tile; 128-row padding can abort on odd N.
+        self.n_pad = ceil_divide(self.out_features, 256) * 256
         self.compute_dtype = weight.dtype
 
-        weight_pad = pad_tensor(weight, divisor=(128, 128), dim=(0, 1))
+        weight_pad = pad_tensor(weight, divisor=(256, 128), dim=(0, 1))
 
         smooth = torch.ones(self.k_pad, dtype=weight.dtype, device=weight.device)
         self.register_buffer("smooth", smooth, persistent=False)
@@ -179,7 +180,7 @@ class NunchakuFP4GemmOp(torch.nn.Module):
         if bias is None:
             self.register_buffer("bias_pad", None, persistent=True)
         else:
-            bias_pad = pad_tensor(bias.to(weight.dtype), divisor=128, dim=0)
+            bias_pad = pad_tensor(bias.to(weight.dtype), divisor=256, dim=0)
             self.register_buffer("bias_pad", bias_pad.contiguous(), persistent=True)
 
     def quantize_input(self, x2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -271,7 +272,7 @@ class NunchakuFP4LowRankOp(NunchakuFP4GemmOp):
 
         # Build low-rank branch from the FP4 quantization residual rather than the full weight.
         # This matches the intended "4-bit main branch + 16-bit residual branch" decomposition.
-        weight_pad = pad_tensor(weight, divisor=(128, 128), dim=(0, 1))
+        weight_pad = pad_tensor(weight, divisor=(256, 128), dim=(0, 1))
         weight_hat, _ = dequantize_fp4_weight(
             qweight=self.qweight,
             packed_wscales=self.wscales,
@@ -550,7 +551,7 @@ class NunchakuFP4LowRankBackwardDXOp(NunchakuFP4BackwardDXOp):
         self.rank = rank
         self.lowrank_dtype = lowrank_dtype
 
-        weight_pad = pad_tensor(weight, divisor=(128, 128), dim=(0, 1))
+        weight_pad = pad_tensor(weight, divisor=(256, 128), dim=(0, 1))
         u, s, vh = torch.linalg.svd(weight_pad.float(), full_matrices=False)
         eff_rank = min(rank, s.numel())
 

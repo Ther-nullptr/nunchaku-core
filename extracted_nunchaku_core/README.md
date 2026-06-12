@@ -91,7 +91,7 @@ pip install -e .
 先确认 Python 封装能正常导入：
 
 ```bash
-python -c "from native_fp4 import NunchakuFP4GemmOp, NunchakuFP4LowRankOp, NunchakuFP4BackwardDXOp, NunchakuFP4LowRankBackwardDXOp; from native_fp8 import NunchakuFP8GemmOp; print('import ok')"
+python -c "from native_fp4 import NunchakuFP4GemmOp, NunchakuFP4LowRankOp, NunchakuFP4BackwardDXOp, NunchakuFP4LowRankBackwardDXOp, NunchakuFP4LoRALinear; from native_fp8 import NunchakuFP8GemmOp; print('import ok')"
 ```
 
 如果这里失败，不要急着跑 benchmark，先回去重编译。
@@ -321,6 +321,47 @@ python benchmarks/benchmark_native_fp4_backward.py \
 
 当前这条路径是已经测出来的最优版本。
 
+## 10.1 FP4 LoRA training correctness
+
+如果你要把 frozen FP4 backbone + trainable BF16/FP16 LoRA 接到微调流程，先验证新的训练接口：
+
+```bash
+python benchmarks/validate_native_fp4_lora_training.py \
+  --m 257 \
+  --in-features 3072 \
+  --out-features 3584 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16
+```
+
+结果会写到：
+
+- `results/latest_native_fp4_lora_training_validation.json`
+
+重点字段：
+
+- `all_passed`
+- `forward_vs_manual`
+- `dx_vs_manual`
+- `lora_up_grad_vs_manual`
+- `lora_down_grad_vs_manual`
+
+这个脚本验证的是 `NunchakuFP4LoRALinear` 与手写公式一致：
+
+```text
+y  = FP4_GEMM(x, W0) + scaling * (x @ A.T) @ B.T + bias
+dX = FP4_dX(dY, W0) + scaling * (dY @ B) @ A
+dB = scaling * dY.T @ (x @ A.T)
+dA = scaling * (dY @ B).T @ x
+```
+
+详细设计见：
+
+- [docs/fp4_lora_finetuning_design.md](/home/wyj24/projects/nunchaku/extracted_nunchaku_core/docs/fp4_lora_finetuning_design.md)
+
+如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -334,6 +375,7 @@ python benchmarks/benchmark_nunchaku_native_fp4.py --m 4096 --in-features 4096 -
 python benchmarks/benchmark_fp4_bf16_fusion_ablation.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --lowrank-dtype bf16 --warmup 20 --iters 50
 python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
+python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
 ```
 
 ## 12. 主要 Python 接口
@@ -350,6 +392,8 @@ python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 -
   - backward 纯 FP4 `dX`
 - `native_fp4.NunchakuFP4LowRankBackwardDXOp`
   - backward 混合算子和 full backward 多种路径
+- `native_fp4.NunchakuFP4LoRALinear`
+  - frozen FP4 backbone + trainable BF16/FP16 LoRA 微调接口
 
 ## 13. 结果文件说明
 
@@ -365,6 +409,8 @@ python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 -
   - backward benchmark
 - `latest_native_fp4_backward_validation.json`
   - backward correctness
+- `latest_native_fp4_lora_training_validation.json`
+  - FP4 LoRA training wrapper correctness
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

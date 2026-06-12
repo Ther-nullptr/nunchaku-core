@@ -193,6 +193,18 @@ def main() -> None:
         cache_lora_act=False,
         fuse_lora_dx=True,
     )
+    fp4_cached_fused_dx_cached_pack = NunchakuFP4LoRALinear(
+        weight=weight,
+        bias=bias,
+        rank=args.rank,
+        lora_alpha=args.lora_alpha,
+        lowrank_dtype=lowrank_dtype,
+        init="gaussian",
+        train_bias=args.train_bias,
+        cache_lora_act=True,
+        fuse_lora_dx=True,
+        cache_fused_lora_dx=True,
+    )
     dense = DenseLoRALinear(
         weight=weight,
         bias=bias,
@@ -203,11 +215,11 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        for module in (fp4_recompute, fp4_cached_fused_dx, fp4_recompute_fused_dx, dense):
+        for module in (fp4_recompute, fp4_cached_fused_dx, fp4_recompute_fused_dx, fp4_cached_fused_dx_cached_pack, dense):
             module.lora_down.copy_(fp4_cached.lora_down)
             module.lora_up.copy_(fp4_cached.lora_up)
         if args.train_bias:
-            for module in (fp4_recompute, fp4_cached_fused_dx, fp4_recompute_fused_dx, dense):
+            for module in (fp4_recompute, fp4_cached_fused_dx, fp4_recompute_fused_dx, fp4_cached_fused_dx_cached_pack, dense):
                 module.bias.copy_(fp4_cached.bias)
 
     with torch.no_grad():
@@ -235,6 +247,17 @@ def main() -> None:
         fp4_recompute_fused_dx, x, dy, args.warmup, args.iters
     )
 
+    def refresh_fused_lora_dx_cache_fn() -> None:
+        fp4_cached_fused_dx_cached_pack.clear_fused_lora_dx_cache()
+        fp4_cached_fused_dx_cached_pack.refresh_fused_lora_dx_cache()
+
+    refresh_fused_lora_dx_cache_ms = time_cuda(
+        refresh_fused_lora_dx_cache_fn, warmup=args.warmup, iters=args.iters
+    )
+    fp4_cached_fused_dx_cached_pack_train_step_ms = benchmark_train_step(
+        fp4_cached_fused_dx_cached_pack, x, dy, args.warmup, args.iters
+    )
+
     payload = {
         "shape": {
             "m": args.m,
@@ -259,6 +282,10 @@ def main() -> None:
             "fp4_recompute_train_step": fp4_recompute_train_step_ms,
             "fp4_cached_fused_dx_train_step": fp4_cached_fused_dx_train_step_ms,
             "fp4_recompute_fused_dx_train_step": fp4_recompute_fused_dx_train_step_ms,
+            "fp4_cached_fused_dx_cached_pack_train_step": fp4_cached_fused_dx_cached_pack_train_step_ms,
+            "refresh_fused_lora_dx_cache": refresh_fused_lora_dx_cache_ms,
+            "fp4_cached_fused_dx_cached_pack_plus_refresh_train_step": fp4_cached_fused_dx_cached_pack_train_step_ms
+            + refresh_fused_lora_dx_cache_ms,
             "dense_backward_estimate": dense_train_step_ms - dense_forward_train_graph_ms,
             "fp4_cached_backward_estimate": fp4_cached_train_step_ms - fp4_cached_forward_train_graph_ms,
             "fp4_recompute_backward_estimate": fp4_recompute_train_step_ms - fp4_recompute_forward_train_graph_ms,
@@ -266,6 +293,8 @@ def main() -> None:
             - fp4_cached_forward_train_graph_ms,
             "fp4_recompute_fused_dx_backward_estimate": fp4_recompute_fused_dx_train_step_ms
             - fp4_recompute_forward_train_graph_ms,
+            "fp4_cached_fused_dx_cached_pack_backward_estimate": fp4_cached_fused_dx_cached_pack_train_step_ms
+            - fp4_cached_forward_train_graph_ms,
         },
         "speedups": {
             "fp4_cached_forward_inference_vs_dense": dense_forward_inference_ms / fp4_cached_forward_inference_ms,
@@ -280,6 +309,10 @@ def main() -> None:
             "fp4_cached_fused_dx_train_step_vs_dense": dense_train_step_ms / fp4_cached_fused_dx_train_step_ms,
             "fp4_recompute_fused_dx_train_step_vs_dense": dense_train_step_ms
             / fp4_recompute_fused_dx_train_step_ms,
+            "fp4_cached_fused_dx_cached_pack_train_step_vs_dense": dense_train_step_ms
+            / fp4_cached_fused_dx_cached_pack_train_step_ms,
+            "fp4_cached_fused_dx_cached_pack_plus_refresh_train_step_vs_dense": dense_train_step_ms
+            / (fp4_cached_fused_dx_cached_pack_train_step_ms + refresh_fused_lora_dx_cache_ms),
             "fp4_cached_backward_estimate_vs_dense": (dense_train_step_ms - dense_forward_train_graph_ms)
             / (fp4_cached_train_step_ms - fp4_cached_forward_train_graph_ms),
             "fp4_recompute_backward_estimate_vs_dense": (dense_train_step_ms - dense_forward_train_graph_ms)
@@ -290,9 +323,17 @@ def main() -> None:
                 dense_train_step_ms - dense_forward_train_graph_ms
             )
             / (fp4_recompute_fused_dx_train_step_ms - fp4_recompute_forward_train_graph_ms),
+            "fp4_cached_fused_dx_cached_pack_backward_estimate_vs_dense": (
+                dense_train_step_ms - dense_forward_train_graph_ms
+            )
+            / (fp4_cached_fused_dx_cached_pack_train_step_ms - fp4_cached_forward_train_graph_ms),
             "cache_vs_recompute_train_step": fp4_recompute_train_step_ms / fp4_cached_train_step_ms,
             "fused_dx_cached_vs_dense_dx_cached_train_step": fp4_cached_train_step_ms
             / fp4_cached_fused_dx_train_step_ms,
+            "fused_dx_cached_pack_vs_dynamic_pack_train_step": fp4_cached_fused_dx_train_step_ms
+            / fp4_cached_fused_dx_cached_pack_train_step_ms,
+            "fused_dx_cached_pack_plus_refresh_vs_dynamic_pack_train_step": fp4_cached_fused_dx_train_step_ms
+            / (fp4_cached_fused_dx_cached_pack_train_step_ms + refresh_fused_lora_dx_cache_ms),
             "fused_dx_recompute_vs_dense_dx_recompute_train_step": fp4_recompute_train_step_ms
             / fp4_recompute_fused_dx_train_step_ms,
         },

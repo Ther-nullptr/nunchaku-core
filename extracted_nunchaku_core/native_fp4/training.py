@@ -36,6 +36,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         lowrank_dtype: torch.dtype,
         cache_lora_act: bool,
         fuse_lora_dx: bool,
+        packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         if x.shape[-1] != fp4_forward_op.in_features:
             raise ValueError(f"Expected input last dim = {fp4_forward_op.in_features}, got {x.shape[-1]}")
@@ -62,6 +63,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.lowrank_dtype = lowrank_dtype
         ctx.cache_lora_act = bool(cache_lora_act)
         ctx.fuse_lora_dx = bool(fuse_lora_dx)
+        ctx.packed_lora_dx = packed_lora_dx
         ctx.has_bias = bias is not None
         ctx.in_features = fp4_forward_op.in_features
         ctx.out_features = fp4_forward_op.out_features
@@ -98,6 +100,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 lowrank_dtype=ctx.lowrank_dtype,
                 in_features=ctx.in_features,
                 out_features=ctx.out_features,
+                packed_lora_dx=ctx.packed_lora_dx,
             )
         else:
             dx_main = ctx.fp4_backward_op(dy)
@@ -113,6 +116,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             d_lora_down,
             d_lora_up,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -149,6 +153,7 @@ def _fused_lora_dx(
     lowrank_dtype: torch.dtype,
     in_features: int,
     out_features: int,
+    packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     orig_shape = dy.shape
     dy2d_src = dy.reshape(-1, out_features)
@@ -156,13 +161,16 @@ def _fused_lora_dx(
     if fp4_backward_op.n_pad != out_features:
         dy2d = pad_tensor(dy2d, divisor=fp4_backward_op.n_pad, dim=1)
 
-    lora_down_bwd_packed, lora_up_bwd_packed = _pack_trainable_lora_for_fused_dx(
-        lora_down=lora_down,
-        lora_up=lora_up,
-        fp4_backward_op=fp4_backward_op,
-        scaling=scaling,
-        lowrank_dtype=lowrank_dtype,
-    )
+    if packed_lora_dx is None:
+        lora_down_bwd_packed, lora_up_bwd_packed = _pack_trainable_lora_for_fused_dx(
+            lora_down=lora_down,
+            lora_up=lora_up,
+            fp4_backward_op=fp4_backward_op,
+            scaling=scaling,
+            lowrank_dtype=lowrank_dtype,
+        )
+    else:
+        lora_down_bwd_packed, lora_up_bwd_packed = packed_lora_dx
     qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
         dy2d,
         lora_down_packed=lora_down_bwd_packed,
@@ -189,8 +197,9 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
 
     Backward:
         dX uses the native FP4 backward dX kernel for W0 plus either a dense
-        LoRA term or the optional fused LoRA dX epilogue. dA/dB still use
-        torch BF16/FP16 matmul.
+        LoRA term or the optional fused LoRA dX epilogue. The fused path can
+        cache packed LoRA dX weights with version-based invalidation. dA/dB
+        still use torch BF16/FP16 matmul.
     """
 
     def __init__(
@@ -204,6 +213,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         train_bias: bool = False,
         cache_lora_act: bool = True,
         fuse_lora_dx: bool = False,
+        cache_fused_lora_dx: bool = False,
     ):
         super().__init__()
         if not weight.is_cuda:
@@ -229,11 +239,17 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.scaling = self.lora_alpha / float(self.rank)
         self.cache_lora_act = bool(cache_lora_act)
         self.fuse_lora_dx = bool(fuse_lora_dx)
+        self.cache_fused_lora_dx = bool(cache_fused_lora_dx)
         self.init_mode = init
 
         self.fp4_forward = NunchakuFP4GemmOp(weight=weight, bias=None, dummy_rank=self.rank)
         self.fp4_backward = NunchakuFP4BackwardDXOp(weight=weight, dummy_rank=self.rank)
         self._share_forward_backbone_with_backward()
+        self.register_buffer("_cached_lora_down_bwd_packed", None, persistent=False)
+        self.register_buffer("_cached_lora_up_bwd_packed", None, persistent=False)
+        self._cached_lora_down_version = -1
+        self._cached_lora_up_version = -1
+        self._cached_lora_scaling = None
 
         self.lora_down = torch.nn.Parameter(
             torch.empty(self.rank, self.in_features, device=weight.device, dtype=lowrank_dtype)
@@ -279,6 +295,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         train_bias: bool = False,
         cache_lora_act: bool = True,
         fuse_lora_dx: bool = False,
+        cache_fused_lora_dx: bool = False,
     ) -> "NunchakuFP4LoRALinear":
         return cls(
             weight=linear.weight.detach(),
@@ -290,7 +307,44 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             train_bias=train_bias,
             cache_lora_act=cache_lora_act,
             fuse_lora_dx=fuse_lora_dx,
+            cache_fused_lora_dx=cache_fused_lora_dx,
         )
+
+    def clear_fused_lora_dx_cache(self) -> None:
+        self._cached_lora_down_bwd_packed = None
+        self._cached_lora_up_bwd_packed = None
+        self._cached_lora_down_version = -1
+        self._cached_lora_up_version = -1
+        self._cached_lora_scaling = None
+
+    def refresh_fused_lora_dx_cache(self) -> None:
+        with torch.no_grad():
+            lora_down_bwd_packed, lora_up_bwd_packed = _pack_trainable_lora_for_fused_dx(
+                lora_down=self.lora_down,
+                lora_up=self.lora_up,
+                fp4_backward_op=self.fp4_backward,
+                scaling=self.scaling,
+                lowrank_dtype=self.lowrank_dtype,
+            )
+        self._cached_lora_down_bwd_packed = lora_down_bwd_packed.detach()
+        self._cached_lora_up_bwd_packed = lora_up_bwd_packed.detach()
+        self._cached_lora_down_version = self.lora_down._version
+        self._cached_lora_up_version = self.lora_up._version
+        self._cached_lora_scaling = float(self.scaling)
+
+    def _get_fused_lora_dx_cache(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not (self.fuse_lora_dx and self.cache_fused_lora_dx):
+            return None
+        cache_valid = (
+            self._cached_lora_down_bwd_packed is not None
+            and self._cached_lora_up_bwd_packed is not None
+            and self._cached_lora_down_version == self.lora_down._version
+            and self._cached_lora_up_version == self.lora_up._version
+            and self._cached_lora_scaling == float(self.scaling)
+        )
+        if not cache_valid:
+            self.refresh_fused_lora_dx_cache()
+        return self._cached_lora_down_bwd_packed, self._cached_lora_up_bwd_packed
 
     def reset_lora_parameters(self, weight: torch.Tensor | None = None) -> None:
         with torch.no_grad():
@@ -304,6 +358,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
                 if weight is None:
                     raise ValueError("weight is required for residual_svd initialization")
                 self._init_from_residual_svd(weight)
+            self.clear_fused_lora_dx_cache()
 
     def _init_from_residual_svd(self, weight: torch.Tensor) -> None:
         weight_pad = pad_tensor(weight, divisor=(256, 128), dim=(0, 1))
@@ -339,6 +394,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.lowrank_dtype,
             self.cache_lora_act,
             self.fuse_lora_dx,
+            self._get_fused_lora_dx_cache(),
         )
 
     def lora_weight(self) -> torch.Tensor:
@@ -349,5 +405,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"rank={self.rank}, lora_alpha={self.lora_alpha:g}, "
             f"lowrank_dtype={self.lowrank_dtype}, init={self.init_mode}, "
-            f"cache_lora_act={self.cache_lora_act}, fuse_lora_dx={self.fuse_lora_dx}"
+            f"cache_lora_act={self.cache_lora_act}, fuse_lora_dx={self.fuse_lora_dx}, "
+            f"cache_fused_lora_dx={self.cache_fused_lora_dx}"
         )

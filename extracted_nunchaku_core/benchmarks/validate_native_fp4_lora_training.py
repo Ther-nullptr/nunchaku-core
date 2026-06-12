@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-cache-lora-act", action="store_true")
     p.add_argument("--fuse-lora-dx", action="store_true")
+    p.add_argument("--cache-fused-lora-dx", action="store_true")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -63,11 +64,28 @@ def main() -> None:
         train_bias=True,
         cache_lora_act=not args.no_cache_lora_act,
         fuse_lora_dx=args.fuse_lora_dx,
+        cache_fused_lora_dx=args.cache_fused_lora_dx,
     )
+
+    cache_refresh_check = True
+    if args.cache_fused_lora_dx:
+        op.refresh_fused_lora_dx_cache()
+        old_down_version = op._cached_lora_down_version
+        old_up_version = op._cached_lora_up_version
+        with torch.no_grad():
+            op.lora_down.add_(1e-4)
+            op.lora_up.add_(1e-4)
+        cache_refresh_check = old_down_version != op.lora_down._version and old_up_version != op.lora_up._version
 
     y = op(x)
     loss = (y.float() * dy.float()).sum()
     loss.backward()
+    if args.cache_fused_lora_dx:
+        cache_refresh_check = bool(
+            cache_refresh_check
+            and op._cached_lora_down_version == op.lora_down._version
+            and op._cached_lora_up_version == op.lora_up._version
+        )
 
     with torch.no_grad():
         x2d = x.detach().reshape(-1, op.in_features)
@@ -108,6 +126,7 @@ def main() -> None:
             and torch.isfinite(op.lora_up.grad).all()
             and torch.isfinite(op.lora_down.grad).all()
         ),
+        "cache_refresh_after_param_update": cache_refresh_check,
     }
 
     payload = {
@@ -121,6 +140,7 @@ def main() -> None:
             "lowrank_dtype": args.lowrank_dtype,
             "cache_lora_act": not args.no_cache_lora_act,
             "fuse_lora_dx": args.fuse_lora_dx,
+            "cache_fused_lora_dx": args.cache_fused_lora_dx,
         },
         "errors": errors,
         "checks": checks,

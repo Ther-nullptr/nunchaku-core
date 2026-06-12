@@ -147,6 +147,35 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=3, iters=6`：
 
 ## 后续优化路线
 
+### Breakdown 证据
+
+新增 breakdown benchmark：
+
+```bash
+conda run -n triton python benchmarks/benchmark_native_fp4_lora_training_breakdown.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+RTX 5090 短测，`M=N=K=4096, rank=32`：
+
+| dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 0.6228 | 0.2141 | 0.0788 | 12.6% | 0.0756 |
+| FP16 | 0.6547 | 0.2262 | 0.0390 | 6.0% | 0.0244 |
+
+直接结论：
+
+- `dA/dB` 目前不是最大瓶颈；低秩梯度专用 kernel 的收益上限有限。
+- 更值得优先看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
+- BF16 的 LoRA pack refresh 相对 cached fused dX 明显更贵，cache/refresh 策略仍值得继续优化。
+
 P1：进一步降低 `cache_fused_lora_dx=True` 的 refresh 开销，并评估 optimizer step 后刷新 cache 的实际训练收益。
 
 P2：修正 `quantize_grad_with_lora_dual` 的 dense `dy_up` 精度后，再考虑让一次 `dY` 读取同时服务 fused dX 和 `dA`。

@@ -426,6 +426,39 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=3, iters=6`：
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation 数字对测量顺序更敏感，建议看多轮结果再定默认策略。
 - `forward_fp4_vs_dense` 的误差是 FP4 量化相对 dense full precision 权重的误差，不是 wrapper correctness；wrapper correctness 请看 `validate_native_fp4_lora_training.py`。
 
+## 10.3 FP4 LoRA training backward breakdown
+
+如果要判断下一步该优化哪一块，跑 breakdown：
+
+```bash
+python benchmarks/benchmark_native_fp4_lora_training_breakdown.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+结果会写到：
+
+- `results/latest_native_fp4_lora_training_breakdown.json`
+
+RTX 5090 短测，`M=N=K=4096, rank=32`：
+
+| dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 0.6228 | 0.2141 | 0.0788 | 12.6% | 0.0756 |
+| FP16 | 0.6547 | 0.2262 | 0.0390 | 6.0% | 0.0244 |
+
+结论：
+
+- `dA/dB` 目前不是最大瓶颈；先写专用低秩梯度 kernel 的收益上限有限。
+- 下一步更应该看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
+- BF16 的 LoRA pack refresh 相对 cached fused dX 明显更贵，cache/refresh 策略仍值得继续优化。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -441,6 +474,7 @@ python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --o
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
 python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
+python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```
 
 ## 12. 主要 Python 接口

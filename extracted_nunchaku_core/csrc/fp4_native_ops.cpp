@@ -12,6 +12,7 @@ torch::Tensor fp4_repack_backward_cuda(
     torch::Tensor fwd_scales_logical,
     torch::Tensor bwd_scales_logical);
 void decode_lora_act_cuda(torch::Tensor packed_lora_act, torch::Tensor dense_lora_act);
+torch::Tensor pack_lowrank_weight_cuda(torch::Tensor weight, bool down);
 
 void gemm_w4a4(
     std::optional<torch::Tensor> act,
@@ -175,6 +176,17 @@ void decode_lora_act(torch::Tensor packed_lora_act, torch::Tensor dense_lora_act
     decode_lora_act_cuda(packed_lora_act, dense_lora_act);
 }
 
+torch::Tensor pack_lowrank_weight(torch::Tensor weight, bool down) {
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+    TORCH_CHECK(
+        weight.scalar_type() == torch::kHalf || weight.scalar_type() == torch::kBFloat16,
+        "weight dtype must be float16 or bfloat16");
+
+    return pack_lowrank_weight_cuda(weight, down);
+}
+
 } // namespace nunchaku_core::ops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -183,4 +195,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_w4a4_act_fuse_lora_dual", nunchaku_core::ops::quantize_w4a4_act_fuse_lora_dual);
     m.def("fp4_repack_backward", nunchaku_core::ops::fp4_repack_backward);
     m.def("decode_lora_act", nunchaku_core::ops::decode_lora_act);
+    m.def("pack_lowrank_weight", nunchaku_core::ops::pack_lowrank_weight);
 }

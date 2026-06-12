@@ -407,22 +407,22 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
 
 | dtype | dense train step ms | FP4 dense-dX step ms | FP4 fused-dX dynamic-pack ms | FP4 fused-dX cached-pack ms | cached+refresh ms | cached-pack speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 2.0009 | 0.9712 | 0.9700 | 0.9070 | 0.9321 | 2.206x |
-| FP16 | 1.7484 | 0.8998 | 0.8855 | 0.9055 | 0.9805 | 1.931x |
+| BF16 | 2.0159 | 0.9464 | 0.9148 | 0.8917 | 0.9058 | 2.261x |
+| FP16 | 1.7440 | 0.9009 | 0.8816 | 0.8708 | 0.8841 | 2.003x |
 
-Gradient accumulation 短测，`grad_accum_steps=4, warmup=3, iters=6`：
+Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 
 | dtype | dense per micro-step ms | FP4 dynamic-pack per micro-step ms | FP4 cached-pack per micro-step ms | cached-pack vs dense |
 | --- | ---: | ---: | ---: | ---: |
-| BF16 | 3.2149 | 1.4203 | 1.4099 | 2.280x |
-| FP16 | 3.5018 | 1.5209 | 1.2119 | 2.889x |
+| BF16 | 3.5701 | 1.5405 | 1.4255 | 2.504x |
+| FP16 | 3.5335 | 1.4621 | 1.5103 | 2.340x |
 
 说明：
 
 - `backward estimate = train_step - train_graph_forward`，用于判断 backward 优化方向，不是单独 CUDA event 包住 backward 的精确拆分。
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
-- BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 训练 step 快 `1.069x`；即使每步刷新 cache，也还有 `1.041x`。FP16 单步下 cached-pack 不划算。
+- BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 训练 step 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation 数字对测量顺序更敏感，建议看多轮结果再定默认策略。
 - `forward_fp4_vs_dense` 的误差是 FP4 量化相对 dense full precision 权重的误差，不是 wrapper correctness；wrapper correctness 请看 `validate_native_fp4_lora_training.py`。
 
@@ -450,14 +450,38 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 | dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 0.6228 | 0.2141 | 0.0788 | 12.6% | 0.0756 |
-| FP16 | 0.6547 | 0.2262 | 0.0390 | 6.0% | 0.0244 |
+| BF16 | 0.6195 | 0.2152 | 0.0761 | 12.3% | 0.0388 |
+| FP16 | 0.6467 | 0.2275 | 0.0396 | 6.1% | 0.0128 |
 
 结论：
 
 - `dA/dB` 目前不是最大瓶颈；先写专用低秩梯度 kernel 的收益上限有限。
 - 下一步更应该看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
-- BF16 的 LoRA pack refresh 相对 cached fused dX 明显更贵，cache/refresh 策略仍值得继续优化。
+- LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
+
+## 10.4 FP4 LoRA native pack validation
+
+`cache_fused_lora_dx=True` 需要把 trainable LoRA A/B 转成 Nunchaku fused dX epilogue 使用的 packed layout。当前默认走 CUDA `pack_lowrank_weight`，不缓存第二份 FP4 backbone。
+
+验证 CUDA pack 与原 PyTorch layout 参考实现 bitwise 一致，并测量单次 pack 开销：
+
+```bash
+python benchmarks/validate_native_fp4_lora_pack.py \
+  --dtype bf16 \
+  --warmup 20 \
+  --iters 100
+```
+
+结果会写到：
+
+- `results/latest_native_fp4_lora_pack_validation.json`
+
+RTX 5090 短测，默认 shapes：
+
+| dtype | typical native pack ms | typical torch pack ms | native speedup |
+| --- | ---: | ---: | ---: |
+| BF16 | 0.0058-0.0063 | 0.0195-0.0212 | 3.3x-3.6x |
+| FP16 | 0.0058-0.0060 | 0.0196-0.0212 | 3.3x-3.6x |
 
 ## 11. 建议的完整实验顺序
 
@@ -473,6 +497,7 @@ python benchmarks/benchmark_fp4_bf16_fusion_ablation.py --m 4096 --in-features 4
 python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
 python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
+python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```

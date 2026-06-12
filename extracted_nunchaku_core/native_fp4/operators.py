@@ -51,7 +51,7 @@ def pad_tensor(
     return out
 
 
-def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
+def _pack_lowrank_weight_torch(weight: torch.Tensor, down: bool) -> torch.Tensor:
     """Pack low-rank weights exactly following nunchaku_converter.pack_lowrank_weight."""
 
     if weight.dtype not in (torch.float16, torch.bfloat16):
@@ -79,6 +79,12 @@ def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
     weight = weight.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
 
     return weight.view(c, r)
+
+
+def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
+    if weight.is_cuda and hasattr(_OPS, "pack_lowrank_weight"):
+        return _OPS.pack_lowrank_weight(weight.contiguous(), down)
+    return _pack_lowrank_weight_torch(weight, down)
 
 
 def quantize_fp4_act_with_lora(

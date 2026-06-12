@@ -125,22 +125,22 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 | dtype | dense train step ms | FP4 dense-dX step ms | FP4 fused-dX dynamic-pack ms | FP4 fused-dX cached-pack ms | cached+refresh ms | cached-pack speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 2.0009 | 0.9712 | 0.9700 | 0.9070 | 0.9321 | 2.206x |
-| FP16 | 1.7484 | 0.8998 | 0.8855 | 0.9055 | 0.9805 | 1.931x |
+| BF16 | 2.0159 | 0.9464 | 0.9148 | 0.8917 | 0.9058 | 2.261x |
+| FP16 | 1.7440 | 0.9009 | 0.8816 | 0.8708 | 0.8841 | 2.003x |
 
-Gradient accumulation 短测，`grad_accum_steps=4, warmup=3, iters=6`：
+Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 
 | dtype | dense per micro-step ms | FP4 dynamic-pack per micro-step ms | FP4 cached-pack per micro-step ms | cached-pack vs dense |
 | --- | ---: | ---: | ---: | ---: |
-| BF16 | 3.2149 | 1.4203 | 1.4099 | 2.280x |
-| FP16 | 3.5018 | 1.5209 | 1.2119 | 2.889x |
+| BF16 | 3.5701 | 1.5405 | 1.4255 | 2.504x |
+| FP16 | 3.5335 | 1.4621 | 1.5103 | 2.340x |
 
 结论：
 
 - P0/P1 接口已经能在典型 4096 线性层上给出约 `1.9x-2.2x` 的训练 step 加速。
 - `fuse_lora_dx=True`：将 `dX_lora = (dY @ B) @ A` 的第二段放进 FP4 dX epilogue。
 - `cache_fused_lora_dx=True`：只缓存 LoRA packed A/B，额外内存约 `rank * (in + out)`，不缓存第二份 FP4 backbone；参数 version 变化时自动刷新。
-- BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.069x`；若每步都刷新 cache，仍快 `1.041x`。FP16 单步下 cached-pack 不划算。
+- BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。
 - 为保证训练梯度精度，`dA` 仍使用 dense `dY @ B`；dual-output kernel 的 dense `dY @ B` 在默认形状下给 `dA` 带来约 `3.3e-3` rel_l2，不作为默认梯度来源。
 - 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
@@ -167,16 +167,37 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 | dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 0.6228 | 0.2141 | 0.0788 | 12.6% | 0.0756 |
-| FP16 | 0.6547 | 0.2262 | 0.0390 | 6.0% | 0.0244 |
+| BF16 | 0.6195 | 0.2152 | 0.0761 | 12.3% | 0.0388 |
+| FP16 | 0.6467 | 0.2275 | 0.0396 | 6.1% | 0.0128 |
 
 直接结论：
 
 - `dA/dB` 目前不是最大瓶颈；低秩梯度专用 kernel 的收益上限有限。
 - 更值得优先看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
-- BF16 的 LoRA pack refresh 相对 cached fused dX 明显更贵，cache/refresh 策略仍值得继续优化。
+- LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
 
-P1：进一步降低 `cache_fused_lora_dx=True` 的 refresh 开销，并评估 optimizer step 后刷新 cache 的实际训练收益。
+### Native LoRA pack
+
+新增：
+
+- `csrc/fp4_lora_pack_cuda.cu`
+- `_fp4_native_cuda.pack_lowrank_weight`
+- `benchmarks/validate_native_fp4_lora_pack.py`
+
+作用：
+
+- 直接把 BF16/FP16 LoRA A/B 写成 Nunchaku fused dX epilogue 使用的 packed layout。
+- 替代原来的 PyTorch `pad + view + permute + contiguous` refresh 路径。
+- 不缓存第二份 transposed FP4 backbone，只降低 trainable LoRA packed cache 的刷新成本。
+
+RTX 5090 短测，`validate_native_fp4_lora_pack.py --dtype bf16/fp16 --warmup 20 --iters 100`：
+
+| dtype | typical native pack ms | typical torch pack ms | native speedup |
+| --- | ---: | ---: | ---: |
+| BF16 | 0.0058-0.0063 | 0.0195-0.0212 | 3.3x-3.6x |
+| FP16 | 0.0058-0.0060 | 0.0196-0.0212 | 3.3x-3.6x |
+
+P1：继续评估 optimizer step 后刷新 cache 的真实训练收益，尤其是梯度累积和多层模型里的调度噪声。
 
 P2：修正 `quantize_grad_with_lora_dual` 的 dense `dy_up` 精度后，再考虑让一次 `dY` 读取同时服务 fused dX 和 `dA`。
 

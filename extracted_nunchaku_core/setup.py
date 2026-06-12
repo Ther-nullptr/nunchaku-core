@@ -47,6 +47,7 @@ ext_modules = [
         sources=[
             "csrc/fp4_native_ops.cpp",
             "csrc/fp4_lora_decode_cuda.cu",
+            "csrc/fp4_lora_pack_cuda.cu",
             "csrc/fp4_repack_cuda.cu",
             "fp4_backend/src/interop/torch.cpp",
             "fp4_backend/src/kernels/zgemm/gemm_w4a4.cu",

@@ -7,18 +7,23 @@ from .operators import (
 )
 from .modeling import (
     FP4LoRAConfig,
+    FP4LoRACacheRefreshHook,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
+    fp4_lora_parameter_groups,
     fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
+    iter_fp4_lora_named_parameters,
     iter_fp4_lora_modules,
     load_fp4_lora_state_dict,
+    register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
 )
 from .training import NunchakuFP4LoRALinear
 
 __all__ = [
     "FP4LoRAConfig",
+    "FP4LoRACacheRefreshHook",
     "NunchakuFP4GemmOp",
     "NunchakuFP4LowRankOp",
     "NunchakuFP4LowRankUnfusedOp",
@@ -27,9 +32,12 @@ __all__ = [
     "NunchakuFP4LoRALinear",
     "clear_fused_lora_dx_caches",
     "convert_linear_to_fp4_lora",
+    "fp4_lora_parameter_groups",
     "fp4_lora_state_dict",
     "freeze_non_fp4_lora_parameters",
+    "iter_fp4_lora_named_parameters",
     "iter_fp4_lora_modules",
     "load_fp4_lora_state_dict",
+    "register_fp4_lora_cache_refresh_hook",
     "refresh_fused_lora_dx_caches",
 ]

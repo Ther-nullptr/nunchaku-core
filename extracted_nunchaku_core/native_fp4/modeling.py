@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 
@@ -118,6 +118,83 @@ def clear_fused_lora_dx_caches(module: torch.nn.Module) -> int:
     return count
 
 
+def iter_fp4_lora_named_parameters(
+    module: torch.nn.Module,
+    *,
+    train_bias: bool = False,
+) -> Iterator[tuple[str, torch.nn.Parameter]]:
+    """Yield LoRA-only trainable parameters from converted FP4 LoRA modules."""
+
+    for module_name, child in iter_fp4_lora_modules(module):
+        prefix = f"{module_name}." if module_name else ""
+        yield f"{prefix}lora_down", child.lora_down
+        yield f"{prefix}lora_up", child.lora_up
+        bias = getattr(child, "bias", None)
+        if train_bias and isinstance(bias, torch.nn.Parameter):
+            yield f"{prefix}bias", bias
+
+
+def fp4_lora_parameter_groups(
+    module: torch.nn.Module,
+    *,
+    train_bias: bool = False,
+    lora_weight_decay: float = 0.0,
+    bias_weight_decay: float = 0.0,
+    lr: float | None = None,
+) -> list[dict[str, Any]]:
+    """Return optimizer parameter groups containing only FP4 LoRA adapter params."""
+
+    lora_params: list[torch.nn.Parameter] = []
+    bias_params: list[torch.nn.Parameter] = []
+    for name, param in iter_fp4_lora_named_parameters(module, train_bias=train_bias):
+        if name.endswith(".bias") or name == "bias":
+            bias_params.append(param)
+        else:
+            lora_params.append(param)
+
+    groups: list[dict[str, Any]] = []
+    if lora_params:
+        group: dict[str, Any] = {"params": lora_params, "weight_decay": float(lora_weight_decay)}
+        if lr is not None:
+            group["lr"] = float(lr)
+        groups.append(group)
+    if bias_params:
+        group = {"params": bias_params, "weight_decay": float(bias_weight_decay)}
+        if lr is not None:
+            group["lr"] = float(lr)
+        groups.append(group)
+    return groups
+
+
+class FP4LoRACacheRefreshHook:
+    """Removable optimizer post-step hook that eagerly refreshes fused LoRA caches."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, module: torch.nn.Module):
+        self.module = module
+        self.last_refresh_count = 0
+        self.handle = optimizer.register_step_post_hook(self._hook)
+
+    def _hook(self, optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        del optimizer, args, kwargs
+        self.last_refresh_count = refresh_fused_lora_dx_caches(self.module)
+
+    def remove(self) -> None:
+        self.handle.remove()
+
+
+def register_fp4_lora_cache_refresh_hook(
+    optimizer: torch.optim.Optimizer,
+    module: torch.nn.Module,
+) -> FP4LoRACacheRefreshHook:
+    """Refresh packed LoRA dX caches after every optimizer step.
+
+    The wrapped modules also have lazy version-based invalidation, so this hook
+    is an eager refresh convenience for stable training-step latency.
+    """
+
+    return FP4LoRACacheRefreshHook(optimizer, module)
+
+
 def fp4_lora_state_dict(
     module: torch.nn.Module,
     *,
@@ -201,11 +278,10 @@ def freeze_non_fp4_lora_parameters(module: torch.nn.Module, train_bias: bool = F
         param.requires_grad_(False)
 
     trainable: list[str] = []
-    for module_name, child in iter_fp4_lora_modules(module):
-        prefix = f"{module_name}." if module_name else ""
-        for param_name, param in child.named_parameters(recurse=False):
-            allow = param_name in ("lora_down", "lora_up") or (train_bias and param_name == "bias")
-            param.requires_grad_(allow)
-            if allow:
-                trainable.append(f"{prefix}{param_name}")
+    allowed = {name for name, _ in iter_fp4_lora_named_parameters(module, train_bias=train_bias)}
+    for name, param in module.named_parameters():
+        allow = name in allowed
+        param.requires_grad_(allow)
+        if allow:
+            trainable.append(name)
     return trainable

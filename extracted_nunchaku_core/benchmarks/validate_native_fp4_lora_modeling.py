@@ -16,10 +16,13 @@ from native_fp4 import (  # noqa: E402
     NunchakuFP4LoRALinear,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
+    fp4_lora_parameter_groups,
     fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
+    iter_fp4_lora_named_parameters,
     iter_fp4_lora_modules,
     load_fp4_lora_state_dict,
+    register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
 )
 
@@ -106,8 +109,29 @@ def main() -> None:
         "layers.1.down_proj",
     }
     expected_adapter_keys = {f"{name}.{param}" for name in expected_replaced for param in ("lora_down", "lora_up")}
+    expected_cache_count = len(replaced) if args.fuse_lora_dx and args.cache_fused_lora_dx else 0
+
+    named_lora_params = dict(iter_fp4_lora_named_parameters(model))
+    param_groups = fp4_lora_parameter_groups(model, lora_weight_decay=0.0)
+    optimizer = torch.optim.AdamW(param_groups, lr=1e-3, eps=1e-4)
+    optimizer_hook = register_fp4_lora_cache_refresh_hook(optimizer, model)
+    pre_step_refreshed = refresh_fused_lora_dx_caches(model)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    hook_refresh_count = optimizer_hook.last_refresh_count
+    optimizer_hook.remove()
+    optimizer_param_ids = {id(param) for group in param_groups for param in group["params"]}
+    expected_param_ids = {id(param) for param in named_lora_params.values()}
+    optimizer_hook_caches_current = all(
+        child._cached_lora_down_version == child.lora_down._version
+        and child._cached_lora_up_version == child.lora_up._version
+        and child._cached_lora_scaling == float(child.scaling)
+        for _, child in iter_fp4_lora_modules(model)
+        if child.fuse_lora_dx and child.cache_fused_lora_dx
+    )
 
     adapter_state = fp4_lora_state_dict(model)
+    adapter_state_finite = all(torch.isfinite(value).all() for value in adapter_state.values())
     model2 = TinyModel(args.hidden, dtype).cuda()
     model2, replaced2 = convert_linear_to_fp4_lora(
         model2,
@@ -140,10 +164,15 @@ def main() -> None:
         "trainable_grads_present": set(trainable).issubset(grad_named),
         "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
         "output_finite": bool(torch.isfinite(y).all()),
-        "cache_count_matches": refreshed == (len(replaced) if args.fuse_lora_dx and args.cache_fused_lora_dx else 0),
+        "cache_count_matches": refreshed == expected_cache_count,
         "clear_count_matches": cleared == len(replaced),
-        "refresh_after_clear_matches": refreshed_after_clear
-        == (len(replaced) if args.fuse_lora_dx and args.cache_fused_lora_dx else 0),
+        "refresh_after_clear_matches": refreshed_after_clear == expected_cache_count,
+        "lora_named_parameters_match_trainable": set(named_lora_params) == set(trainable),
+        "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
+        "optimizer_pre_step_refresh_count_matches": pre_step_refreshed == expected_cache_count,
+        "optimizer_hook_refresh_count_matches": hook_refresh_count == expected_cache_count,
+        "optimizer_hook_caches_current": optimizer_hook_caches_current,
+        "adapter_state_finite": adapter_state_finite,
         "adapter_state_keys_match": set(adapter_state) == expected_adapter_keys,
         "adapter_state_load_missing_empty": missing == [],
         "adapter_state_load_unexpected_empty": unexpected == [],
@@ -169,6 +198,8 @@ def main() -> None:
             "cleared": cleared,
             "refreshed_after_clear": refreshed_after_clear,
             "pre_load_refreshed": pre_load_refreshed,
+            "pre_step_refreshed": pre_step_refreshed,
+            "optimizer_hook_refreshed": hook_refresh_count,
         },
         "adapter_state_keys": sorted(adapter_state),
         "checks": checks,

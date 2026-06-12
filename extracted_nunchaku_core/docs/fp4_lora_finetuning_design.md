@@ -57,6 +57,9 @@ backward: dX = dY @ Q4(W0)   + dY @ B @ A
 - `native_fp4.modeling.FP4LoRAConfig`
 - `native_fp4.modeling.convert_linear_to_fp4_lora`
 - `native_fp4.modeling.freeze_non_fp4_lora_parameters`
+- `native_fp4.modeling.iter_fp4_lora_named_parameters`
+- `native_fp4.modeling.fp4_lora_parameter_groups`
+- `native_fp4.modeling.register_fp4_lora_cache_refresh_hook`
 - `native_fp4.modeling.fp4_lora_state_dict`
 - `native_fp4.modeling.load_fp4_lora_state_dict`
 - `native_fp4.modeling.refresh_fused_lora_dx_caches`
@@ -113,6 +116,22 @@ checkpoint 边界：
 - `fp4_lora_state_dict` 只导出 `lora_down/lora_up` 和可选 trainable bias。
 - 不导出 `qweight/wscales/wscales_bwd_*` 等 frozen FP4 backbone buffers。
 - `load_fp4_lora_state_dict` 加载后会清空 packed LoRA dX cache，避免 adapter 参数与 cache 不一致。
+
+Optimizer 示例：
+
+```python
+from native_fp4 import fp4_lora_parameter_groups, register_fp4_lora_cache_refresh_hook
+
+optimizer = torch.optim.AdamW(fp4_lora_parameter_groups(model), lr=1e-4, eps=1e-4)
+cache_hook = register_fp4_lora_cache_refresh_hook(optimizer, model)
+```
+
+optimizer 边界：
+
+- `fp4_lora_parameter_groups` 只返回 LoRA A/B，`train_bias=True` 时额外包含 trainable bias。
+- 如果 LoRA 参数是 FP16，AdamW 建议显式设置 `eps=1e-4` 或使用带 FP32 master weight 的 optimizer，避免默认 `1e-8` 在 FP16 下数值过小。
+- `register_fp4_lora_cache_refresh_hook` 使用 PyTorch optimizer post-step hook，不替换 optimizer 类型，因此不影响 scheduler 使用原始 optimizer。
+- `NunchakuFP4LoRALinear` 本身已有参数 `_version` lazy invalidation；post-step hook 是 eager refresh，用于减少下一次 forward/backward 的 cache refresh 抖动。
 
 匹配规则：
 
@@ -248,7 +267,7 @@ RTX 5090 短测，`validate_native_fp4_lora_pack.py --dtype bf16/fp16 --warmup 2
 | BF16 | 0.0058-0.0063 | 0.0195-0.0212 | 3.3x-3.6x |
 | FP16 | 0.0058-0.0060 | 0.0196-0.0212 | 3.3x-3.6x |
 
-P1：继续评估 optimizer step 后刷新 cache 的真实训练收益，尤其是梯度累积和多层模型里的调度噪声。
+P1：optimizer post-step eager refresh 接口已落地；后续需要在多层真实模型里继续测量它对 step latency 抖动和梯度累积的收益。
 
 P2：继续研究 BF16 下 packed `dY @ B` 复用的精度问题；当前仅 FP16 opt-in，BF16 必须继续用 dense `dY @ B` 保护 `dA`。
 

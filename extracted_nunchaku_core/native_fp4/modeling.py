@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import Mapping
 
 import torch
 
@@ -115,6 +116,82 @@ def clear_fused_lora_dx_caches(module: torch.nn.Module) -> int:
         child.clear_fused_lora_dx_cache()
         count += 1
     return count
+
+
+def fp4_lora_state_dict(
+    module: torch.nn.Module,
+    *,
+    include_bias: bool = False,
+    destination: str | torch.device | None = "cpu",
+    clone: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Return a LoRA-only state dict for converted FP4 LoRA modules."""
+
+    out: dict[str, torch.Tensor] = {}
+    for module_name, child in iter_fp4_lora_modules(module):
+        prefix = f"{module_name}." if module_name else ""
+        for key, tensor in (
+            (f"{prefix}lora_down", child.lora_down),
+            (f"{prefix}lora_up", child.lora_up),
+        ):
+            value = tensor.detach()
+            if destination is not None:
+                value = value.to(destination)
+            if clone:
+                value = value.clone()
+            out[key] = value
+
+        bias = getattr(child, "bias", None)
+        if include_bias and isinstance(bias, torch.nn.Parameter):
+            value = bias.detach()
+            if destination is not None:
+                value = value.to(destination)
+            if clone:
+                value = value.clone()
+            out[f"{prefix}bias"] = value
+    return out
+
+
+def load_fp4_lora_state_dict(
+    module: torch.nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    strict: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Load a LoRA-only state dict into converted FP4 LoRA modules.
+
+    Returns (missing_keys, unexpected_keys). With strict=True, any mismatch
+    raises ValueError after collecting the mismatch lists.
+    """
+
+    expected: dict[str, torch.nn.Parameter] = {}
+    for module_name, child in iter_fp4_lora_modules(module):
+        prefix = f"{module_name}." if module_name else ""
+        expected[f"{prefix}lora_down"] = child.lora_down
+        expected[f"{prefix}lora_up"] = child.lora_up
+        bias = getattr(child, "bias", None)
+        if isinstance(bias, torch.nn.Parameter):
+            expected[f"{prefix}bias"] = bias
+
+    missing = sorted(key for key in expected if key not in state_dict)
+    unexpected = sorted(key for key in state_dict if key not in expected)
+    if strict and (missing or unexpected):
+        raise ValueError(f"FP4 LoRA state_dict mismatch: missing={missing}, unexpected={unexpected}")
+
+    loaded = 0
+    with torch.no_grad():
+        for key, param in expected.items():
+            if key not in state_dict:
+                continue
+            value = state_dict[key]
+            if value.shape != param.shape:
+                raise ValueError(f"Shape mismatch for {key}: expected {tuple(param.shape)}, got {tuple(value.shape)}")
+            param.copy_(value.to(device=param.device, dtype=param.dtype))
+            loaded += 1
+
+    if loaded:
+        clear_fused_lora_dx_caches(module)
+    return missing, unexpected
 
 
 def freeze_non_fp4_lora_parameters(module: torch.nn.Module, train_bias: bool = False) -> list[str]:

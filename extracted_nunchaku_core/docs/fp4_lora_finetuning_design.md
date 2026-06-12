@@ -57,6 +57,8 @@ backward: dX = dY @ Q4(W0)   + dY @ B @ A
 - `native_fp4.modeling.FP4LoRAConfig`
 - `native_fp4.modeling.convert_linear_to_fp4_lora`
 - `native_fp4.modeling.freeze_non_fp4_lora_parameters`
+- `native_fp4.modeling.fp4_lora_state_dict`
+- `native_fp4.modeling.load_fp4_lora_state_dict`
 - `native_fp4.modeling.refresh_fused_lora_dx_caches`
 - `native_fp4.modeling.clear_fused_lora_dx_caches`
 - `benchmarks/validate_native_fp4_lora_training.py`
@@ -96,6 +98,21 @@ model, replaced = convert_linear_to_fp4_lora(
     exclude_modules=("lm_head",),
 )
 ```
+
+Adapter checkpoint 示例：
+
+```python
+from native_fp4 import fp4_lora_state_dict, load_fp4_lora_state_dict
+
+adapter_state = fp4_lora_state_dict(model)
+missing, unexpected = load_fp4_lora_state_dict(model, adapter_state, strict=True)
+```
+
+checkpoint 边界：
+
+- `fp4_lora_state_dict` 只导出 `lora_down/lora_up` 和可选 trainable bias。
+- 不导出 `qweight/wscales/wscales_bwd_*` 等 frozen FP4 backbone buffers。
+- `load_fp4_lora_state_dict` 加载后会清空 packed LoRA dX cache，避免 adapter 参数与 cache 不一致。
 
 匹配规则：
 

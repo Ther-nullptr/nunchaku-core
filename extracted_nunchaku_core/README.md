@@ -515,7 +515,9 @@ RTX 5090 短测，默认 shapes：
 from native_fp4 import (
     FP4LoRAConfig,
     convert_linear_to_fp4_lora,
+    fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
+    load_fp4_lora_state_dict,
     refresh_fused_lora_dx_caches,
 )
 
@@ -535,6 +537,10 @@ model, replaced = convert_linear_to_fp4_lora(
 )
 trainable = freeze_non_fp4_lora_parameters(model)
 refresh_fused_lora_dx_caches(model)
+
+# 保存/加载时只处理 LoRA adapter，不保存 FP4 backbone buffers。
+adapter_state = fp4_lora_state_dict(model)
+load_fp4_lora_state_dict(model, adapter_state)
 ```
 
 验证批量替换、冻结参数、cache refresh/clear 和 backward：
@@ -553,7 +559,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 验证结果：
 
 - `results/latest_native_fp4_lora_modeling_validation.json`
-- BF16 fused cached 路径：替换 4 个目标 Linear，`lm_head` 保持 dense，只有 LoRA A/B 可训练，cache count 和 backward 均通过。
+- BF16 fused cached 路径：替换 4 个目标 Linear，`lm_head` 保持 dense，只有 LoRA A/B 可训练，cache count、LoRA-only state_dict strict load 和 backward 均通过。
 
 ## 11. 建议的完整实验顺序
 
@@ -597,6 +603,10 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.freeze_non_fp4_lora_parameters`
   - 冻结非 LoRA 参数，只保留 LoRA A/B 可训练
+- `native_fp4.fp4_lora_state_dict`
+  - 导出 LoRA-only adapter checkpoint，不包含 FP4 backbone buffers
+- `native_fp4.load_fp4_lora_state_dict`
+  - strict 加载 LoRA-only adapter checkpoint，并清空 packed LoRA cache
 - `native_fp4.refresh_fused_lora_dx_caches`
   - optimizer step 后显式刷新 fused dX packed LoRA cache
 - `native_fp4.clear_fused_lora_dx_caches`

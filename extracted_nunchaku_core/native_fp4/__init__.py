@@ -9,8 +9,10 @@ from .modeling import (
     FP4LoRAConfig,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
+    fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
     iter_fp4_lora_modules,
+    load_fp4_lora_state_dict,
     refresh_fused_lora_dx_caches,
 )
 from .training import NunchakuFP4LoRALinear
@@ -25,7 +27,9 @@ __all__ = [
     "NunchakuFP4LoRALinear",
     "clear_fused_lora_dx_caches",
     "convert_linear_to_fp4_lora",
+    "fp4_lora_state_dict",
     "freeze_non_fp4_lora_parameters",
     "iter_fp4_lora_modules",
+    "load_fp4_lora_state_dict",
     "refresh_fused_lora_dx_caches",
 ]

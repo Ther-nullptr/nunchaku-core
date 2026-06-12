@@ -16,8 +16,10 @@ from native_fp4 import (  # noqa: E402
     NunchakuFP4LoRALinear,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
+    fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
     iter_fp4_lora_modules,
+    load_fp4_lora_state_dict,
     refresh_fused_lora_dx_caches,
 )
 
@@ -103,8 +105,35 @@ def main() -> None:
         "layers.1.q_proj",
         "layers.1.down_proj",
     }
+    expected_adapter_keys = {f"{name}.{param}" for name in expected_replaced for param in ("lora_down", "lora_up")}
+
+    adapter_state = fp4_lora_state_dict(model)
+    model2 = TinyModel(args.hidden, dtype).cuda()
+    model2, replaced2 = convert_linear_to_fp4_lora(
+        model2,
+        cfg,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+    )
+    pre_load_refreshed = refresh_fused_lora_dx_caches(model2)
+    missing, unexpected = load_fp4_lora_state_dict(model2, adapter_state, strict=True)
+    loaded_state = fp4_lora_state_dict(model2)
+    loaded_matches = all(torch.equal(adapter_state[key], loaded_state[key]) for key in expected_adapter_keys)
+    caches_cleared_after_load = all(
+        child._cached_lora_down_bwd_packed is None and child._cached_lora_up_bwd_packed is None
+        for _, child in iter_fp4_lora_modules(model2)
+    )
+    strict_mismatch_raises = False
+    try:
+        bad_state = dict(adapter_state)
+        bad_state.pop(next(iter(expected_adapter_keys)))
+        load_fp4_lora_state_dict(model2, bad_state, strict=True)
+    except ValueError:
+        strict_mismatch_raises = True
+
     checks = {
         "replaced_expected_modules": set(replaced) == expected_replaced,
+        "second_model_replaced_expected_modules": set(replaced2) == expected_replaced,
         "lm_head_not_replaced": not isinstance(model.lm_head, NunchakuFP4LoRALinear),
         "all_replaced_are_fp4_lora": all(isinstance(fp4_modules[name], NunchakuFP4LoRALinear) for name in expected_replaced),
         "only_lora_trainable": trainable_named == set(trainable),
@@ -115,6 +144,12 @@ def main() -> None:
         "clear_count_matches": cleared == len(replaced),
         "refresh_after_clear_matches": refreshed_after_clear
         == (len(replaced) if args.fuse_lora_dx and args.cache_fused_lora_dx else 0),
+        "adapter_state_keys_match": set(adapter_state) == expected_adapter_keys,
+        "adapter_state_load_missing_empty": missing == [],
+        "adapter_state_load_unexpected_empty": unexpected == [],
+        "adapter_state_loaded_matches": loaded_matches,
+        "adapter_load_clears_cache": caches_cleared_after_load,
+        "strict_mismatch_raises": strict_mismatch_raises,
     }
     payload = {
         "shape": {
@@ -133,7 +168,9 @@ def main() -> None:
             "refreshed": refreshed,
             "cleared": cleared,
             "refreshed_after_clear": refreshed_after_clear,
+            "pre_load_refreshed": pre_load_refreshed,
         },
+        "adapter_state_keys": sorted(adapter_state),
         "checks": checks,
         "all_passed": bool(all(checks.values())),
     }

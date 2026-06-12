@@ -216,6 +216,7 @@ nunchaku-models/
 dev/
 .tmp/
 metrics.json
+results/*.json
 *use_count.txt
 *use_record.txt
 

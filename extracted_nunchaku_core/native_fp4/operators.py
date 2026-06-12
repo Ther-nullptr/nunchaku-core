@@ -87,6 +87,14 @@ def pack_lowrank_weight(weight: torch.Tensor, down: bool) -> torch.Tensor:
     return _pack_lowrank_weight_torch(weight, down)
 
 
+def decode_lora_act(packed_lora_act: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("dtype must be float16 or bfloat16")
+    dense = torch.empty(packed_lora_act.shape, dtype=dtype, device=packed_lora_act.device)
+    _OPS.decode_lora_act(packed_lora_act, dense)
+    return dense
+
+
 def quantize_fp4_act_with_lora(
     x: torch.Tensor,
     lora_down_packed: torch.Tensor,
@@ -594,9 +602,7 @@ class NunchakuFP4LowRankBackwardDXOp(NunchakuFP4BackwardDXOp):
         )
 
     def decode_packed_lowrank_act(self, packed_lora_act: torch.Tensor) -> torch.Tensor:
-        dense = torch.empty(packed_lora_act.shape, dtype=self.lowrank_dtype, device=packed_lora_act.device)
-        _OPS.decode_lora_act(packed_lora_act, dense)
-        return dense
+        return decode_lora_act(packed_lora_act, self.lowrank_dtype)
 
     def quantize_grad_with_lora_dual(
         self,

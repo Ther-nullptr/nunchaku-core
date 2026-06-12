@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-cache-lora-act", action="store_true")
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
+    p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -65,6 +66,7 @@ def main() -> None:
         cache_lora_act=not args.no_cache_lora_act,
         fuse_lora_dx=args.fuse_lora_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
     )
 
     cache_refresh_check = True
@@ -141,6 +143,7 @@ def main() -> None:
             "cache_lora_act": not args.no_cache_lora_act,
             "fuse_lora_dx": args.fuse_lora_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
+            "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
         },
         "errors": errors,
         "checks": checks,

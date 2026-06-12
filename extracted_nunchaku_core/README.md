@@ -390,16 +390,20 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
 - `latency_ms.fp4_recompute_train_step`
 - `latency_ms.fp4_cached_fused_dx_train_step`
 - `latency_ms.fp4_cached_fused_dx_cached_pack_train_step`
+- `latency_ms.fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step`
 - `latency_ms.refresh_fused_lora_dx_cache`
 - `latency_ms.fp4_cached_fused_dx_cached_pack_grad_accum_per_micro_step`
+- `latency_ms.fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_per_micro_step`
 - `speedups.fp4_cached_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_cached_pack_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_cached_pack_plus_refresh_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_cached_pack_grad_accum_vs_dense`
+- `speedups.fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_vs_dense`
 - `speedups.fp4_cached_backward_estimate_vs_dense`
 - `speedups.fp4_cached_fused_dx_backward_estimate_vs_dense`
 - `speedups.fused_dx_cached_pack_vs_dynamic_pack_train_step`
+- `speedups.fused_dx_cached_pack_reuse_dy_up_vs_cached_pack_train_step`
 - `speedups.fused_dx_cached_pack_plus_refresh_vs_dynamic_pack_train_step`
 - `speedups.fused_dx_cached_pack_vs_dynamic_pack_grad_accum`
 
@@ -422,9 +426,29 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - `backward estimate = train_step - train_graph_forward`，用于判断 backward 优化方向，不是单独 CUDA event 包住 backward 的精确拆分。
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
+- `reuse_fused_dy_up_for_d_lora_down=True` 是 FP16-only 实验选项：复用 fused dX quantize kernel 产生的 packed `dY @ B`，decode 后用于 `dA = (dY @ B).T @ X`，避免额外 dense `dY @ B` matmul。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 训练 step 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation 数字对测量顺序更敏感，建议看多轮结果再定默认策略。
 - `forward_fp4_vs_dense` 的误差是 FP4 量化相对 dense full precision 权重的误差，不是 wrapper correctness；wrapper correctness 请看 `validate_native_fp4_lora_training.py`。
+
+FP16 packed `dY @ B` 复用消融：
+
+```bash
+python benchmarks/validate_native_fp4_lora_training.py \
+  --m 257 \
+  --in-features 3072 \
+  --out-features 3584 \
+  --rank 32 \
+  --dtype fp16 \
+  --lowrank-dtype fp16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx \
+  --reuse-fused-dy-up-for-d-lora-down
+```
+
+RTX 5090 上该路径 correctness 通过，`d_lora_down` rel_l2 约 `3.35e-5`。BF16 下同一复用方式会把 `d_lora_down` rel_l2 放大到约 `3.36e-3`，因此构造函数会拒绝 BF16 weight/LoRA 打开此选项。
+
+性能上它是噪声敏感的小优化：FP16 `M=N=K=4096, rank=32` 两次短测中，单步相对 cached-pack 约 `0.968x-1.018x`，gradient accumulation per micro-step 约 `1.016x-1.036x`。建议只在实际训练循环里确认收益后启用。
 
 ## 10.3 FP4 LoRA training backward breakdown
 

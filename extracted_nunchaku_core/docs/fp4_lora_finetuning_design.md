@@ -142,7 +142,8 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - `cache_fused_lora_dx=True`：只缓存 LoRA packed A/B，额外内存约 `rank * (in + out)`，不缓存第二份 FP4 backbone；参数 version 变化时自动刷新。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。
-- 为保证训练梯度精度，`dA` 仍使用 dense `dY @ B`；dual-output kernel 的 dense `dY @ B` 在默认形状下给 `dA` 带来约 `3.3e-3` rel_l2，不作为默认梯度来源。
+- 为保证训练梯度精度，默认 `dA` 仍使用 dense `dY @ B`；BF16 下复用 fused dX 产生的 packed `dY @ B` 会给 `dA` 带来约 `3.36e-3` rel_l2，不作为默认梯度来源。
+- FP16 下提供 `reuse_fused_dy_up_for_d_lora_down=True` 实验选项，复用 packed `dY @ B` 可通过 correctness，`dA` rel_l2 约 `3.35e-5`；性能收益较小且有噪声，4096/rank32 短测中单步约 `0.968x-1.018x`，梯度累积 per micro-step 约 `1.016x-1.036x`。
 - 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
 
 ## 后续优化路线
@@ -199,7 +200,7 @@ RTX 5090 短测，`validate_native_fp4_lora_pack.py --dtype bf16/fp16 --warmup 2
 
 P1：继续评估 optimizer step 后刷新 cache 的真实训练收益，尤其是梯度累积和多层模型里的调度噪声。
 
-P2：修正 `quantize_grad_with_lora_dual` 的 dense `dy_up` 精度后，再考虑让一次 `dY` 读取同时服务 fused dX 和 `dA`。
+P2：继续研究 BF16 下 packed `dY @ B` 复用的精度问题；当前仅 FP16 opt-in，BF16 必须继续用 dense `dY @ B` 保护 `dA`。
 
 P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。
 

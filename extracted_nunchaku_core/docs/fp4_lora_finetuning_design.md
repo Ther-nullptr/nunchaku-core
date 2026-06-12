@@ -104,6 +104,35 @@ dA      = scaling * dy_up.T @ x
 - 当前默认不预存 backward packed weight；沿用 transient CUDA repack，符合“不让常驻内存乘 2”的约束。
 - `NunchakuFP4LoRALinear` 会让 forward/backward op 共享同一份 resident `qweight/wscales`，只额外保存 backward scale metadata。
 
+## 当前性能证据
+
+新增 benchmark：
+
+```bash
+conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+RTX 5090 短测，`M=N=K=4096, rank=32`：
+
+| dtype | dense train step ms | FP4 cached train step ms | step speedup | backward estimate speedup | cache vs recompute |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 2.0206 | 0.9730 | 2.077x | 1.764x | 1.028x |
+| FP16 | 1.7631 | 0.9311 | 1.894x | 1.626x | 1.075x |
+
+结论：
+
+- P0 接口已经能在典型 4096 线性层上给出约 `1.9x-2.1x` 的训练 step 加速。
+- 当前 backward 仍包含 transient repack、`dy @ B`、`dA/dB` 三块开销；下一步优化应优先看 `dy @ B` 与 FP4 dX 的融合/重叠，而不是继续优化 Python wrapper。
+- 保存 forward `lora_act` 对大形状有小幅收益，约 `2.8%-7.5%`；是否默认缓存要结合训练显存预算决定。
+
 ## 后续优化路线
 
 P1：把 `dy_up = dY @ B` 和 `dX_main` 的 quantize/repack 调度重叠。

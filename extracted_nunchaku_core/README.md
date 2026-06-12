@@ -362,6 +362,47 @@ dA = scaling * (dY @ B).T @ x
 
 如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`。
 
+## 10.2 FP4 LoRA training benchmark
+
+对比 frozen dense BF16/FP16 LoRA Linear 与 `NunchakuFP4LoRALinear` 的 forward、train step 和估算 backward：
+
+```bash
+python benchmarks/benchmark_native_fp4_lora_training.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+结果会写到：
+
+- `results/latest_native_fp4_lora_training.json`
+
+重点字段：
+
+- `latency_ms.dense_train_step`
+- `latency_ms.fp4_cached_train_step`
+- `latency_ms.fp4_recompute_train_step`
+- `speedups.fp4_cached_train_step_vs_dense`
+- `speedups.fp4_cached_backward_estimate_vs_dense`
+- `speedups.cache_vs_recompute_train_step`
+
+当前 RTX 5090 短测结果，形状 `M=N=K=4096, rank=32, warmup=5, iters=10`：
+
+| dtype | dense train step ms | FP4 cached train step ms | step speedup | backward estimate speedup | cache vs recompute |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 2.0206 | 0.9730 | 2.077x | 1.764x | 1.028x |
+| FP16 | 1.7631 | 0.9311 | 1.894x | 1.626x | 1.075x |
+
+说明：
+
+- `backward estimate = train_step - train_graph_forward`，用于判断 backward 优化方向，不是单独 CUDA event 包住 backward 的精确拆分。
+- `forward_fp4_vs_dense` 的误差是 FP4 量化相对 dense full precision 权重的误差，不是 wrapper correctness；wrapper correctness 请看 `validate_native_fp4_lora_training.py`。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -376,6 +417,7 @@ python benchmarks/benchmark_fp4_bf16_fusion_ablation.py --m 4096 --in-features 4
 python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
 python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
+python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```
 
 ## 12. 主要 Python 接口
@@ -411,6 +453,8 @@ python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 307
   - backward correctness
 - `latest_native_fp4_lora_training_validation.json`
   - FP4 LoRA training wrapper correctness
+- `latest_native_fp4_lora_training.json`
+  - FP4 LoRA training benchmark
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

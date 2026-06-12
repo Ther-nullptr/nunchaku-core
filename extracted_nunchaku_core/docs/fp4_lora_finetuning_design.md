@@ -122,22 +122,24 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
 
 RTX 5090 短测，`M=N=K=4096, rank=32`：
 
-| dtype | dense train step ms | FP4 cached train step ms | step speedup | backward estimate speedup | cache vs recompute |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 2.0206 | 0.9730 | 2.077x | 1.764x | 1.028x |
-| FP16 | 1.7631 | 0.9311 | 1.894x | 1.626x | 1.075x |
+| dtype | dense train step ms | FP4 dense-dX step ms | FP4 fused-dX step ms | dense-dX speedup | fused-dX speedup | fused vs dense-dX |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 2.0117 | 0.9661 | 0.9470 | 2.082x | 2.124x | 1.020x |
+| FP16 | 1.7592 | 0.9185 | 0.9328 | 1.915x | 1.886x | 0.985x |
 
 结论：
 
 - P0 接口已经能在典型 4096 线性层上给出约 `1.9x-2.1x` 的训练 step 加速。
-- 当前 backward 仍包含 transient repack、`dy @ B`、`dA/dB` 三块开销；下一步优化应优先看 `dy @ B` 与 FP4 dX 的融合/重叠，而不是继续优化 Python wrapper。
-- 保存 forward `lora_act` 对大形状有小幅收益，约 `2.8%-7.5%`；是否默认缓存要结合训练显存预算决定。
+- 新增 `fuse_lora_dx=True`：将 `dX_lora = (dY @ B) @ A` 的第二段放进 FP4 dX epilogue。
+- 为保证训练梯度精度，`dA` 仍使用 dense `dY @ B`；dual-output kernel 的 dense `dY @ B` 在默认形状下给 `dA` 带来约 `3.3e-3` rel_l2，不作为默认梯度来源。
+- BF16 下 fused dX 训练 step 额外提升约 `2.0%`；FP16 下略慢，所以当前只作为可选路径。
+- 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
 
 ## 后续优化路线
 
-P1：把 `dy_up = dY @ B` 和 `dX_main` 的 quantize/repack 调度重叠。
+P1：进一步降低 `fuse_lora_dx=True` 的动态 pack 开销，或为 LoRA 参数维护低成本 packed cache。
 
-P2：复用 `quantize_grad_with_lora_dual` 思路，让一次 `dY` 读取同时产出 FP4 quantized `dY` 和 dense/packed `dy_up`。
+P2：修正 `quantize_grad_with_lora_dual` 的 dense `dy_up` 精度后，再考虑让一次 `dY` 读取同时服务 fused dX 和 `dA`。
 
 P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。
 
@@ -168,7 +170,7 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
 
 验证项：
 
-如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`。
+如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`；如果要验证 fused dX 路径，追加 `--fuse-lora-dx`。
 
 - forward wrapper 是否等价于手写 `FP4 main + LoRA dense branch`。
 - `dX` 是否等价于 `FP4 backward dX + LoRA dense dX`。

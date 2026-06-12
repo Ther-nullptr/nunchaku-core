@@ -360,7 +360,7 @@ dA = scaling * (dY @ B).T @ x
 
 - [docs/fp4_lora_finetuning_design.md](/home/wyj24/projects/nunchaku/extracted_nunchaku_core/docs/fp4_lora_finetuning_design.md)
 
-如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`。
+如果要验证 backward 重算 `x @ A.T` 的路径，在命令末尾追加 `--no-cache-lora-act`。如果要验证 fused dX 路径，追加 `--fuse-lora-dx`。
 
 ## 10.2 FP4 LoRA training benchmark
 
@@ -387,20 +387,25 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
 - `latency_ms.dense_train_step`
 - `latency_ms.fp4_cached_train_step`
 - `latency_ms.fp4_recompute_train_step`
+- `latency_ms.fp4_cached_fused_dx_train_step`
 - `speedups.fp4_cached_train_step_vs_dense`
+- `speedups.fp4_cached_fused_dx_train_step_vs_dense`
 - `speedups.fp4_cached_backward_estimate_vs_dense`
-- `speedups.cache_vs_recompute_train_step`
+- `speedups.fp4_cached_fused_dx_backward_estimate_vs_dense`
+- `speedups.fused_dx_cached_vs_dense_dx_cached_train_step`
 
 当前 RTX 5090 短测结果，形状 `M=N=K=4096, rank=32, warmup=5, iters=10`：
 
-| dtype | dense train step ms | FP4 cached train step ms | step speedup | backward estimate speedup | cache vs recompute |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 2.0206 | 0.9730 | 2.077x | 1.764x | 1.028x |
-| FP16 | 1.7631 | 0.9311 | 1.894x | 1.626x | 1.075x |
+| dtype | dense train step ms | FP4 dense-dX step ms | FP4 fused-dX step ms | dense-dX speedup | fused-dX speedup | fused vs dense-dX |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 2.0117 | 0.9661 | 0.9470 | 2.082x | 2.124x | 1.020x |
+| FP16 | 1.7592 | 0.9185 | 0.9328 | 1.915x | 1.886x | 0.985x |
 
 说明：
 
 - `backward estimate = train_step - train_graph_forward`，用于判断 backward 优化方向，不是单独 CUDA event 包住 backward 的精确拆分。
+- `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
+- BF16 下 fused dX 有小幅收益；FP16 下动态 pack + fused epilogue 暂时不划算，所以默认仍是 `fuse_lora_dx=False`。
 - `forward_fp4_vs_dense` 的误差是 FP4 量化相对 dense full precision 权重的误差，不是 wrapper correctness；wrapper correctness 请看 `validate_native_fp4_lora_training.py`。
 
 ## 11. 建议的完整实验顺序

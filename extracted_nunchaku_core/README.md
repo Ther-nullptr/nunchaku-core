@@ -507,6 +507,54 @@ RTX 5090 短测，默认 shapes：
 | BF16 | 0.0058-0.0063 | 0.0195-0.0212 | 3.3x-3.6x |
 | FP16 | 0.0058-0.0060 | 0.0196-0.0212 | 3.3x-3.6x |
 
+## 10.5 FP4 LoRA model conversion
+
+真实模型微调不应该手工逐层替换。`native_fp4.modeling` 提供了模型级工具：
+
+```python
+from native_fp4 import (
+    FP4LoRAConfig,
+    convert_linear_to_fp4_lora,
+    freeze_non_fp4_lora_parameters,
+    refresh_fused_lora_dx_caches,
+)
+
+cfg = FP4LoRAConfig(
+    rank=32,
+    lowrank_dtype=torch.bfloat16,
+    init="gaussian",
+    fuse_lora_dx=True,
+    cache_fused_lora_dx=True,
+)
+
+model, replaced = convert_linear_to_fp4_lora(
+    model,
+    cfg,
+    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"),
+    exclude_modules=("lm_head",),
+)
+trainable = freeze_non_fp4_lora_parameters(model)
+refresh_fused_lora_dx_caches(model)
+```
+
+验证批量替换、冻结参数、cache refresh/clear 和 backward：
+
+```bash
+python benchmarks/validate_native_fp4_lora_modeling.py \
+  --batch 8 \
+  --hidden 256 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx
+```
+
+验证结果：
+
+- `results/latest_native_fp4_lora_modeling_validation.json`
+- BF16 fused cached 路径：替换 4 个目标 Linear，`lm_head` 保持 dense，只有 LoRA A/B 可训练，cache count 和 backward 均通过。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -522,6 +570,7 @@ python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --o
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
 python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
+python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```
@@ -542,6 +591,16 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-
   - backward 混合算子和 full backward 多种路径
 - `native_fp4.NunchakuFP4LoRALinear`
   - frozen FP4 backbone + trainable BF16/FP16 LoRA 微调接口
+- `native_fp4.FP4LoRAConfig`
+  - 批量替换 Linear 时使用的配置对象
+- `native_fp4.convert_linear_to_fp4_lora`
+  - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
+- `native_fp4.freeze_non_fp4_lora_parameters`
+  - 冻结非 LoRA 参数，只保留 LoRA A/B 可训练
+- `native_fp4.refresh_fused_lora_dx_caches`
+  - optimizer step 后显式刷新 fused dX packed LoRA cache
+- `native_fp4.clear_fused_lora_dx_caches`
+  - 清空模型内所有 FP4 LoRA cache
 
 ## 13. 结果文件说明
 
@@ -561,6 +620,8 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-
   - FP4 LoRA training wrapper correctness
 - `latest_native_fp4_lora_training.json`
   - FP4 LoRA training benchmark
+- `latest_native_fp4_lora_modeling_validation.json`
+  - 模型级 Linear 替换、参数冻结和 cache 管理验证
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

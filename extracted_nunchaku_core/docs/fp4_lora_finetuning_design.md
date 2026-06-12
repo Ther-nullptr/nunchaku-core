@@ -54,7 +54,13 @@ backward: dX = dY @ Q4(W0)   + dY @ B @ A
 新增：
 
 - `native_fp4.training.NunchakuFP4LoRALinear`
+- `native_fp4.modeling.FP4LoRAConfig`
+- `native_fp4.modeling.convert_linear_to_fp4_lora`
+- `native_fp4.modeling.freeze_non_fp4_lora_parameters`
+- `native_fp4.modeling.refresh_fused_lora_dx_caches`
+- `native_fp4.modeling.clear_fused_lora_dx_caches`
 - `benchmarks/validate_native_fp4_lora_training.py`
+- `benchmarks/validate_native_fp4_lora_modeling.py`
 
 模块语义：
 
@@ -71,6 +77,32 @@ op = NunchakuFP4LoRALinear(
 y = op(x)
 ```
 
+模型级替换示例：
+
+```python
+from native_fp4 import FP4LoRAConfig, convert_linear_to_fp4_lora
+
+cfg = FP4LoRAConfig(
+    rank=32,
+    lowrank_dtype=torch.bfloat16,
+    fuse_lora_dx=True,
+    cache_fused_lora_dx=True,
+)
+
+model, replaced = convert_linear_to_fp4_lora(
+    model.cuda().to(torch.bfloat16),
+    cfg,
+    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"),
+    exclude_modules=("lm_head",),
+)
+```
+
+匹配规则：
+
+- `target_modules=None`：替换所有 `torch.nn.Linear`。
+- `target_modules=("q_proj",)`：匹配完整路径、子模块名或完整路径后缀。
+- `exclude_modules` 使用同样的匹配规则，优先排除。
+
 参数：
 
 - `weight`：CUDA 上的 FP16/BF16 dense 权重，构造时量化为 frozen FP4 backbone。
@@ -83,6 +115,7 @@ y = op(x)
   - `gaussian`：`A/B` 都用小方差正态，用于 correctness/压力测试。
   - `residual_svd`：用 `W0 - dequant(Q4(W0))` 的低秩 SVD 初始化 LoRA，贴近 SVDQuant residual branch。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
+- `target_modules/exclude_modules`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA。
 
 ## 当前 backward 边界
 

@@ -109,6 +109,33 @@ def benchmark_train_step(
     return ms
 
 
+def benchmark_grad_accum(
+    module: torch.nn.Module,
+    x: torch.Tensor,
+    dy: torch.Tensor,
+    warmup: int,
+    iters: int,
+    steps: int,
+    refresh_fused_lora_dx_cache: bool = False,
+) -> float:
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+
+    def fn() -> None:
+        zero_grads(module, x)
+        if refresh_fused_lora_dx_cache:
+            module.clear_fused_lora_dx_cache()
+            module.refresh_fused_lora_dx_cache()
+        for _ in range(steps):
+            y = module(x)
+            loss = (y.float() * dy.float()).sum()
+            loss.backward()
+
+    ms = time_cuda(fn, warmup=warmup, iters=iters)
+    zero_grads(module, x)
+    return ms
+
+
 def tensor_error(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
     da = a.float()
     db = b.float()
@@ -132,6 +159,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-bias", action="store_true")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--grad-accum-steps", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -257,6 +285,24 @@ def main() -> None:
     fp4_cached_fused_dx_cached_pack_train_step_ms = benchmark_train_step(
         fp4_cached_fused_dx_cached_pack, x, dy, args.warmup, args.iters
     )
+    dense_grad_accum_total_ms = benchmark_grad_accum(
+        dense, x, dy, args.warmup, args.iters, args.grad_accum_steps
+    )
+    fp4_cached_fused_dx_grad_accum_total_ms = benchmark_grad_accum(
+        fp4_cached_fused_dx, x, dy, args.warmup, args.iters, args.grad_accum_steps
+    )
+    fp4_cached_fused_dx_cached_pack_grad_accum_total_ms = benchmark_grad_accum(
+        fp4_cached_fused_dx_cached_pack, x, dy, args.warmup, args.iters, args.grad_accum_steps
+    )
+    fp4_cached_fused_dx_cached_pack_refresh_grad_accum_total_ms = benchmark_grad_accum(
+        fp4_cached_fused_dx_cached_pack,
+        x,
+        dy,
+        args.warmup,
+        args.iters,
+        args.grad_accum_steps,
+        refresh_fused_lora_dx_cache=True,
+    )
 
     payload = {
         "shape": {
@@ -269,6 +315,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "train_bias": args.train_bias,
+            "grad_accum_steps": args.grad_accum_steps,
         },
         "latency_ms": {
             "dense_forward_inference": dense_forward_inference_ms,
@@ -286,6 +333,21 @@ def main() -> None:
             "refresh_fused_lora_dx_cache": refresh_fused_lora_dx_cache_ms,
             "fp4_cached_fused_dx_cached_pack_plus_refresh_train_step": fp4_cached_fused_dx_cached_pack_train_step_ms
             + refresh_fused_lora_dx_cache_ms,
+            "dense_grad_accum_total": dense_grad_accum_total_ms,
+            "fp4_cached_fused_dx_grad_accum_total": fp4_cached_fused_dx_grad_accum_total_ms,
+            "fp4_cached_fused_dx_cached_pack_grad_accum_total": fp4_cached_fused_dx_cached_pack_grad_accum_total_ms,
+            "fp4_cached_fused_dx_cached_pack_refresh_grad_accum_total": (
+                fp4_cached_fused_dx_cached_pack_refresh_grad_accum_total_ms
+            ),
+            "dense_grad_accum_per_micro_step": dense_grad_accum_total_ms / args.grad_accum_steps,
+            "fp4_cached_fused_dx_grad_accum_per_micro_step": fp4_cached_fused_dx_grad_accum_total_ms
+            / args.grad_accum_steps,
+            "fp4_cached_fused_dx_cached_pack_grad_accum_per_micro_step": (
+                fp4_cached_fused_dx_cached_pack_grad_accum_total_ms / args.grad_accum_steps
+            ),
+            "fp4_cached_fused_dx_cached_pack_refresh_grad_accum_per_micro_step": (
+                fp4_cached_fused_dx_cached_pack_refresh_grad_accum_total_ms / args.grad_accum_steps
+            ),
             "dense_backward_estimate": dense_train_step_ms - dense_forward_train_graph_ms,
             "fp4_cached_backward_estimate": fp4_cached_train_step_ms - fp4_cached_forward_train_graph_ms,
             "fp4_recompute_backward_estimate": fp4_recompute_train_step_ms - fp4_recompute_forward_train_graph_ms,
@@ -313,6 +375,12 @@ def main() -> None:
             / fp4_cached_fused_dx_cached_pack_train_step_ms,
             "fp4_cached_fused_dx_cached_pack_plus_refresh_train_step_vs_dense": dense_train_step_ms
             / (fp4_cached_fused_dx_cached_pack_train_step_ms + refresh_fused_lora_dx_cache_ms),
+            "fp4_cached_fused_dx_grad_accum_vs_dense": dense_grad_accum_total_ms
+            / fp4_cached_fused_dx_grad_accum_total_ms,
+            "fp4_cached_fused_dx_cached_pack_grad_accum_vs_dense": dense_grad_accum_total_ms
+            / fp4_cached_fused_dx_cached_pack_grad_accum_total_ms,
+            "fp4_cached_fused_dx_cached_pack_refresh_grad_accum_vs_dense": dense_grad_accum_total_ms
+            / fp4_cached_fused_dx_cached_pack_refresh_grad_accum_total_ms,
             "fp4_cached_backward_estimate_vs_dense": (dense_train_step_ms - dense_forward_train_graph_ms)
             / (fp4_cached_train_step_ms - fp4_cached_forward_train_graph_ms),
             "fp4_recompute_backward_estimate_vs_dense": (dense_train_step_ms - dense_forward_train_graph_ms)
@@ -334,6 +402,10 @@ def main() -> None:
             / fp4_cached_fused_dx_cached_pack_train_step_ms,
             "fused_dx_cached_pack_plus_refresh_vs_dynamic_pack_train_step": fp4_cached_fused_dx_train_step_ms
             / (fp4_cached_fused_dx_cached_pack_train_step_ms + refresh_fused_lora_dx_cache_ms),
+            "fused_dx_cached_pack_vs_dynamic_pack_grad_accum": fp4_cached_fused_dx_grad_accum_total_ms
+            / fp4_cached_fused_dx_cached_pack_grad_accum_total_ms,
+            "fused_dx_cached_pack_refresh_vs_dynamic_pack_grad_accum": fp4_cached_fused_dx_grad_accum_total_ms
+            / fp4_cached_fused_dx_cached_pack_refresh_grad_accum_total_ms,
             "fused_dx_recompute_vs_dense_dx_recompute_train_step": fp4_recompute_train_step_ms
             / fp4_recompute_fused_dx_train_step_ms,
         },

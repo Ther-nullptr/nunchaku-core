@@ -117,7 +117,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   --dtype bf16 \
   --lowrank-dtype bf16 \
   --warmup 5 \
-  --iters 10
+  --iters 10 \
+  --grad-accum-steps 4
 ```
 
 RTX 5090 短测，`M=N=K=4096, rank=32`：
@@ -127,12 +128,20 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | BF16 | 2.0009 | 0.9712 | 0.9700 | 0.9070 | 0.9321 | 2.206x |
 | FP16 | 1.7484 | 0.8998 | 0.8855 | 0.9055 | 0.9805 | 1.931x |
 
+Gradient accumulation 短测，`grad_accum_steps=4, warmup=3, iters=6`：
+
+| dtype | dense per micro-step ms | FP4 dynamic-pack per micro-step ms | FP4 cached-pack per micro-step ms | cached-pack vs dense |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 | 3.2149 | 1.4203 | 1.4099 | 2.280x |
+| FP16 | 3.5018 | 1.5209 | 1.2119 | 2.889x |
+
 结论：
 
 - P0/P1 接口已经能在典型 4096 线性层上给出约 `1.9x-2.2x` 的训练 step 加速。
 - `fuse_lora_dx=True`：将 `dX_lora = (dY @ B) @ A` 的第二段放进 FP4 dX epilogue。
 - `cache_fused_lora_dx=True`：只缓存 LoRA packed A/B，额外内存约 `rank * (in + out)`，不缓存第二份 FP4 backbone；参数 version 变化时自动刷新。
-- BF16 下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.069x`；若每步都刷新 cache，仍快 `1.041x`。FP16 下 cached-pack 不划算。
+- BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.069x`；若每步都刷新 cache，仍快 `1.041x`。FP16 单步下 cached-pack 不划算。
+- Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。
 - 为保证训练梯度精度，`dA` 仍使用 dense `dY @ B`；dual-output kernel 的 dense `dY @ B` 在默认形状下给 `dA` 带来约 `3.3e-3` rel_l2，不作为默认梯度来源。
 - 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
 

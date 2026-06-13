@@ -388,6 +388,7 @@ RTX 5090 短测，`benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hid
 - 新增 `native_fp4.layout.dequantize_fp4_activation(qact, ascales, return_scales=False)`；CUDA kernel 直接按 Nunchaku `uint4` activation layout 和 FP8 scale layout 反量化，和 Torch fallback 对齐到 `rel_l2=0`。
 - 新增 `native_fp4.fp4_activation_cache_lora_down_grad(qact, ascales, dy_up, in_features)`；CUDA kernel 直接从 native FP4 activation cache 计算 `dA`，避免 backward 物化 dense `x_hat`。
 - 新增 `benchmark_fp4_lora_activation_cache_policy.py`，比较 saved BF16/FP16 `x` 与 FP4 activation cache 对 `dA` 的显存、速度和精度影响。
+- 新增 `benchmark_fp4_lora_saved_tensors.py`，用 `torch.autograd.graph.saved_tensors_hooks` 直接检查训练 wrapper 的 autograd context，确认 `fp4_activation_cache_d_lora_down=True` 不再保存 BF16/FP16 `x`。
 - `NunchakuFP4LoRALinear(fp4_activation_cache_d_lora_down=True)` 已接入该模式：forward 不把 BF16/FP16 `x` 存入 autograd context，而是保存 `qact + ascales`；`dB` 仍依赖 `cache_lora_act=True` 保存的 LoRA activation。
 
 RTX 5090 BF16 短测：
@@ -404,9 +405,18 @@ RTX 5090 BF16 短测：
 | 2048^2, rank32 | 0.2635 | 0.3624 | 0.73x | 0.2409 | 0.3443 | 8.00 MiB -> 2.25 MiB |
 | 4096^2, rank32 | 0.9499 | 1.3145 | 0.72x | 0.9724 | 1.3182 | 32.00 MiB -> 9.00 MiB |
 
+训练接口实际 saved tensor 短测，`benchmark_fp4_lora_saved_tensors.py --warmup 5 --iters 10`，BF16，`fuse_lora_dx=True, cache_fused_lora_dx=True`：
+
+| shape | exact activation context | FP4-cache activation context | context reduction | exact all saved | FP4-cache all saved | all-saved reduction | FP4-cache / exact step | dA rel_l2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048^2, rank32 | 8.125 MiB | 2.375 MiB | 3.42x | 8.375 MiB | 2.625 MiB | 3.19x | 0.71x | 9.83e-2 |
+| 4096^2, rank32 | 32.25 MiB | 9.25 MiB | 3.49x | 32.75 MiB | 9.75 MiB | 3.36x | 0.74x | 9.78e-2 |
+
+这里 `activation context = saved_x/qact/ascales + saved_lora_act`，`all saved` 额外包含 LoRA A/B 等权重引用。这个口径比只看 `x -> qact+ascales` 更接近 PyTorch autograd 真实保存量。
+
 结论：
 
-- FP4 cache 的显存收益明确，`qact + ascales` 约为 saved BF16/FP16 `x` 的 `28.1%`。
+- FP4 cache 的显存收益明确，`qact + ascales` 约为 saved BF16/FP16 `x` 的 `28.1%`；训练接口实测 activation context 缩减约 `3.42x-3.49x`，all saved tensors 缩减约 `3.19x-3.36x`。
 - 直接用 FP4-dequant activation 计算 `dA` 会带来约 `1e-1` rel_l2 梯度误差；如果要保持 LoRA 梯度精确，默认仍应使用 `save_bf16` 或重算 `x` 来源。
 - 当前 naive CUDA dequant 仍要物化 dense `x_hat`，4096 形状比 saved-x `dA` 慢约 `5.1x`。
 - fused `dA` 原型避免了 dense `x_hat`，当前 `kVec=2,rVec=16` rank-tiled 标量 reduction 相比上一版 `kVec=8,rVec=4` 在 2048/4096 形状分别约 `1.22x/1.29x`；但它仍慢于 `dequant + GEMM`，4096 形状约 `0.51x`。下一步应把 FP4 decode staging 和 reduction 改成更 tensor-core/GEMM 友好的分块。

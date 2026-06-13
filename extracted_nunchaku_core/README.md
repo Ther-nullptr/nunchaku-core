@@ -867,6 +867,41 @@ RTX 5090 BF16 短测：
 - 已加入 `fp4_activation_cache_lora_down_grad` fused CUDA 原型，避免 dense `x_hat` 中间张量；当前使用 `kVec=2,rVec=16` rank-tiled 标量 reduction，相比上一版 `kVec=8,rVec=4` 在 2048/4096 形状分别约 `1.22x/1.29x`。它仍慢于 `dequant + GEMM`，4096 形状约 `0.51x`，说明后续要继续优化 decode staging/reduction 或改成 tensor-core 友好的分块，而不是直接把该原型设为默认路径。
 - 精度上 fused 原型对齐的是 `dequant(qact, ascales)` 近似路径，不解决 FP4 activation cache 本身带来的约 `1e-1` `dA` 误差。因此它仍应作为显存模式或近似训练消融，而非默认精度路径。
 
+训练接口接入后的实际 autograd saved tensor 测量：
+
+```bash
+python benchmarks/benchmark_fp4_lora_saved_tensors.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+输出：
+
+- `results/latest_fp4_lora_saved_tensors.json`
+- `saved_tensors.exact_cached_pack`
+- `saved_tensors.fp4_activation_cache_d_lora_down`
+- `saved_bytes.activation_context_reduction`
+- `saved_bytes.all_saved_tensors_reduction`
+- `speedups.fp4_activation_cache_d_lora_down_vs_exact_cached_pack`
+- `errors.d_lora_down_vs_exact`
+
+这个脚本用 `torch.autograd.graph.saved_tensors_hooks` 只包住 `module(x)`，直接检查 `_FP4LoRALinearFunction` 的 `ctx.save_for_backward`，不会把 loss backward 的额外临时保存算进去。
+
+RTX 5090 BF16 短测：
+
+| shape | exact activation context | FP4-cache activation context | context reduction | exact all saved | FP4-cache all saved | all-saved reduction | FP4-cache / exact step | dA rel_l2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048^2, rank32 | 8.125 MiB | 2.375 MiB | 3.42x | 8.375 MiB | 2.625 MiB | 3.19x | 0.71x | 9.83e-2 |
+| 4096^2, rank32 | 32.25 MiB | 9.25 MiB | 3.49x | 32.75 MiB | 9.75 MiB | 3.36x | 0.74x | 9.78e-2 |
+
+这里的 `activation context` 只统计 `saved_x/qact/ascales + saved_lora_act`；`all saved` 还包含 LoRA A/B 等权重引用。结论是：训练 wrapper 里真实 autograd context 也能拿到约 `3.4x` activation-cache 缩减，但当前近似 `dA` 路径会让 step 速度降到 exact cached-pack 的约 `0.7x`，所以仍定位为显存压力模式。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -890,6 +925,7 @@ python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidde
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --intermediate-activation silu --warmup 5 --iters 10
 python benchmarks/benchmark_fp4_lora_activation_cache_policy.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 10 --iters 30
+python benchmarks/benchmark_fp4_lora_saved_tensors.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30 --fuse-lowrank-forward
@@ -1010,6 +1046,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - activation checkpoint 显存/速度消融
 - `latest_fp4_lora_activation_cache_policy.json`
   - FP4 activation cache 替代 saved BF16/FP16 `x` 的显存、速度、fused `dA` 原型和 `dA` 精度消融
+- `latest_fp4_lora_saved_tensors.json`
+  - FP4 activation-cache `dA` 训练接口的实际 autograd saved tensor、速度和精度消融
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

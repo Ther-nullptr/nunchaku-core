@@ -16,6 +16,7 @@ from .operators import (
     NunchakuFP4GemmOp,
     ceil_divide,
     decode_lora_act,
+    fp4_activation_cache_lora_down_grad,
     pack_lowrank_weight,
     pad_tensor,
     quantize_fp4_act_with_lora,
@@ -48,6 +49,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         reuse_fused_dy_up_for_d_lora_down: bool,
         overlap_lora_grad: bool,
         overlap_lora_grad_min_rows: int,
+        fp4_activation_cache_d_lora_down: bool,
         packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         if x.shape[-1] != fp4_forward_op.in_features:
@@ -59,7 +61,21 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         up_lr = lora_up.to(lowrank_dtype)
         has_frozen_residual = frozen_residual_down.numel() > 0 and frozen_residual_up.numel() > 0
 
-        y_main = fp4_forward_op(x)
+        use_fp4_act_cache = bool(fp4_activation_cache_d_lora_down)
+        if use_fp4_act_cache:
+            x2d_for_fp4 = x2d
+            if fp4_forward_op.k_pad != fp4_forward_op.in_features:
+                x2d_for_fp4 = pad_tensor(x2d_for_fp4, divisor=fp4_forward_op.k_pad, dim=1)
+            qact, ascales = fp4_forward_op.quantize_input(x2d_for_fp4)
+            y_main_pad = fp4_forward_op.forward_prequantized(qact, ascales)
+            y_main = y_main_pad[: x2d.shape[0], : fp4_forward_op.out_features].reshape(
+                *x.shape[:-1],
+                fp4_forward_op.out_features,
+            )
+        else:
+            qact = torch.empty(0, device=x.device, dtype=torch.uint8)
+            ascales = torch.empty(0, device=x.device, dtype=torch.float8_e4m3fn)
+            y_main = fp4_forward_op(x)
         if has_frozen_residual and fuse_lowrank_forward:
             residual_down_lr = frozen_residual_down.to(lowrank_dtype)
             residual_up_lr = frozen_residual_up.to(lowrank_dtype)
@@ -90,7 +106,17 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             saved_lora_act = lora_act
         else:
             saved_lora_act = torch.empty(0, device=x.device, dtype=lowrank_dtype)
-        ctx.save_for_backward(x, lora_down, lora_up, frozen_residual_down, frozen_residual_up, saved_lora_act)
+        saved_x = torch.empty(0, device=x.device, dtype=x.dtype) if use_fp4_act_cache else x
+        ctx.save_for_backward(
+            saved_x,
+            qact,
+            ascales,
+            lora_down,
+            lora_up,
+            frozen_residual_down,
+            frozen_residual_up,
+            saved_lora_act,
+        )
         ctx.fp4_backward_op = fp4_backward_op
         ctx.scaling = float(scaling)
         ctx.frozen_residual_scaling = float(frozen_residual_scaling)
@@ -102,22 +128,44 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
         ctx.overlap_lora_grad = bool(overlap_lora_grad)
         ctx.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
+        ctx.fp4_activation_cache_d_lora_down = use_fp4_act_cache
         ctx.packed_lora_dx = packed_lora_dx
         ctx.has_frozen_residual = bool(has_frozen_residual)
         ctx.has_bias = bias is not None
         ctx.in_features = fp4_forward_op.in_features
         ctx.out_features = fp4_forward_op.out_features
+        ctx.x_shape = tuple(x.shape)
+        ctx.x_dtype = x.dtype
         return y
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x, lora_down, lora_up, frozen_residual_down, frozen_residual_up, saved_lora_act = ctx.saved_tensors
+        (
+            saved_x,
+            qact,
+            ascales,
+            lora_down,
+            lora_up,
+            frozen_residual_down,
+            frozen_residual_up,
+            saved_lora_act,
+        ) = ctx.saved_tensors
         dy = grad_output.contiguous()
 
-        x2d = x.reshape(-1, ctx.in_features)
+        if ctx.fp4_activation_cache_d_lora_down:
+            x2d = None
+            rows = math.prod(ctx.x_shape[:-1]) if len(ctx.x_shape) > 1 else 1
+        else:
+            x2d = saved_x.reshape(-1, ctx.in_features)
+            rows = x2d.shape[0]
         dy2d = dy.reshape(-1, ctx.out_features)
 
-        should_overlap_lora_grad = ctx.overlap_lora_grad and x2d.shape[0] >= ctx.overlap_lora_grad_min_rows
+        should_overlap_lora_grad = (
+            ctx.overlap_lora_grad
+            and not ctx.fp4_activation_cache_d_lora_down
+            and x2d is not None
+            and rows >= ctx.overlap_lora_grad_min_rows
+        )
         if should_overlap_lora_grad:
             if ctx.cache_lora_act:
                 lora_act = saved_lora_act
@@ -162,7 +210,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 )
             d_bias = dy2d.sum(dim=0).to(grad_output.dtype) if ctx.has_bias else None
             return (
-                dx.to(x.dtype),
+                dx.to(ctx.x_dtype),
                 d_lora_down,
                 d_lora_up,
                 None,
@@ -181,9 +229,10 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
-        x_lr = x2d.to(ctx.lowrank_dtype)
+        x_lr = None if ctx.fp4_activation_cache_d_lora_down else x2d.to(ctx.lowrank_dtype)
         dy_lr = dy2d.to(ctx.lowrank_dtype)
         down_lr = lora_down.to(ctx.lowrank_dtype)
         up_lr = lora_up.to(ctx.lowrank_dtype)
@@ -191,6 +240,8 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         if ctx.cache_lora_act:
             lora_act = saved_lora_act
         else:
+            if x_lr is None:
+                raise RuntimeError("cache_lora_act=True is required when using FP4 activation-cache dA")
             lora_act = torch.matmul(x_lr, down_lr.t())
 
         dy_up = None
@@ -220,27 +271,37 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             dy_up = torch.matmul(dy_lr, up_lr)
             dx_main = ctx.fp4_backward_op(dy)
             dx_lora = torch.matmul(dy_up, down_lr).mul(ctx.scaling)
-            dx = dx_main.to(dx_lora.dtype) + dx_lora.reshape_as(x)
+            dx = dx_main.to(dx_lora.dtype) + dx_lora.reshape(ctx.x_shape)
 
         if dy_up is None:
             dy_up = torch.matmul(dy_lr, up_lr)
         d_lora_up = torch.matmul(dy_lr.t(), lora_act).mul(ctx.scaling).to(lora_up.dtype)
-        d_lora_down = torch.matmul(dy_up.t(), x_lr).mul(ctx.scaling).to(lora_down.dtype)
+        if ctx.fp4_activation_cache_d_lora_down:
+            d_lora_down = fp4_activation_cache_lora_down_grad(
+                qact,
+                ascales,
+                dy_up.contiguous(),
+                in_features=ctx.in_features,
+            )
+            d_lora_down = d_lora_down.mul(ctx.scaling).to(lora_down.dtype)
+        else:
+            d_lora_down = torch.matmul(dy_up.t(), x_lr).mul(ctx.scaling).to(lora_down.dtype)
         if ctx.has_frozen_residual and not (ctx.fuse_lora_dx and ctx.fuse_frozen_residual_dx):
             residual_down_lr = frozen_residual_down.to(ctx.lowrank_dtype)
             residual_up_lr = frozen_residual_up.to(ctx.lowrank_dtype)
             dy_residual_up = torch.matmul(dy_lr, residual_up_lr)
             dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(ctx.frozen_residual_scaling)
-            dx = dx.to(dx_residual.dtype) + dx_residual.reshape_as(x)
+            dx = dx.to(dx_residual.dtype) + dx_residual.reshape(ctx.x_shape)
         d_bias = dy2d.sum(dim=0).to(grad_output.dtype) if ctx.has_bias else None
 
         return (
-            dx.to(x.dtype),
+            dx.to(ctx.x_dtype),
             d_lora_down,
             d_lora_up,
             None,
             None,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -553,8 +614,10 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
     Backward:
         dX uses the native FP4 backward dX kernel for W0 plus either a dense
         LoRA term or the optional fused LoRA dX epilogue. The fused path can
-        cache packed LoRA dX weights with version-based invalidation. dA/dB
-        still use torch BF16/FP16 matmul.
+        cache packed LoRA dX weights with version-based invalidation. dA uses
+        exact BF16/FP16 matmul by default, or an opt-in FP4 activation-cache
+        approximation when activation memory is the bottleneck. dB uses the
+        saved LoRA activation.
     """
 
     def __init__(
@@ -577,6 +640,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         reuse_fused_dy_up_for_d_lora_down: bool = False,
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+        fp4_activation_cache_d_lora_down: bool = False,
     ):
         super().__init__()
         if not weight.is_cuda:
@@ -623,6 +687,12 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("exact overlap_lora_grad expects frozen residual dX to stay dense")
         if overlap_lora_grad_min_rows < 0:
             raise ValueError("overlap_lora_grad_min_rows must be non-negative")
+        if fp4_activation_cache_d_lora_down and not cache_lora_act:
+            raise ValueError("fp4_activation_cache_d_lora_down requires cache_lora_act=True for dB")
+        if fp4_activation_cache_d_lora_down and overlap_lora_grad:
+            raise ValueError("fp4_activation_cache_d_lora_down does not currently support overlap_lora_grad")
+        if fp4_activation_cache_d_lora_down and reuse_fused_dy_up_for_d_lora_down:
+            raise ValueError("fp4_activation_cache_d_lora_down does not reuse packed dy_up")
 
         self.out_features, self.in_features = weight.shape
         self.rank = max(16, ceil_divide(rank, 16) * 16)
@@ -642,6 +712,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
         self.overlap_lora_grad = bool(overlap_lora_grad)
         self.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
+        self.fp4_activation_cache_d_lora_down = bool(fp4_activation_cache_d_lora_down)
         self.init_mode = init
         self.frozen_residual_init = frozen_residual_init
 
@@ -715,6 +786,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         reuse_fused_dy_up_for_d_lora_down: bool = False,
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+        fp4_activation_cache_d_lora_down: bool = False,
         frozen_residual_rank: int = 0,
         frozen_residual_init: FrozenResidualInitMode = "none",
     ) -> "NunchakuFP4LoRALinear":
@@ -737,6 +809,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad=overlap_lora_grad,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
+            fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
         )
 
     def clear_fused_lora_dx_cache(self) -> None:
@@ -877,6 +950,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.reuse_fused_dy_up_for_d_lora_down,
             self.overlap_lora_grad,
             self.overlap_lora_grad_min_rows,
+            self.fp4_activation_cache_d_lora_down,
             self._get_fused_lora_dx_cache(),
         )
 
@@ -909,5 +983,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"cache_fused_lora_dx={self.cache_fused_lora_dx}, "
             f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}, "
             f"overlap_lora_grad={self.overlap_lora_grad}, "
-            f"overlap_lora_grad_min_rows={self.overlap_lora_grad_min_rows}"
+            f"overlap_lora_grad_min_rows={self.overlap_lora_grad_min_rows}, "
+            f"fp4_activation_cache_d_lora_down={self.fp4_activation_cache_d_lora_down}"
         )

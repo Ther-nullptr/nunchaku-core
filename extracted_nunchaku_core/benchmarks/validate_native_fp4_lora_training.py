@@ -11,7 +11,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from native_fp4 import NunchakuFP4LoRALinear  # noqa: E402
+from native_fp4 import NunchakuFP4LoRALinear, fp4_activation_cache_lora_down_grad  # noqa: E402
+from native_fp4.operators import pad_tensor  # noqa: E402
 
 
 def tensor_error(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
@@ -46,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     p.add_argument("--overlap-lora-grad", action="store_true")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    p.add_argument("--fp4-activation-cache-d-lora-down", action="store_true")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -82,6 +84,7 @@ def main() -> None:
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         overlap_lora_grad=args.overlap_lora_grad,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+        fp4_activation_cache_d_lora_down=args.fp4_activation_cache_d_lora_down,
     )
 
     cache_refresh_check = True
@@ -151,7 +154,20 @@ def main() -> None:
         if separate_y_ref is not None:
             separate_y_ref = separate_y_ref + op.bias.detach().to(dtype)
         d_up_ref = torch.matmul(dy_lr.t(), lora_act).mul(op.scaling).to(op.lora_up.dtype)
-        d_down_ref = torch.matmul(dy_up.t(), x_lr).mul(op.scaling).to(op.lora_down.dtype)
+        d_down_exact_ref = torch.matmul(dy_up.t(), x_lr).mul(op.scaling).to(op.lora_down.dtype)
+        d_down_ref = d_down_exact_ref
+        if args.fp4_activation_cache_d_lora_down:
+            x2d_fp4 = x2d
+            if op.fp4_forward.k_pad != op.in_features:
+                x2d_fp4 = pad_tensor(x2d_fp4, divisor=op.fp4_forward.k_pad, dim=1)
+            qact, ascales = op.fp4_forward.quantize_input(x2d_fp4)
+            d_down_ref = fp4_activation_cache_lora_down_grad(
+                qact,
+                ascales,
+                dy_up.contiguous(),
+                in_features=op.in_features,
+            )
+            d_down_ref = d_down_ref.mul(op.scaling).to(op.lora_down.dtype)
         d_bias_ref = dy2d.sum(dim=0).to(op.bias.dtype)
 
     errors = {
@@ -161,6 +177,8 @@ def main() -> None:
         "lora_down_grad_vs_manual": tensor_error(op.lora_down.grad, d_down_ref),
         "bias_grad_vs_manual": tensor_error(op.bias.grad, d_bias_ref),
     }
+    if args.fp4_activation_cache_d_lora_down:
+        errors["lora_down_grad_fp4_cache_vs_exact_manual"] = tensor_error(d_down_ref, d_down_exact_ref)
     if args.fuse_lowrank_forward and separate_y_ref is not None:
         errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
     grad_tol = 5e-4 if args.fuse_lora_dx else 1e-6
@@ -211,6 +229,7 @@ def main() -> None:
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "overlap_lora_grad": args.overlap_lora_grad,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
         },
         "tolerances": {
             "forward_rel_l2": forward_tol,

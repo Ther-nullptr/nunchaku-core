@@ -282,8 +282,8 @@ void fp4_activation_cache_lora_down_grad_cuda(
     TORCH_CHECK(output.size(0) == rank, "output rows must match dy_up rank");
     TORCH_CHECK(ascales.numel() == padded_rows * padded_cols / kFP4GroupSize, "ascales numel mismatch");
 
-    constexpr int kVec = 8;
-    constexpr int rVec = 4;
+    constexpr int kVec = 2;
+    constexpr int rVec = 16;
     constexpr int threads = 256;
     const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
     auto stream = at::cuda::getCurrentCUDAStream();

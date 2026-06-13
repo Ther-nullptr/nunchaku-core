@@ -826,6 +826,7 @@ python benchmarks/benchmark_fp4_lora_activation_cache_policy.py \
 - `latency_ms.fp4_cache_dequant_only`
 - `latency_ms.fp4_cache_dequant_plus_d_lora_down`
 - `latency_ms.fp4_cache_fused_d_lora_down`
+- `implementation.fp4_cache_fused_d_lora_down`
 - `errors.d_lora_down_fp4_cache_vs_saved_x`
 - `errors.d_lora_down_fp4_cache_fused_vs_dequant_gemm`
 
@@ -841,15 +842,15 @@ RTX 5090 BF16 短测：
 
 | shape | saved x cache | FP4 cache | memory reduction | x_hat rel_l2 | dA rel_l2 | saved-x dA ms | FP4 dequant+dA ms | fused dA ms | fused vs dequant rel_l2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0280 | 0.0689 | 0.1584 | 2.86e-3 |
-| 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0387 | 0.1977 | 0.5062 | 7.84e-5 |
+| 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0284 | 0.0682 | 0.1300 | 2.86e-3 |
+| 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0389 | 0.1985 | 0.3920 | 7.84e-5 |
 
 当前结论：
 
 - `qact + ascales` 的缓存体积是 BF16/FP16 `x` 的约 `28.1%`，理论显存节省明确。
 - 但 `dA` 直接用 FP4-dequant `x_hat` 会引入约 `1e-1` rel_l2 的 LoRA A 梯度误差，不适合作为默认精度路径。
 - naive `dequant -> dense x_hat -> GEMM` 需要在 backward 重新物化 dense `x_hat`，4096 形状比直接用 saved BF16 `x` 慢约 `5.1x`。
-- 已加入 `fp4_activation_cache_lora_down_grad` fused CUDA 原型，避免 dense `x_hat` 中间张量；当前 rank-tiled 标量 reduction 实现仍慢于 `dequant + GEMM`，4096 形状约 `0.39x`。这说明后续要继续优化 decode staging/reduction 或改成 tensor-core 友好的分块，而不是直接把该原型设为默认路径。
+- 已加入 `fp4_activation_cache_lora_down_grad` fused CUDA 原型，避免 dense `x_hat` 中间张量；当前使用 `kVec=2,rVec=16` rank-tiled 标量 reduction，相比上一版 `kVec=8,rVec=4` 在 2048/4096 形状分别约 `1.22x/1.29x`。它仍慢于 `dequant + GEMM`，4096 形状约 `0.51x`，说明后续要继续优化 decode staging/reduction 或改成 tensor-core 友好的分块，而不是直接把该原型设为默认路径。
 - 精度上 fused 原型对齐的是 `dequant(qact, ascales)` 近似路径，不解决 FP4 activation cache 本身带来的约 `1e-1` `dA` 误差。因此它仍应作为显存模式或近似训练消融，而非默认精度路径。
 
 ## 11. 建议的完整实验顺序

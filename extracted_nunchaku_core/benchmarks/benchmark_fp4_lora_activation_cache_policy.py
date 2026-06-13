@@ -199,6 +199,9 @@ def main() -> None:
             "fp4_cache_reduction_vs_padded_x": bf16_x_cache_padded_bytes / fp4_cache_bytes,
             "naive_fp4_cache_materializes_dense_x_hat_in_backward": True,
         },
+        "implementation": {
+            "fp4_cache_fused_d_lora_down": "cuda_rank_tiled_kvec2_rvec16",
+        },
         "latency_ms": {
             "forward_quantize_cache": quantize_cache_ms,
             "dy_up": dy_up_ms,

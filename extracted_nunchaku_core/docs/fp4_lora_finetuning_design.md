@@ -307,6 +307,24 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 - 更值得优先看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
 - LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
 
+### Native FP4 backward repack micro-optimization
+
+新增微优化：
+
+- `csrc/fp4_repack_cuda.cu`
+- 将每个 32-bit 输出 word 内重复使用的 backward scale load、zero check 和固定 forward scale group 计算移到 8 元素循环外。
+- 不保存第二份 transposed FP4 backbone；仍然每次 backward transient repack。
+- `validate_native_fp4_backward.py --m 256 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16` 通过，`qweight_bwd_cuda_matches_reference=true`，repack 输出 bitwise exact。
+
+RTX 5090 短测，`benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10`：
+
+| metric | before ms | after ms | speedup |
+| --- | ---: | ---: | ---: |
+| `repack_backbone` | 0.0424 | 0.0391 | 1.084x |
+| `fp4_dx_main` | 0.1868 | 0.1839 | 1.016x |
+| `fused_dx_cached_pack` | 0.2175 | 0.2139 | 1.017x |
+| `full_backward_minus_forward` | 0.6703 | 0.6561 | 1.022x |
+
 ### Native LoRA pack
 
 新增：

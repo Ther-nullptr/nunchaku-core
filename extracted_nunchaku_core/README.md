@@ -479,6 +479,17 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | BF16 | 0.6195 | 0.2152 | 0.0761 | 12.3% | 0.0388 |
 | FP16 | 0.6467 | 0.2275 | 0.0396 | 6.1% | 0.0128 |
 
+本轮 repack micro-optimization 后，RTX 5090 同形状 BF16 短测：
+
+| metric | before ms | after ms | speedup |
+| --- | ---: | ---: | ---: |
+| `repack_backbone` | 0.0424 | 0.0391 | 1.084x |
+| `fp4_dx_main` | 0.1868 | 0.1839 | 1.016x |
+| `fused_dx_cached_pack` | 0.2175 | 0.2139 | 1.017x |
+| `full_backward_minus_forward` | 0.6703 | 0.6561 | 1.022x |
+
+这个优化只把 repack kernel 内每个输出 word 重复使用的 backward scale load、zero check 和固定 scale-group 计算移到 8 元素循环外；不保存第二份 transposed FP4 backbone，`qweight_bwd_cuda_matches_reference` 仍保持 bitwise exact。
+
 结论：
 
 - `dA/dB` 目前不是最大瓶颈；先写专用低秩梯度 kernel 的收益上限有限。

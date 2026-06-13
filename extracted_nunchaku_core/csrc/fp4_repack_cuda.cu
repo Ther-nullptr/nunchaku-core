@@ -101,27 +101,32 @@ __global__ void fp4_repack_backward_kernel(
 
     const int dst_row = (n_block << 7) + (n_pack << 4) + (n_pack_size << 3) + n_lane;
     const int dst_col_base = (k_tile << 6) + (k_pack_size << 5) + (k_lane << 3);
+    const int src_col = dst_row;
+    const int src_col_group = src_col >> 4;
+    const half zero = __float2half_rn(0.0f);
+    const half dst_scale = bwd_scales[static_cast<int64_t>(dst_row) * bwd_groups + (dst_col_base >> 4)];
+    const bool dst_scale_valid = __hgt(dst_scale, zero);
 
     uint32_t out_word = 0;
 
-    #pragma unroll
-    for (int reg_k = 0; reg_k < 8; ++reg_k) {
-        const int dst_col = dst_col_base + reg_k;
-        const int src_row = dst_col;
-        const int src_col = dst_row;
+    if (dst_scale_valid) {
+        #pragma unroll
+        for (int reg_k = 0; reg_k < 8; ++reg_k) {
+            const int dst_col = dst_col_base + reg_k;
+            const int src_row = dst_col;
 
-        const uint8_t src_code = load_fp4_code(qweight_fwd, src_k_tiles, src_row, src_col);
-        const half src_scale = fwd_scales[static_cast<int64_t>(src_row) * fwd_groups + (src_col >> 4)];
-        const half dst_scale = bwd_scales[static_cast<int64_t>(dst_row) * bwd_groups + (dst_col >> 4)];
+            const uint8_t src_code = load_fp4_code(qweight_fwd, src_k_tiles, src_row, src_col);
+            const half src_scale = fwd_scales[static_cast<int64_t>(src_row) * fwd_groups + src_col_group];
 
-        uint8_t dst_code = 0;
-        if (__hgt(dst_scale, __float2half_rn(0.0f)) && __hgt(src_scale, __float2half_rn(0.0f))) {
-            const half value = __hmul(decode_fp4_half(src_code), src_scale);
-            const half scaled = __hdiv(value, dst_scale);
-            dst_code = quantize_fp4_from_half(scaled);
+            uint8_t dst_code = 0;
+            if (__hgt(src_scale, zero)) {
+                const half value = __hmul(decode_fp4_half(src_code), src_scale);
+                const half scaled = __hdiv(value, dst_scale);
+                dst_code = quantize_fp4_from_half(scaled);
+            }
+
+            out_word |= static_cast<uint32_t>(dst_code & 0xF) << (reg_k * 4);
         }
-
-        out_word |= static_cast<uint32_t>(dst_code & 0xF) << (reg_k * 4);
     }
 
     qweight_bwd_words[word_index] = out_word;

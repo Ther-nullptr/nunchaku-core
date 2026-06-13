@@ -282,6 +282,7 @@ def run_record(
         train_bias=args.train_bias,
         cache_lora_act=not args.no_cache_lora_act,
         activation_checkpoint=args.activation_checkpoint,
+        backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=backend,
         lr=args.lr,
@@ -308,6 +309,9 @@ def run_record(
     all_module_backends_match = all(
         child.fp4_activation_cache_d_lora_down_backend == backend for child in fp4_modules.values()
     )
+    all_module_backward_weight_policies_match = all(
+        child.backward_weight_policy == args.backward_weight_policy for child in fp4_modules.values()
+    )
     grads_finite = all(
         param.grad is not None and bool(torch.isfinite(param.grad).all())
         for group in result.optimizer_param_groups
@@ -327,6 +331,7 @@ def run_record(
         "x_grad_finite": x_grad_finite,
         "trainable_grads_finite": grads_finite,
         "module_backends_match": all_module_backends_match,
+        "module_backward_weight_policies_match": all_module_backward_weight_policies_match,
         "latency_positive": latency_ms > 0.0,
         "peak_delta_nonnegative": peak_delta >= 0,
     }
@@ -340,6 +345,7 @@ def run_record(
         "replaced_count": len(result.replaced_modules),
         "trainable_param_count": result.trainable_param_count,
         "refreshed_cache_count": result.refreshed_cache_count,
+        "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_hook_refresh_count": cache_hook_count,
         "latency_ms": {
             "train_step_with_optimizer": latency_ms,
@@ -468,6 +474,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-bias", action="store_true")
     p.add_argument("--no-cache-lora-act", action="store_true")
     p.add_argument("--activation-checkpoint", action="store_true")
+    p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--include-reuse-policies", action="store_true")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--adam-eps", type=float, default=1e-4)
@@ -559,6 +566,7 @@ def main() -> None:
             "train_bias": args.train_bias,
             "cache_lora_act": not args.no_cache_lora_act,
             "activation_checkpoint": args.activation_checkpoint,
+            "backward_weight_policy": args.backward_weight_policy,
             "include_reuse_policies": args.include_reuse_policies,
             "warmup": args.warmup,
             "iters": args.iters,

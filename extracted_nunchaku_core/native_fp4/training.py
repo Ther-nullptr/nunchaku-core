@@ -13,6 +13,7 @@ from .layout import (
     unpack_fp4_weight_scales,
 )
 from .operators import (
+    FP4BackwardWeightPolicy,
     NunchakuFP4BackwardDXOp,
     NunchakuFP4GemmOp,
     ceil_divide,
@@ -694,6 +695,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         fuse_lora_dx: bool = False,
         fuse_frozen_residual_dx: bool = False,
         cache_fused_lora_dx: bool = False,
+        backward_weight_policy: FP4BackwardWeightPolicy = "repack",
         reuse_fused_dy_up_for_d_lora_down: bool = False,
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
@@ -728,6 +730,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("residual_svd_lowrank_oversample must be non-negative")
         if residual_svd_lowrank_niter < 0:
             raise ValueError("residual_svd_lowrank_niter must be non-negative")
+        if backward_weight_policy not in ("repack", "cache"):
+            raise ValueError("backward_weight_policy must be one of: repack, cache")
         if frozen_residual_rank < 0:
             raise ValueError("frozen_residual_rank must be non-negative")
         if frozen_residual_init == "residual_svd" and frozen_residual_rank <= 0:
@@ -778,6 +782,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.fuse_lora_dx = bool(fuse_lora_dx)
         self.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
         self.cache_fused_lora_dx = bool(cache_fused_lora_dx)
+        self.backward_weight_policy = backward_weight_policy
         self.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
         self.overlap_lora_grad = bool(overlap_lora_grad)
         self.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
@@ -790,7 +795,11 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.residual_svd_lowrank_niter = int(residual_svd_lowrank_niter)
 
         self.fp4_forward = NunchakuFP4GemmOp(weight=weight, bias=None, dummy_rank=self.rank)
-        self.fp4_backward = NunchakuFP4BackwardDXOp(weight=weight, dummy_rank=self.rank)
+        self.fp4_backward = NunchakuFP4BackwardDXOp(
+            weight=weight,
+            dummy_rank=self.rank,
+            backward_weight_policy=backward_weight_policy,
+        )
         self._share_forward_backbone_with_backward()
         self.register_buffer("_cached_lora_down_bwd_packed", None, persistent=False)
         self.register_buffer("_cached_lora_up_bwd_packed", None, persistent=False)
@@ -840,6 +849,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.fp4_backward.wscales_fwd_logical = fwd_scales.to(torch.float16).contiguous()
         self.fp4_backward.wscales_bwd_logical = logical_bwd.to(torch.float16).contiguous()
         self.fp4_backward.wscales_bwd_packed = packed_bwd.contiguous()
+        self.fp4_backward.clear_backward_qweight_cache()
 
     @classmethod
     def from_linear(
@@ -856,6 +866,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         fuse_lora_dx: bool = False,
         fuse_frozen_residual_dx: bool = False,
         cache_fused_lora_dx: bool = False,
+        backward_weight_policy: FP4BackwardWeightPolicy = "repack",
         reuse_fused_dy_up_for_d_lora_down: bool = False,
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
@@ -883,6 +894,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             fuse_lora_dx=fuse_lora_dx,
             fuse_frozen_residual_dx=fuse_frozen_residual_dx,
             cache_fused_lora_dx=cache_fused_lora_dx,
+            backward_weight_policy=backward_weight_policy,
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad=overlap_lora_grad,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
@@ -902,6 +914,16 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self._cached_frozen_residual_up_version = -1
         self._cached_lora_scaling = None
         self._cached_frozen_residual_scaling = None
+
+    def clear_backward_weight_cache(self) -> None:
+        self.fp4_backward.clear_backward_qweight_cache()
+
+    def refresh_backward_weight_cache(self) -> torch.Tensor | None:
+        if self.backward_weight_policy != "cache":
+            self.clear_backward_weight_cache()
+            return None
+        with torch.no_grad():
+            return self.fp4_backward.refresh_backward_qweight_cache()
 
     def refresh_fused_lora_dx_cache(self) -> None:
         with torch.no_grad():
@@ -1070,6 +1092,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"fuse_lora_dx={self.fuse_lora_dx}, "
             f"fuse_frozen_residual_dx={self.fuse_frozen_residual_dx}, "
             f"cache_fused_lora_dx={self.cache_fused_lora_dx}, "
+            f"backward_weight_policy={self.backward_weight_policy}, "
             f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}, "
             f"overlap_lora_grad={self.overlap_lora_grad}, "
             f"overlap_lora_grad_min_rows={self.overlap_lora_grad_min_rows}, "

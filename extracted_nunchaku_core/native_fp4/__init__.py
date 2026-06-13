@@ -14,6 +14,7 @@ from .modeling import (
     FP4LoRACacheRefreshHook,
     FP4LoRAPrepareResult,
     FP4LoRASensitivityPolicy,
+    clear_fp4_backward_weight_caches,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
@@ -29,12 +30,20 @@ from .modeling import (
     load_fp4_lora_state_dict,
     prepare_fp4_lora_finetuning,
     register_fp4_lora_cache_refresh_hook,
+    refresh_fp4_backward_weight_caches,
     refresh_fused_lora_dx_caches,
 )
-from .training import FP4ActivationCacheDLoRADownBackend, FrozenResidualInitMode, NunchakuFP4LoRALinear, ResidualSVDMethod
+from .training import (
+    FP4ActivationCacheDLoRADownBackend,
+    FP4BackwardWeightPolicy,
+    FrozenResidualInitMode,
+    NunchakuFP4LoRALinear,
+    ResidualSVDMethod,
+)
 
 __all__ = [
     "FP4ActivationCacheDLoRADownBackend",
+    "FP4BackwardWeightPolicy",
     "FP4LoRAConfig",
     "FP4LoRACacheRefreshHook",
     "FP4LoRAPrepareResult",
@@ -49,6 +58,7 @@ __all__ = [
     "NunchakuFP4BackwardDXOp",
     "NunchakuFP4LowRankBackwardDXOp",
     "NunchakuFP4LoRALinear",
+    "clear_fp4_backward_weight_caches",
     "clear_fused_lora_dx_caches",
     "convert_linear_to_fp4_lora",
     "fp4_lora_config_overrides_from_outlier_report",
@@ -64,6 +74,7 @@ __all__ = [
     "load_fp4_lora_state_dict",
     "prepare_fp4_lora_finetuning",
     "register_fp4_lora_cache_refresh_hook",
+    "refresh_fp4_backward_weight_caches",
     "refresh_fused_lora_dx_caches",
     "dequantize_fp4_activation",
     "unpack_fp4_activation_codes",

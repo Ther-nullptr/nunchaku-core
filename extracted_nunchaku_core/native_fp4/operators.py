@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 
 from .layout import (
@@ -8,6 +10,8 @@ from .layout import (
     repack_fp4_weight_for_backward,
     unpack_fp4_weight_scales,
 )
+
+FP4BackwardWeightPolicy = Literal["repack", "cache"]
 
 
 def _load_fp4_backend_ops():
@@ -476,10 +480,19 @@ class NunchakuFP4LowRankUnfusedOp(NunchakuFP4LowRankOp):
 
 
 class NunchakuFP4BackwardDXOp(NunchakuFP4GemmOp):
-    """Backward dX operator using transient FP4 repack for W^T."""
+    """Backward dX operator using transient or cached FP4 repack for W^T."""
 
-    def __init__(self, weight: torch.Tensor, dummy_rank: int = 16):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        dummy_rank: int = 16,
+        backward_weight_policy: FP4BackwardWeightPolicy = "repack",
+    ):
+        if backward_weight_policy not in ("repack", "cache"):
+            raise ValueError("backward_weight_policy must be one of: repack, cache")
         super().__init__(weight=weight, bias=None, dummy_rank=dummy_rank)
+        self.backward_weight_policy = backward_weight_policy
+        self.register_buffer("_cached_qweight_bwd", None, persistent=False)
 
         wscales_fwd_logical = unpack_fp4_weight_scales(self.wscales, self.n_pad, self.k_pad).to(torch.float16).contiguous()
         self.register_buffer("wscales_fwd_logical", wscales_fwd_logical, persistent=False)
@@ -509,7 +522,14 @@ class NunchakuFP4BackwardDXOp(NunchakuFP4GemmOp):
         )
         return qact, ascales
 
-    def repack_qweight_for_backward(self) -> torch.Tensor:
+    def clear_backward_qweight_cache(self) -> None:
+        self._cached_qweight_bwd = None
+
+    def refresh_backward_qweight_cache(self) -> torch.Tensor:
+        self._cached_qweight_bwd = self._repack_qweight_for_backward().detach()
+        return self._cached_qweight_bwd
+
+    def _repack_qweight_for_backward(self) -> torch.Tensor:
         if hasattr(_OPS, "fp4_repack_backward"):
             return _OPS.fp4_repack_backward(
                 self.qweight,
@@ -523,6 +543,13 @@ class NunchakuFP4BackwardDXOp(NunchakuFP4GemmOp):
             in_features=self.k_pad,
             logical_scales_t=self.wscales_bwd_logical,
         )
+
+    def repack_qweight_for_backward(self) -> torch.Tensor:
+        if self.backward_weight_policy == "cache":
+            if self._cached_qweight_bwd is None:
+                return self.refresh_backward_qweight_cache()
+            return self._cached_qweight_bwd
+        return self._repack_qweight_for_backward()
 
     def backward_prequantized(
         self,

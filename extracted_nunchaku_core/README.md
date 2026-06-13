@@ -441,6 +441,7 @@ FP4 activation-cache `dA` 接入训练接口后的 BF16 短测，`fuse_lora_dx=T
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
 - `fuse_lowrank_forward=True` 是 dual-branch opt-in 实验选项：把 task LoRA forward 和 frozen residual forward 合成一次拼接 low-rank GEMM。它减少 launch/GEMM 次数，但会改变低秩分支的浮点归约顺序；验证脚本会 strict 检查当前调度，并额外用 `5e-4` rel_l2 tolerance 报告它相对“两支分开计算”公式的差异。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
+- `backward_weight_policy="repack"` 是默认策略：每次 backward transient repack 出 `W^T` 的 packed FP4 权重，只预存转置后的 scale，不额外常驻第二份 backbone。`"cache"` 是显式 opt-in：常驻一份 compressed backward qweight，用显存换掉 repack 开销。RTX 5090 4096/rank32 BF16 短测中，cache train step 相对 repack 为 `1.056x`，4-step accumulation 为 `1.050x`；额外 qweight 为 dense BF16 权重的 `25%`、forward qweight 的 `1.0x`。
 - `fp4_activation_cache_d_lora_down=True` 是显存/近似训练模式：forward 保存主分支已有的 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 是默认值，直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 backward 临时物化 dense `x_hat`；`"dequant_gemm"` 会先反量化出 dense `x_hat` 再走 torch GEMM，通常更快但有额外 transient 显存。该模式要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 opt-in 实验选项：复用 fused dX quantize kernel 产生的 `dY @ B`，避免额外 dense `dY @ B` matmul。FP16 走 packed decode，有小量 `dA` 误差；BF16 走 dual dense `dy_up` 输出，保持 `dA` 与手写 BF16 matmul 对齐。
 - `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`，用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM；exact overlap 支持 frozen residual branch，但 residual dX 保持 dense 计算。
@@ -783,6 +784,8 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
 
 输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
 
+如果要测试第二份 compressed backward qweight 的上限收益，追加 `--backward-weight-policy cache`。默认仍是 `repack`，避免常驻第二份 backbone；cache 策略会在 `prepare_fp4_lora_finetuning(..., refresh_caches=True)` 时预热，并在结果中报告 `refreshed_backward_weight_count`。
+
 如果要把 BF16/FP16 `dy_up` 复用纳入模型级消融，追加 `--include-reuse-policies`：
 
 ```bash
@@ -812,6 +815,7 @@ RTX 5090 验证结果：
 - 按 `target_modules/exclude_modules/config_overrides/outlier_report/sensitivity_report` 替换模型 Linear。
 - 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
 - 按需刷新 fused dX cache。
+- opt-in `backward_weight_policy="cache"` 时预热 compressed backward qweight；默认 `repack` 不额外常驻第二份 backbone。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
 - 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache。
 
@@ -1152,13 +1156,17 @@ python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 307
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fuse-lowrank-forward
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
+python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --backward-weight-policy cache
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 4 --hidden 128 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fp4-activation-cache-d-lora-down --fp4-activation-cache-d-lora-down-backend dequant_gemm
 python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/validate_fp4_lora_prepare.py
+python benchmarks/validate_fp4_lora_prepare.py --dtype bf16 --lowrank-dtype bf16 --mode balanced --backward-weight-policy cache
 python benchmarks/benchmark_fp4_lora_prepare_policies.py --batch 8 --hidden 256 --layers 2 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
+python benchmarks/benchmark_fp4_lora_prepare_policies.py --batch 8 --hidden 256 --layers 2 --rank 32 --dtype bf16 --lowrank-dtype bf16 --modes balanced --backward-weight-policy cache --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_prepare_policies.py --batch 8 --hidden 256 --layers 2 --rank 32 --dtype bf16 --lowrank-dtype bf16 --modes balanced --include-reuse-policies --no-frozen-residual --warmup 3 --iters 5
+python benchmarks/benchmark_fp4_lora_backward_weight_policy.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16

@@ -12,6 +12,7 @@ import torch
 from .training import (
     DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     FP4ActivationCacheDLoRADownBackend,
+    FP4BackwardWeightPolicy,
     FrozenResidualInitMode,
     LoRAInitMode,
     NunchakuFP4LoRALinear,
@@ -49,6 +50,7 @@ class FP4LoRAConfig:
     fuse_lora_dx: bool = False
     fuse_frozen_residual_dx: bool = False
     cache_fused_lora_dx: bool = False
+    backward_weight_policy: FP4BackwardWeightPolicy = "repack"
     reuse_fused_dy_up_for_d_lora_down: bool = False
     overlap_lora_grad: bool = False
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS
@@ -67,6 +69,7 @@ class FP4LoRAPrepareResult:
     trainable_param_count: int
     optimizer_param_groups: list[dict[str, Any]]
     refreshed_cache_count: int
+    refreshed_backward_weight_count: int
     target_modules: tuple[str, ...]
     exclude_modules: tuple[str, ...]
 
@@ -99,6 +102,7 @@ def fp4_lora_finetune_config(
     train_bias: bool = False,
     cache_lora_act: bool = True,
     activation_checkpoint: bool = False,
+    backward_weight_policy: FP4BackwardWeightPolicy = "repack",
     reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
@@ -128,6 +132,8 @@ def fp4_lora_finetune_config(
         raise ValueError("lowrank_dtype must be torch.float16 or torch.bfloat16")
     if fp4_activation_cache_d_lora_down_backend not in ("fused", "dequant_gemm"):
         raise ValueError("fp4_activation_cache_d_lora_down_backend must be one of: fused, dequant_gemm")
+    if backward_weight_policy not in ("repack", "cache"):
+        raise ValueError("backward_weight_policy must be one of: repack, cache")
     if overlap_lora_grad_min_rows < 0:
         raise ValueError("overlap_lora_grad_min_rows must be non-negative")
     if reuse_fused_dy_up_for_d_lora_down and dtype != lowrank_dtype:
@@ -196,6 +202,7 @@ def fp4_lora_finetune_config(
         fuse_lora_dx=fuse_lora_dx,
         fuse_frozen_residual_dx=fuse_frozen_residual_dx,
         cache_fused_lora_dx=cache_fused_lora_dx,
+        backward_weight_policy=backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=bool(reuse_fused_dy_up_for_d_lora_down),
         overlap_lora_grad=overlap_lora_grad,
         overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
@@ -463,6 +470,7 @@ def convert_linear_to_fp4_lora(
                         fuse_lora_dx=child_cfg.fuse_lora_dx,
                         fuse_frozen_residual_dx=child_cfg.fuse_frozen_residual_dx,
                         cache_fused_lora_dx=child_cfg.cache_fused_lora_dx,
+                        backward_weight_policy=child_cfg.backward_weight_policy,
                         reuse_fused_dy_up_for_d_lora_down=child_cfg.reuse_fused_dy_up_for_d_lora_down,
                         overlap_lora_grad=child_cfg.overlap_lora_grad,
                         overlap_lora_grad_min_rows=child_cfg.overlap_lora_grad_min_rows,
@@ -499,6 +507,23 @@ def clear_fused_lora_dx_caches(module: torch.nn.Module) -> int:
     count = 0
     for _, child in iter_fp4_lora_modules(module):
         child.clear_fused_lora_dx_cache()
+        count += 1
+    return count
+
+
+def refresh_fp4_backward_weight_caches(module: torch.nn.Module) -> int:
+    count = 0
+    for _, child in iter_fp4_lora_modules(module):
+        if child.backward_weight_policy == "cache":
+            child.refresh_backward_weight_cache()
+            count += 1
+    return count
+
+
+def clear_fp4_backward_weight_caches(module: torch.nn.Module) -> int:
+    count = 0
+    for _, child in iter_fp4_lora_modules(module):
+        child.clear_backward_weight_cache()
         count += 1
     return count
 
@@ -837,6 +862,7 @@ def prepare_fp4_lora_finetuning(
     train_bias: bool = False,
     cache_lora_act: bool = True,
     activation_checkpoint: bool = False,
+    backward_weight_policy: FP4BackwardWeightPolicy = "repack",
     reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
@@ -887,6 +913,7 @@ def prepare_fp4_lora_finetuning(
             train_bias=train_bias,
             cache_lora_act=cache_lora_act,
             activation_checkpoint=activation_checkpoint,
+            backward_weight_policy=backward_weight_policy,
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
             fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
@@ -951,6 +978,7 @@ def prepare_fp4_lora_finetuning(
     )
     trainable_names = freeze_non_fp4_lora_parameters(prepared_model, train_bias=train_bias)
     refreshed = refresh_fused_lora_dx_caches(prepared_model) if refresh_caches else 0
+    refreshed_backward_weight = refresh_fp4_backward_weight_caches(prepared_model) if refresh_caches else 0
     param_groups = fp4_lora_parameter_groups(
         prepared_model,
         train_bias=train_bias,
@@ -968,6 +996,7 @@ def prepare_fp4_lora_finetuning(
         trainable_param_count=trainable_param_count,
         optimizer_param_groups=param_groups,
         refreshed_cache_count=refreshed,
+        refreshed_backward_weight_count=refreshed_backward_weight,
         target_modules=targets,
         exclude_modules=excludes,
     )

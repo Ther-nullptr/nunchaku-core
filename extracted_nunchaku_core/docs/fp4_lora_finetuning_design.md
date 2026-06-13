@@ -159,7 +159,7 @@ model = prepared.model
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则；`memory_saving + fp4_activation_cache_d_lora_down_backend="dequant_gemm"` 也通过。
 
-`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；默认 `repack` 仍不常驻第二份 FP4 backbone。
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、初始 forward 误差和相对 dense LoRA speedup 消融。
 
@@ -298,6 +298,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - P0/P1 接口已经能在典型 4096 线性层上给出约 `1.9x-2.2x` 的训练 step 加速。
 - `fuse_lora_dx=True`：将 `dX_lora = (dY @ B) @ A` 的第二段放进 FP4 dX epilogue。
 - `cache_fused_lora_dx=True`：只缓存 LoRA packed A/B，额外内存约 `rank * (in + out)`，不缓存第二份 FP4 backbone；参数 version 变化时自动刷新。
+- `backward_weight_policy="repack"`：默认每次 backward transient repack `W^T` 的 packed FP4 权重，只预存转置后的 scale，不常驻第二份 backbone。`"cache"` 是 memory-budget opt-in，常驻一份 compressed backward qweight；RTX 5090 4096/rank32 BF16 短测中 train step `1.056x`、4-step accumulation `1.050x` vs repack，额外 cache 为 dense BF16 weight 的 `25%`。
 - `fp4_activation_cache_d_lora_down=True`：forward 保存主分支已有 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 dense `x_hat`；`"dequant_gemm"` 先反量化出 dense `x_hat` 再用 torch GEMM，当前更快但 transient 显存更高。这是显存/近似训练模式，要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。
@@ -413,6 +414,7 @@ FP4 dX pipeline 短测，`M=N=K=4096, rank=32`：
 - `csrc/fp4_repack_cuda.cu`
 - 将每个 32-bit 输出 word 内重复使用的 backward scale load、zero check 和固定 forward scale group 计算移到 8 元素循环外。
 - 不保存第二份 transposed FP4 backbone；仍然每次 backward transient repack。
+- 高层训练接口新增 `backward_weight_policy`：默认 `"repack"` 保持上述行为；`"cache"` 显式常驻 compressed backward qweight，用于量化 repack 开销上限，不作为默认策略。
 - `validate_native_fp4_backward.py --m 256 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16` 通过，`qweight_bwd_cuda_matches_reference=true`，repack 输出 bitwise exact。
 
 RTX 5090 短测，`benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10`：

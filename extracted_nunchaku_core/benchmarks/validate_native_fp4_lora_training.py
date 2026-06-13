@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--fuse-frozen-residual-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
+    p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     p.add_argument("--overlap-lora-grad", action="store_true")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
@@ -88,6 +89,7 @@ def main() -> None:
         fuse_lora_dx=args.fuse_lora_dx,
         fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
+        backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         overlap_lora_grad=args.overlap_lora_grad,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
@@ -96,6 +98,10 @@ def main() -> None:
     )
 
     cache_refresh_check = True
+    backward_weight_cache_check = True
+    if args.backward_weight_policy == "cache":
+        op.refresh_backward_weight_cache()
+        backward_weight_cache_check = op.fp4_backward._cached_qweight_bwd is not None
     if args.cache_fused_lora_dx:
         op.refresh_fused_lora_dx_cache()
         old_down_version = op._cached_lora_down_version
@@ -214,6 +220,8 @@ def main() -> None:
             name.startswith("frozen_residual") for name, _ in op.named_parameters()
         ),
         "cache_refresh_after_param_update": cache_refresh_check,
+        "backward_weight_cache_policy_matches": op.backward_weight_policy == args.backward_weight_policy,
+        "backward_weight_cache_state_matches": backward_weight_cache_check,
     }
     if "forward_vs_separate_lowrank_manual" in errors:
         checks["fused_forward_separate_formula_rel_l2_lt_5e-4"] = (
@@ -242,6 +250,7 @@ def main() -> None:
             "fuse_lora_dx": args.fuse_lora_dx,
             "fuse_frozen_residual_dx": args.fuse_frozen_residual_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
+            "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "overlap_lora_grad": args.overlap_lora_grad,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,

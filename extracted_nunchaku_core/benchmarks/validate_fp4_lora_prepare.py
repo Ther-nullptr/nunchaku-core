@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["accuracy", "balanced", "throughput", "memory_saving"], default="balanced")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--adam-eps", type=float, default=1e-4)
+    p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
@@ -89,6 +90,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
@@ -129,6 +131,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
@@ -178,6 +181,7 @@ def main() -> None:
     expected_cache_count = (
         len(expected_replaced) if base_cfg.fuse_lora_dx and base_cfg.cache_fused_lora_dx else 0
     )
+    expected_backward_weight_count = len(expected_replaced) if base_cfg.backward_weight_policy == "cache" else 0
     expected_adapter_keys = {
         f"{name}.{param}" for name in expected_replaced for param in ("lora_down", "lora_up")
     }
@@ -201,6 +205,9 @@ def main() -> None:
             result.config.reuse_fused_dy_up_for_d_lora_down
             == args.reuse_fused_dy_up_for_d_lora_down
         ),
+        "result_config_backward_weight_policy_matches": (
+            result.config.backward_weight_policy == args.backward_weight_policy
+        ),
         "all_replaced_backend_matches": all(
             fp4_modules[name].fp4_activation_cache_d_lora_down_backend
             == args.fp4_activation_cache_d_lora_down_backend
@@ -210,6 +217,9 @@ def main() -> None:
             fp4_modules[name].reuse_fused_dy_up_for_d_lora_down
             == args.reuse_fused_dy_up_for_d_lora_down
             for name in expected_replaced
+        ),
+        "all_replaced_backward_weight_policy_matches": all(
+            fp4_modules[name].backward_weight_policy == args.backward_weight_policy for name in expected_replaced
         ),
         "lm_head_not_replaced": not isinstance(prepared.lm_head, NunchakuFP4LoRALinear),
         "sensitivity_exclude_keeps_layer0_down_proj_dense": (
@@ -231,6 +241,14 @@ def main() -> None:
         "optimizer_param_groups_have_lr": groups_have_lr,
         "trainable_param_count_matches": result.trainable_param_count == trainable_param_count,
         "refresh_count_matches": result.refreshed_cache_count == expected_cache_count,
+        "backward_weight_refresh_count_matches": (
+            result.refreshed_backward_weight_count == expected_backward_weight_count
+        ),
+        "backward_weight_cache_state_matches": all(
+            (fp4_modules[name].fp4_backward._cached_qweight_bwd is not None)
+            == (args.backward_weight_policy == "cache")
+            for name in expected_replaced
+        ),
         "cache_hook_refresh_count_matches": hook_refresh_count == expected_cache_count,
         "cache_hook_caches_current": caches_current,
         "forward_output_finite": bool(torch.isfinite(y).all()),
@@ -252,6 +270,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "mode": args.mode,
+            "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
@@ -259,6 +278,7 @@ def main() -> None:
         "trainable": result.trainable_names,
         "trainable_param_count": result.trainable_param_count,
         "refreshed_cache_count": result.refreshed_cache_count,
+        "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "hook_refresh_count": hook_refresh_count,
         "exclude_modules": result.exclude_modules,
         "checks": checks,

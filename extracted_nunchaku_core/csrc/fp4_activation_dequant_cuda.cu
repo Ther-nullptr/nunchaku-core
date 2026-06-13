@@ -309,7 +309,7 @@ void fp4_activation_cache_lora_down_grad_cuda(
                         rank,
                         static_cast<int>(padded_cols / kWarpK));
             });
-    } else if (rank <= 256) {
+    } else if (rank <= 512) {
         // Higher-rank sensitive projections still benefit from a wider rank tile.
         // Keep the thread count low so the reduction fits under 48KB static smem.
         constexpr int kVec = 3;
@@ -320,7 +320,7 @@ void fp4_activation_cache_lora_down_grad_cuda(
             at::kHalf,
             at::kBFloat16,
             output.scalar_type(),
-            "fp4_activation_cache_lora_down_grad_cuda_rank256",
+            "fp4_activation_cache_lora_down_grad_cuda_rank512",
             [&] {
                 fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec, kThreads>
                     <<<blocks, kThreads, 0, stream>>>(

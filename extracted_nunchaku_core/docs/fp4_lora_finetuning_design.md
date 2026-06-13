@@ -436,6 +436,8 @@ RTX 5090 BF16 短测：
 | 4096^2, rank128 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.79e-2 | 0.0354 | 0.2017 | 1.8640 | 2.63e-3 |
 | 2048^2, rank256 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.79e-2 | 0.0510 | 0.0924 | 1.0643 | 4.45e-5 |
 | 4096^2, rank256 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.79e-2 | 0.0684 | 0.2264 | 3.6840 | 2.87e-3 |
+| 2048^2, rank512 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.79e-2 | 0.0484 | 0.0893 | 2.0542 | 2.86e-3 |
+| 4096^2, rank512 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.78e-2 | 0.1084 | 0.2694 | 7.2254 | 7.43e-5 |
 
 训练接口接入后的短测，`benchmark_native_fp4_lora_training.py --warmup 5 --iters 10 --grad-accum-steps 4`，BF16，`fuse_lora_dx=True, cache_fused_lora_dx=True`：
 
@@ -458,8 +460,8 @@ RTX 5090 BF16 短测：
 - FP4 cache 的显存收益明确，`qact + ascales` 约为 saved BF16/FP16 `x` 的 `28.1%`；训练接口实测 activation context 缩减约 `3.42x-3.49x`，all saved tensors 缩减约 `3.19x-3.36x`。
 - 直接用 FP4-dequant activation 计算 `dA` 会带来约 `1e-1` rel_l2 梯度误差；如果要保持 LoRA 梯度精确，默认仍应使用 `save_bf16` 或重算 `x` 来源。
 - 当前 naive CUDA dequant 仍要物化 dense `x_hat`，4096 形状比 saved-x `dA` 慢约 `5.1x`。
-- fused `dA` 原型避免了 dense `x_hat`，rank<=32 当前使用 `kVec=3,rVec=16`，rank<=256 使用 `kVec=3,rVec=32,threads=128`，rank>256 仍回落 `kVec=2,rVec=16`。本轮候选记录见 `docs/fp4_kernel_research_notes.md`：rank32 的 4096 fused `dA` 从约 `0.391ms` 降到 `0.346ms`，约 `1.13x`；rank64 从约 `1.50ms` 降到 `0.99ms`，约 `1.52x`；rank128 从约 `3.34ms` 降到 `1.86ms`，约 `1.79x`；rank256 从约 `5.72ms` 降到 `3.68ms`，约 `1.55x`。
-- 它仍慢于 `dequant + GEMM`，4096/rank32 约 `0.58x`，4096/rank64 约 `0.22x`，4096/rank128 约 `0.11x`，4096/rank256 约 `0.06x`。下一步应把 FP4 decode staging 和 reduction 改成更 tensor-core/GEMM 友好的分块。
+- fused `dA` 原型避免了 dense `x_hat`，rank<=32 当前使用 `kVec=3,rVec=16`，rank<=512 使用 `kVec=3,rVec=32,threads=128`，rank>512 仍回落 `kVec=2,rVec=16`。本轮候选记录见 `docs/fp4_kernel_research_notes.md`：rank32 的 4096 fused `dA` 从约 `0.391ms` 降到 `0.346ms`，约 `1.13x`；rank64 从约 `1.50ms` 降到 `0.99ms`，约 `1.52x`；rank128 从约 `3.34ms` 降到 `1.86ms`，约 `1.79x`；rank256 从约 `5.72ms` 降到 `3.68ms`，约 `1.55x`；rank512 从约 `11.54ms` 降到 `7.23ms`，约 `1.60x`。
+- 它仍慢于 `dequant + GEMM`，4096/rank32 约 `0.58x`，4096/rank64 约 `0.22x`，4096/rank128 约 `0.11x`，4096/rank256 约 `0.06x`，4096/rank512 约 `0.04x`。下一步应把 FP4 decode staging 和 reduction 改成更 tensor-core/GEMM 友好的分块。
 - 接入训练 wrapper 后，该模式用约 `0.77x` exact cached-pack step 速度换取 saved `x` 约 `3.56x` 缓存压缩；它当前是显存压力模式，不是性能模式。
 - 即便 fused `dA` 继续优化，它对齐的仍是 `dequant(qact, ascales)` 近似路径，不能消除 FP4 activation cache 自身带来的 `dA` 精度损失，因此只适合作为显存/近似训练模式。
 

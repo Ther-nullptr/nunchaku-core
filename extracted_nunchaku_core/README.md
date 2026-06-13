@@ -783,6 +783,25 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
 
 输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
 
+如果要把 BF16/FP16 `dy_up` 复用纳入模型级消融，追加 `--include-reuse-policies`：
+
+```bash
+python benchmarks/benchmark_fp4_lora_prepare_policies.py \
+  --batch 8 \
+  --hidden 256 \
+  --layers 2 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --modes balanced \
+  --include-reuse-policies \
+  --no-frozen-residual \
+  --warmup 3 \
+  --iters 5
+```
+
+该选项会为 `balanced/throughput` 增加 `*_reuse_dy_up` 记录；当 frozen residual 开启时，高层 config 会自动关闭 reuse-based overlap，因此用 `--no-frozen-residual` 可以观察 reuse+overlap 的上限。RTX 5090 短测中，TinyTransformer 默认形状 `batch=8, hidden=256, layers=2` 的 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，说明小 M 场景额外同步/调度开销会压过收益；4096 单层 benchmark 中 BF16 reuse 与 reuse+overlap 分别为 `1.014x` 和 `1.032x`。因此该策略保持 opt-in，应按真实训练形状决定是否启用。
+
 RTX 5090 验证结果：
 
 - BF16 `accuracy/balanced/throughput/memory_saving`：全部通过，LoRA A/B 更新、frozen residual 不变、optimizer cache hook 按需运行。
@@ -1139,6 +1158,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py --batch 4 --hidden 128 --
 python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/validate_fp4_lora_prepare.py
 python benchmarks/benchmark_fp4_lora_prepare_policies.py --batch 8 --hidden 256 --layers 2 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
+python benchmarks/benchmark_fp4_lora_prepare_policies.py --batch 8 --hidden 256 --layers 2 --rank 32 --dtype bf16 --lowrank-dtype bf16 --modes balanced --include-reuse-policies --no-frozen-residual --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16

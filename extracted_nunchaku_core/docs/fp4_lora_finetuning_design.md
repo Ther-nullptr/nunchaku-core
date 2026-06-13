@@ -163,6 +163,8 @@ model = prepared.model
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、初始 forward 误差和相对 dense LoRA speedup 消融。
 
+追加 `--include-reuse-policies` 后，benchmark 会为支持的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
+
 Adapter checkpoint 示例：
 
 ```python

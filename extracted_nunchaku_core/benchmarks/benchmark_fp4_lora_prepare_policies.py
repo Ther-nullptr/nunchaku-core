@@ -226,14 +226,31 @@ def make_inputs(args: argparse.Namespace, dtype: torch.dtype) -> tuple[torch.Ten
     return x, target
 
 
-def mode_backend_records(args: argparse.Namespace) -> list[tuple[str, str, str]]:
-    records: list[tuple[str, str, str]] = []
+def mode_backend_records(
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    lowrank_dtype: torch.dtype,
+) -> list[tuple[str, str, str, bool]]:
+    records: list[tuple[str, str, str, bool]] = []
     for mode in args.modes:
         if mode == "memory_saving":
             for backend in args.memory_saving_backends:
-                records.append((f"{mode}_{backend}", mode, backend))
+                records.append((f"{mode}_{backend}", mode, backend, False))
         else:
-            records.append((mode, mode, args.fp4_activation_cache_d_lora_down_backend))
+            records.append((mode, mode, args.fp4_activation_cache_d_lora_down_backend, False))
+            if (
+                args.include_reuse_policies
+                and mode not in ("accuracy", "memory_saving")
+                and dtype == lowrank_dtype
+            ):
+                records.append(
+                    (
+                        f"{mode}_reuse_dy_up",
+                        mode,
+                        args.fp4_activation_cache_d_lora_down_backend,
+                        True,
+                    )
+                )
     return records
 
 
@@ -243,6 +260,7 @@ def run_record(
     record_name: str,
     mode: str,
     backend: str,
+    reuse_fused_dy_up_for_d_lora_down: bool,
     dense_state: dict[str, torch.Tensor],
     dense_y_ref: torch.Tensor,
     dtype: torch.dtype,
@@ -264,6 +282,7 @@ def run_record(
         train_bias=args.train_bias,
         cache_lora_act=not args.no_cache_lora_act,
         activation_checkpoint=args.activation_checkpoint,
+        reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=backend,
         lr=args.lr,
         lora_weight_decay=args.lora_weight_decay,
@@ -316,6 +335,7 @@ def run_record(
         "record": record_name,
         "mode": mode,
         "backend": backend,
+        "reuse_fused_dy_up_for_d_lora_down": reuse_fused_dy_up_for_d_lora_down,
         "config": jsonable_config(result.config),
         "replaced_count": len(result.replaced_modules),
         "trainable_param_count": result.trainable_param_count,
@@ -448,6 +468,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-bias", action="store_true")
     p.add_argument("--no-cache-lora-act", action="store_true")
     p.add_argument("--activation-checkpoint", action="store_true")
+    p.add_argument("--include-reuse-policies", action="store_true")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--adam-eps", type=float, default=1e-4)
     p.add_argument("--lora-weight-decay", type=float, default=0.0)
@@ -489,12 +510,17 @@ def main() -> None:
             record_name=record_name,
             mode=mode,
             backend=backend,
+            reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             dense_state=dense_state,
             dense_y_ref=dense_y_ref,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
         )
-        for record_name, mode, backend in mode_backend_records(args)
+        for record_name, mode, backend, reuse_fused_dy_up_for_d_lora_down in mode_backend_records(
+            args,
+            dtype,
+            lowrank_dtype,
+        )
     ]
 
     baseline_name = "balanced" if any(record["record"] == "balanced" for record in records) else records[0]["record"]
@@ -533,6 +559,7 @@ def main() -> None:
             "train_bias": args.train_bias,
             "cache_lora_act": not args.no_cache_lora_act,
             "activation_checkpoint": args.activation_checkpoint,
+            "include_reuse_policies": args.include_reuse_policies,
             "warmup": args.warmup,
             "iters": args.iters,
         },

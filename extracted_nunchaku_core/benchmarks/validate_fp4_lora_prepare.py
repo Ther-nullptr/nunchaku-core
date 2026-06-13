@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import replace
@@ -100,6 +101,25 @@ def main() -> None:
             ]
         }
     }
+    sensitivity_report = {
+        "module_records": [
+            {
+                "module": "layers.0.q_proj",
+                "kind": "q_proj",
+                "perplexity_ratio_vs_fp16": 1.10,
+            },
+            {
+                "module": "model.layers.0.down_proj",
+                "kind": "down_proj",
+                "perplexity_ratio_vs_fp16": 1.30,
+            },
+            {
+                "module": "layers.1.down_proj",
+                "kind": "down_proj",
+                "perplexity_ratio_vs_fp16": 1.40,
+            },
+        ]
+    }
 
     result = prepare_fp4_lora_finetuning(
         model,
@@ -112,16 +132,24 @@ def main() -> None:
         exclude_modules=("lm_head",),
         config_overrides={"layers.1.down_proj": manual_override},
         outlier_report=outlier_report,
+        sensitivity_report=sensitivity_report,
+        sensitivity_rank_bump_ratio=1.05,
+        sensitivity_exclude_ratio=1.25,
+        sensitivity_rank_scale=2.0,
         lr=args.lr,
     )
     prepared = result.model
     fp4_modules = dict(iter_fp4_lora_modules(prepared))
     expected_replaced = {
         "layers.0.q_proj",
-        "layers.0.down_proj",
         "layers.1.q_proj",
         "layers.1.down_proj",
     }
+    expected_excludes = ("lm_head", "model.layers.0.down_proj", "layers.0.down_proj")
+    expected_sensitivity_rank = max(
+        args.rank,
+        ((int(math.ceil(args.rank * 2.0)) + 15) // 16) * 16,
+    )
 
     x = torch.randn(args.batch, args.hidden, device="cuda", dtype=dtype, requires_grad=True)
     y = prepared(x)
@@ -172,8 +200,18 @@ def main() -> None:
             for name in expected_replaced
         ),
         "lm_head_not_replaced": not isinstance(prepared.lm_head, NunchakuFP4LoRALinear),
+        "sensitivity_exclude_keeps_layer0_down_proj_dense": (
+            "layers.0.down_proj" not in fp4_modules
+            and isinstance(prepared.layers[0].down_proj, torch.nn.Linear)
+        ),
+        "sensitivity_rank_bump_applied": (
+            fp4_modules["layers.0.q_proj"].requested_rank == expected_sensitivity_rank
+        ),
         "manual_override_wins_over_outlier_report": (
             fp4_modules["layers.1.down_proj"].requested_rank == args.override_rank
+        ),
+        "manual_override_wins_over_sensitivity_exclude": (
+            "layers.1.down_proj" in fp4_modules and "layers.1.down_proj" not in result.exclude_modules
         ),
         "trainable_names_match_lora_params": set(result.trainable_names) == set(named_lora_params),
         "all_non_lora_frozen": all_non_lora_frozen,
@@ -188,7 +226,7 @@ def main() -> None:
         "lora_grads_present": grads_present,
         "adapter_state_keys_match": set(adapter_state) == expected_adapter_keys,
         "target_modules_recorded": result.target_modules == ("q_proj", "down_proj"),
-        "exclude_modules_recorded": result.exclude_modules == ("lm_head",),
+        "exclude_modules_recorded": result.exclude_modules == expected_excludes,
     }
 
     payload: dict[str, Any] = {
@@ -198,6 +236,7 @@ def main() -> None:
             "rank": args.rank,
             "override_rank": args.override_rank,
             "auto_rank": args.auto_rank,
+            "sensitivity_rank": expected_sensitivity_rank,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "mode": args.mode,
@@ -208,6 +247,7 @@ def main() -> None:
         "trainable_param_count": result.trainable_param_count,
         "refreshed_cache_count": result.refreshed_cache_count,
         "hook_refresh_count": hook_refresh_count,
+        "exclude_modules": result.exclude_modules,
         "checks": checks,
         "all_passed": bool(all(checks.values())),
     }

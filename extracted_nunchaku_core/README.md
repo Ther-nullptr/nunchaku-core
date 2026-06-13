@@ -610,6 +610,7 @@ from native_fp4 import (
     fp4_lora_finetune_config,
     fp4_lora_parameter_groups,
     fp4_lora_peft_state_dict,
+    fp4_lora_sensitivity_policy_from_report,
     fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
     load_fp4_lora_peft_state_dict,
@@ -647,6 +648,11 @@ prepared = prepare_fp4_lora_finetuning(
     target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
     config_overrides=sensitive_overrides,
+    # 可直接读取 Llama module sensitivity scan；手写 config_overrides 优先级最高。
+    sensitivity_report="results/llama_module_fp4_sensitivity_20260321_202421.json",
+    sensitivity_rank_bump_ratio=1.05,
+    sensitivity_exclude_ratio=10.0,
+    sensitivity_rank_scale=2.0,
     lr=1e-4,
 )
 model = prepared.model
@@ -666,7 +672,7 @@ load_fp4_lora_peft_state_dict(model, peft_state)
 ```
 
 如果只想跑单分支 task LoRA，把 `frozen_residual_rank=0` 且 `frozen_residual_init="none"`。
-如果已经通过 sensitivity scan 发现某些完整模块路径不适合 FP4，可用 `exclude_modules` 保持 BF16；如果只是需要更强补偿能力，优先用 `config_overrides` 对这些模块单独提高 rank 或调整 residual/task LoRA 策略。
+如果已经通过 sensitivity scan 发现某些完整模块路径不适合 FP4，可以把 JSON 直接传给 `prepare_fp4_lora_finetuning(..., sensitivity_report=...)`：超过 `sensitivity_exclude_ratio` 的模块自动加入 `exclude_modules` 保持 BF16/FP16，超过 `sensitivity_rank_bump_ratio` 但未被排除的模块自动提高 LoRA rank。`model.` 前缀会自动补一个去前缀 alias，因此同一份 LlamaForCausalLM 报告也可用于裸 `model.model` 子模块。手写 `config_overrides` 优先级最高，其次 activation/grad outlier 报告，最后是 sensitivity 报告。
 
 `fp4_lora_finetune_config` 提供四种预设，均采用“frozen residual_svd 量化补偿 + zero-init task LoRA”的推荐形态：
 
@@ -718,7 +724,7 @@ RTX 5090 验证结果：
 
 `prepare_fp4_lora_finetuning` 是推荐的真实微调入口，会一次性完成：
 
-- 按 `target_modules/exclude_modules/config_overrides/outlier_report` 替换模型 Linear。
+- 按 `target_modules/exclude_modules/config_overrides/outlier_report/sensitivity_report` 替换模型 Linear。
 - 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
 - 按需刷新 fused dX cache。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
@@ -1141,6 +1147,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.fp4_lora_config_overrides_from_outlier_report`
   - 从 outlier 诊断 JSON 自动生成 `config_overrides`
+- `native_fp4.fp4_lora_sensitivity_policy_from_report`
+  - 从真实模型 module sensitivity JSON 生成 rank bump `config_overrides` 和 BF16/FP16 `exclude_modules` 策略
 - `native_fp4.freeze_non_fp4_lora_parameters`
   - 冻结非 LoRA 参数，只保留 LoRA A/B 可训练
 - `native_fp4.iter_fp4_lora_named_parameters`

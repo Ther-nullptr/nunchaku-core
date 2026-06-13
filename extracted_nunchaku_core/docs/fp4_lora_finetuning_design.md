@@ -106,6 +106,7 @@ from native_fp4 import (
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_finetune_config,
+    fp4_lora_sensitivity_policy_from_report,
     prepare_fp4_lora_finetuning,
 )
 
@@ -136,10 +137,16 @@ prepared = prepare_fp4_lora_finetuning(
     target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
     config_overrides=sensitive_overrides,
+    sensitivity_report="results/llama_module_fp4_sensitivity_20260321_202421.json",
+    sensitivity_rank_bump_ratio=1.05,
+    sensitivity_exclude_ratio=10.0,
+    sensitivity_rank_scale=2.0,
     lr=1e-4,
 )
 model = prepared.model
 ```
+
+`sensitivity_report` 直接消费真实模型 module sensitivity scan 的 `module_records[].perplexity_ratio_vs_fp16`：超过 `sensitivity_exclude_ratio` 的 projection 保持 BF16/FP16，超过 `sensitivity_rank_bump_ratio` 的 projection 自动提高 LoRA rank。策略优先级是手写 `config_overrides` > activation/grad outlier report > module sensitivity report；LlamaForCausalLM 报告里的 `model.` 前缀会自动生成去前缀 alias，便于同一份报告复用到裸 decoder 子模块。
 
 `fp4_lora_finetune_config(mode=...)` 是微调推荐入口，用来避免手动拼装不兼容开关：
 
@@ -152,7 +159,7 @@ model = prepared.model
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则；`memory_saving + fp4_activation_cache_d_lora_down_backend="dequant_gemm"` 也通过。
 
-`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、LoRA-only 冻结、optimizer 参数组、cache hook 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、初始 forward 误差和相对 dense LoRA speedup 消融。
 
@@ -510,6 +517,7 @@ P6：加入 outlier-aware FP4 训练策略：
 
 - `analyze_fp4_lora_activation_grad_outliers.py` 已落地 activation / grad-output 通道统计。
 - `summary.rank_bump_candidates` 可用 `fp4_lora_config_overrides_from_outlier_report` 直接转成 `config_overrides`，对敏感 projection 单独提高 rank 或调整 residual/task LoRA 策略。
+- Llama module sensitivity scan 可用 `fp4_lora_sensitivity_policy_from_report` 或 `prepare_fp4_lora_finetuning(..., sensitivity_report=...)` 直接转成 rank bump / BF16 exclude 策略。
 - `summary.smooth_bwd_candidates` 用 Spearman rank correlation 判断 activation outlier 是否能代理 backward `dY` outlier；当前只作为诊断，不直接改 kernel `smooth_bwd`。
 - 对真正不适合 FP4 的 projection，仍用 `exclude_modules` 保留 BF16。
 

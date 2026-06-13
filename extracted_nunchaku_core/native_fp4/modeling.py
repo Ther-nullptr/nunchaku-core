@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Mapping
@@ -71,6 +72,16 @@ class FP4LoRAPrepareResult:
 
     def register_cache_refresh_hook(self, optimizer: torch.optim.Optimizer) -> FP4LoRACacheRefreshHook:
         return register_fp4_lora_cache_refresh_hook(optimizer, self.model)
+
+
+@dataclass
+class FP4LoRASensitivityPolicy:
+    """Per-module policy derived from a real-model FP4 sensitivity scan."""
+
+    config_overrides: dict[str, FP4LoRAConfig]
+    exclude_modules: tuple[str, ...]
+    rank_bump_modules: tuple[str, ...]
+    excluded_modules: tuple[str, ...]
 
 
 def fp4_lora_finetune_config(
@@ -188,6 +199,44 @@ def _ceil_to_multiple(value: int, multiple: int) -> int:
     return ((int(value) + multiple - 1) // multiple) * multiple
 
 
+def _load_report(report: Mapping[str, Any] | str) -> Mapping[str, Any]:
+    if isinstance(report, str):
+        with open(report, "r", encoding="utf-8") as f:
+            report_data = json.load(f)
+    else:
+        report_data = report
+    if not isinstance(report_data, Mapping):
+        raise ValueError("report must be a mapping or a JSON file containing an object")
+    return report_data
+
+
+def _module_name_aliases(module_name: str) -> tuple[str, ...]:
+    aliases = [module_name]
+    if module_name.startswith("model."):
+        aliases.append(module_name[len("model.") :])
+    return tuple(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _iter_module_sensitivity_records(report_data: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+    records = report_data.get("module_records")
+    if isinstance(records, list):
+        for item in records:
+            if isinstance(item, Mapping):
+                yield item
+        return
+
+    summary = report_data.get("summary", {})
+    if not isinstance(summary, Mapping):
+        return
+    for key in ("most_sensitive_modules", "least_sensitive_modules"):
+        items = summary.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, Mapping):
+                yield item
+
+
 def fp4_lora_config_overrides_from_outlier_report(
     report: Mapping[str, Any] | str,
     base_config: FP4LoRAConfig,
@@ -206,11 +255,7 @@ def fp4_lora_config_overrides_from_outlier_report(
     ``summary.rank_bump_candidates`` is consumed; unsupported fields are ignored.
     """
 
-    if isinstance(report, str):
-        with open(report, "r", encoding="utf-8") as f:
-            report_data = json.load(f)
-    else:
-        report_data = report
+    report_data = _load_report(report)
 
     candidates = report_data.get("summary", {}).get("rank_bump_candidates", [])
     overrides: dict[str, FP4LoRAConfig] = {}
@@ -231,6 +276,93 @@ def fp4_lora_config_overrides_from_outlier_report(
             fuse_frozen_residual_dx=False if disable_fuse_frozen_residual_dx else base_config.fuse_frozen_residual_dx,
         )
     return overrides
+
+
+def fp4_lora_sensitivity_policy_from_report(
+    report: Mapping[str, Any] | str,
+    base_config: FP4LoRAConfig,
+    *,
+    ratio_field: str = "perplexity_ratio_vs_fp16",
+    rank_bump_ratio: float | None = 1.05,
+    exclude_ratio: float | None = None,
+    rank_scale: float = 2.0,
+    rank_multiple: int = 16,
+    min_rank: int | None = None,
+    max_rank: int | None = None,
+    force_init: LoRAInitMode | None = None,
+    disable_fuse_frozen_residual_dx: bool = False,
+) -> FP4LoRASensitivityPolicy:
+    """Convert a real-model FP4 sensitivity scan into a fine-tuning policy.
+
+    The expected input is the JSON emitted by the Llama module sensitivity
+    benchmark, where ``module_records`` contains full module paths and
+    ``perplexity_ratio_vs_fp16``. Modules above ``exclude_ratio`` stay in
+    BF16/FP16 via ``exclude_modules``. Modules above ``rank_bump_ratio`` receive
+    a per-module rank override. Manual ``config_overrides`` should still be
+    applied before this policy so explicit user choices win.
+    """
+
+    if rank_bump_ratio is not None and rank_bump_ratio <= 0:
+        raise ValueError("rank_bump_ratio must be positive or None")
+    if exclude_ratio is not None and exclude_ratio <= 0:
+        raise ValueError("exclude_ratio must be positive or None")
+    if rank_scale < 1.0:
+        raise ValueError("rank_scale must be >= 1.0")
+    if rank_multiple <= 0:
+        raise ValueError("rank_multiple must be positive")
+
+    report_data = _load_report(report)
+    overrides: dict[str, FP4LoRAConfig] = {}
+    exclude_modules: list[str] = []
+    rank_bump_modules: list[str] = []
+    excluded_modules: list[str] = []
+    seen_records: set[str] = set()
+
+    bumped_rank = int(math.ceil(float(base_config.rank) * float(rank_scale)))
+    if min_rank is not None:
+        bumped_rank = max(bumped_rank, int(min_rank))
+    if max_rank is not None:
+        bumped_rank = min(bumped_rank, int(max_rank))
+    bumped_rank = max(base_config.rank, _ceil_to_multiple(bumped_rank, rank_multiple))
+
+    for item in _iter_module_sensitivity_records(report_data):
+        module_name = item.get("module")
+        if not module_name:
+            continue
+        module_name = str(module_name)
+        if module_name in seen_records:
+            continue
+        seen_records.add(module_name)
+        try:
+            ratio = float(item[ratio_field])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        aliases = _module_name_aliases(module_name)
+        if exclude_ratio is not None and ratio >= exclude_ratio:
+            for alias in aliases:
+                exclude_modules.append(alias)
+            excluded_modules.append(module_name)
+            continue
+        if rank_bump_ratio is None or ratio < rank_bump_ratio:
+            continue
+        for alias in aliases:
+            overrides[alias] = replace(
+                base_config,
+                rank=bumped_rank,
+                init=base_config.init if force_init is None else force_init,
+                fuse_frozen_residual_dx=False
+                if disable_fuse_frozen_residual_dx
+                else base_config.fuse_frozen_residual_dx,
+            )
+        rank_bump_modules.append(module_name)
+
+    return FP4LoRASensitivityPolicy(
+        config_overrides=overrides,
+        exclude_modules=tuple(dict.fromkeys(exclude_modules)),
+        rank_bump_modules=tuple(dict.fromkeys(rank_bump_modules)),
+        excluded_modules=tuple(dict.fromkeys(excluded_modules)),
+    )
 
 
 def _as_tuple(values: Iterable[str] | None) -> tuple[str, ...]:
@@ -704,6 +836,14 @@ def prepare_fp4_lora_finetuning(
     outlier_rank_multiple: int = 16,
     outlier_min_rank: int | None = None,
     outlier_max_rank: int | None = None,
+    sensitivity_report: Mapping[str, Any] | str | None = None,
+    sensitivity_ratio_field: str = "perplexity_ratio_vs_fp16",
+    sensitivity_rank_bump_ratio: float | None = 1.05,
+    sensitivity_exclude_ratio: float | None = None,
+    sensitivity_rank_scale: float = 2.0,
+    sensitivity_rank_multiple: int = 16,
+    sensitivity_min_rank: int | None = None,
+    sensitivity_max_rank: int | None = None,
     inplace: bool = True,
     refresh_caches: bool = True,
     lora_weight_decay: float = 0.0,
@@ -742,8 +882,12 @@ def prepare_fp4_lora_finetuning(
         train_bias = cfg.train_bias
 
     merged_overrides: dict[str, FP4LoRAConfig] = {}
+    manual_override_patterns: tuple[str, ...] = ()
     if config_overrides:
         merged_overrides.update(config_overrides)
+        manual_override_patterns = tuple(
+            dict.fromkeys(alias for key in config_overrides for alias in _module_name_aliases(str(key)))
+        )
     if outlier_report is not None:
         auto_overrides = fp4_lora_config_overrides_from_outlier_report(
             outlier_report,
@@ -760,6 +904,30 @@ def prepare_fp4_lora_finetuning(
 
     targets = _as_tuple(target_modules)
     excludes = _as_tuple(exclude_modules)
+    if sensitivity_report is not None:
+        sensitivity_policy = fp4_lora_sensitivity_policy_from_report(
+            sensitivity_report,
+            cfg,
+            ratio_field=sensitivity_ratio_field,
+            rank_bump_ratio=sensitivity_rank_bump_ratio,
+            exclude_ratio=sensitivity_exclude_ratio,
+            rank_scale=sensitivity_rank_scale,
+            rank_multiple=sensitivity_rank_multiple,
+            min_rank=sensitivity_min_rank,
+            max_rank=sensitivity_max_rank,
+            force_init="zero",
+            disable_fuse_frozen_residual_dx=True,
+        )
+        for key, value in sensitivity_policy.config_overrides.items():
+            merged_overrides.setdefault(key, value)
+        if sensitivity_policy.exclude_modules:
+            sensitivity_excludes = tuple(
+                name
+                for name in sensitivity_policy.exclude_modules
+                if not _name_matches(name, name.rsplit(".", 1)[-1], manual_override_patterns)
+            )
+            excludes = tuple(dict.fromkeys((*excludes, *sensitivity_excludes)))
+
     prepared_model, replaced = convert_linear_to_fp4_lora(
         module,
         cfg,

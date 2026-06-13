@@ -206,6 +206,7 @@ optimizer 边界：
   - `0/"none"`：只使用 trainable task LoRA。
   - `rank/"residual_svd"`：额外构造 frozen residual branch，推荐与 `init="zero"` 搭配，避免训练破坏量化补偿。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
+- `activation_checkpoint`：逐 `NunchakuFP4LoRALinear` 的局部 checkpoint。它只省该算子内部 saved tensors；要显著降低多层输入 activation，应该在 transformer block/segment 外层做 checkpoint。
 - `fuse_lowrank_forward`：dual-branch opt-in 实验选项，把 task LoRA forward 与 frozen residual forward 合成一次拼接 low-rank GEMM；减少 launch/GEMM 次数，但会改变浮点归约顺序。验证脚本 strict 检查当前调度，并额外报告相对“两支分开计算”公式的 rel_l2；默认关闭。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
 - `target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
@@ -337,7 +338,18 @@ P4：加入 activation cache policy：
 
 - `save_bf16`：保存 BF16 `x` 和 `lora_act`，速度优先。
 - `recompute_lora_act`：只保存 `x`，少存一个 `[M, rank]`。
-- `checkpoint`：进一步重算上游 activation，面向长序列微调。
+- `checkpoint`：进一步重算上游 activation，面向长序列微调。实测逐 Linear checkpoint 只省内部 `lora_act`，收益很小；应按 transformer block/segment 做 checkpoint。
+
+RTX 5090 短测，`benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --warmup 5 --iters 10`：
+
+| checkpoint scope | intermediate activation | train step ms | peak delta reduction | conclusion |
+| --- | --- | ---: | ---: | --- |
+| module | none | 2.0313 | 1.2% | 逐 Linear checkpoint 基本只省内部 `lora_act`，不推荐默认开启 |
+| stack/block | none | 1.6118 | 9.9% | 能省跨层输入 activation，但要重算整段 forward |
+| module | silu | 2.0873 | 1.0% | 非线性本身仍保存激活，逐 Linear checkpoint 收益更低 |
+| stack/block | silu | 1.6642 | 7.6% | 推荐作为长序列/多层微调的显存模式，按 block 粒度打开 |
+
+正确性：`module` 和 `stack` checkpoint 的 forward、`dX`、首尾 LoRA A/B 梯度与 no-checkpoint reference 均为 `rel_l2=0`。
 
 P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该路径误差偏大，默认仍保留 residual dense dX。
 

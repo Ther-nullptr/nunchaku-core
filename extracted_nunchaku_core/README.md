@@ -428,6 +428,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - `fuse_lowrank_forward=True` 是 dual-branch opt-in 实验选项：把 task LoRA forward 和 frozen residual forward 合成一次拼接 low-rank GEMM。它减少 launch/GEMM 次数，但会改变低秩分支的浮点归约顺序；验证脚本会 strict 检查当前调度，并额外用 `5e-4` rel_l2 tolerance 报告它相对“两支分开计算”公式的差异。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 FP16-only 实验选项：复用 fused dX quantize kernel 产生的 packed `dY @ B`，decode 后用于 `dA = (dY @ B).T @ X`，避免额外 dense `dY @ B` matmul。
+- `activation_checkpoint=True` 是逐 `NunchakuFP4LoRALinear` 的局部 checkpoint，只能省该算子内部的 `lora_act` 等 saved tensors；真正要省多层输入 activation，应在 transformer block/segment 外层用 `torch.utils.checkpoint`。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 训练 step 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation 数字对测量顺序更敏感，建议看多轮结果再定默认策略。
 - `forward_fp4_vs_dense` 的误差是 FP4 量化相对 dense full precision 权重的误差，不是 wrapper correctness；wrapper correctness 请看 `validate_native_fp4_lora_training.py`。
@@ -687,6 +688,45 @@ python benchmarks/benchmark_fp4_lora_outlier_overrides.py \
 - `latency_ms.override_train_step`
 - `overhead.override_over_base`
 
+## 10.8 FP4 LoRA activation checkpoint 消融
+
+用于测量逐 Linear checkpoint 与 block/segment checkpoint 的显存/速度权衡：
+
+```bash
+python benchmarks/benchmark_fp4_lora_activation_checkpoint.py \
+  --batch 512 \
+  --hidden 1024 \
+  --layers 4 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx \
+  --intermediate-activation silu \
+  --warmup 5 \
+  --iters 10
+```
+
+输出：
+
+- `results/latest_fp4_lora_activation_checkpoint.json`
+- `latency_ms.no_activation_checkpoint_train_step`
+- `latency_ms.module_activation_checkpoint_train_step`
+- `latency_ms.stack_activation_checkpoint_train_step`
+- `peak_memory_bytes.*_delta`
+- `derived.*_peak_delta_reduction`
+
+RTX 5090 短测，`batch=512, hidden=1024, layers=4, rank=32, BF16, fused dX cached pack`：
+
+| checkpoint scope | intermediate activation | train step ms | peak delta reduction | conclusion |
+| --- | --- | ---: | ---: | --- |
+| module | none | 2.0313 | 1.2% | 逐 Linear checkpoint 基本只省内部 `lora_act`，不推荐默认开启 |
+| stack/block | none | 1.6118 | 9.9% | 能省跨层输入 activation，但要重算整段 forward |
+| module | silu | 2.0873 | 1.0% | 非线性本身仍保存激活，逐 Linear checkpoint 收益更低 |
+| stack/block | silu | 1.6642 | 7.6% | 推荐作为长序列/多层微调的显存模式，按 block 粒度打开 |
+
+正确性：`module` 和 `stack` checkpoint 的 forward、`dX`、首尾 LoRA A/B 梯度与 no-checkpoint reference 均为 `rel_l2=0`。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -708,6 +748,7 @@ python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --it
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
+python benchmarks/benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --intermediate-activation silu --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30 --fuse-lowrank-forward
@@ -755,7 +796,7 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
 - `native_fp4.NunchakuFP4LoRALinear`
   - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口
 - `native_fp4.FP4LoRAConfig`
-  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init` 和 FP16-only `fuse_frozen_residual_dx`
+  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`activation_checkpoint` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.fp4_lora_config_overrides_from_outlier_report`

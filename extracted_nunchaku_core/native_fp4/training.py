@@ -4,6 +4,7 @@ import math
 from typing import Literal
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from .layout import (
     build_backward_scales_from_forward_quant,
@@ -312,6 +313,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         frozen_residual_init: FrozenResidualInitMode = "none",
         train_bias: bool = False,
         cache_lora_act: bool = True,
+        activation_checkpoint: bool = False,
         fuse_lowrank_forward: bool = False,
         fuse_lora_dx: bool = False,
         fuse_frozen_residual_dx: bool = False,
@@ -362,6 +364,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.scaling = self.lora_alpha / float(self.rank)
         self.frozen_residual_scaling = 1.0
         self.cache_lora_act = bool(cache_lora_act)
+        self.activation_checkpoint = bool(activation_checkpoint)
         self.fuse_lowrank_forward = bool(fuse_lowrank_forward)
         self.fuse_lora_dx = bool(fuse_lora_dx)
         self.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
@@ -432,6 +435,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         init: LoRAInitMode = "zero",
         train_bias: bool = False,
         cache_lora_act: bool = True,
+        activation_checkpoint: bool = False,
         fuse_lowrank_forward: bool = False,
         fuse_lora_dx: bool = False,
         fuse_frozen_residual_dx: bool = False,
@@ -451,6 +455,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             frozen_residual_init=frozen_residual_init,
             train_bias=train_bias,
             cache_lora_act=cache_lora_act,
+            activation_checkpoint=activation_checkpoint,
             fuse_lowrank_forward=fuse_lowrank_forward,
             fuse_lora_dx=fuse_lora_dx,
             fuse_frozen_residual_dx=fuse_frozen_residual_dx,
@@ -572,7 +577,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             and self.frozen_residual_up.numel() > 0
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         return _FP4LoRALinearFunction.apply(
             x,
             self.lora_down,
@@ -597,6 +602,11 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self._get_fused_lora_dx_cache(),
         )
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_checkpoint and self.training and torch.is_grad_enabled():
+            return checkpoint(self._forward_impl, x, use_reentrant=False, preserve_rng_state=False)
+        return self._forward_impl(x)
+
     def lora_weight(self) -> torch.Tensor:
         return torch.matmul(self.lora_up.float(), self.lora_down.float()).mul(self.scaling)
 
@@ -614,7 +624,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"frozen_residual_rank={self.frozen_residual_rank}, "
             f"lowrank_dtype={self.lowrank_dtype}, init={self.init_mode}, "
             f"frozen_residual_init={self.frozen_residual_init}, "
-            f"cache_lora_act={self.cache_lora_act}, fuse_lowrank_forward={self.fuse_lowrank_forward}, "
+            f"cache_lora_act={self.cache_lora_act}, activation_checkpoint={self.activation_checkpoint}, "
+            f"fuse_lowrank_forward={self.fuse_lowrank_forward}, "
             f"fuse_lora_dx={self.fuse_lora_dx}, "
             f"fuse_frozen_residual_dx={self.fuse_frozen_residual_dx}, "
             f"cache_fused_lora_dx={self.cache_fused_lora_dx}, "

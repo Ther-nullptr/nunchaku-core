@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
+    p.add_argument("--activation-checkpoint", action="store_true")
     p.add_argument("--fuse-lowrank-forward", action="store_true")
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--fuse-frozen-residual-dx", action="store_true")
@@ -91,6 +92,7 @@ def main() -> None:
         frozen_residual_init=args.frozen_residual_init,
         train_bias=False,
         cache_lora_act=True,
+        activation_checkpoint=args.activation_checkpoint,
         fuse_lowrank_forward=args.fuse_lowrank_forward,
         fuse_lora_dx=args.fuse_lora_dx,
         fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
@@ -343,6 +345,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "init": args.init,
+            "activation_checkpoint": args.activation_checkpoint,
             "fuse_lowrank_forward": args.fuse_lowrank_forward,
             "fuse_lora_dx": args.fuse_lora_dx,
             "fuse_frozen_residual_dx": args.fuse_frozen_residual_dx,

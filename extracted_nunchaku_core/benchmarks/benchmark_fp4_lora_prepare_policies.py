@@ -361,8 +361,15 @@ def run_dense_lora_baseline(
         lowrank_dtype=lowrank_dtype,
         train_bias=args.train_bias,
     )
-    params = [param for param in model.parameters() if param.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr, eps=args.adam_eps, weight_decay=args.lora_weight_decay)
+    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    lora_params = [param for name, param in named_params if not name.endswith("bias")]
+    bias_params = [param for name, param in named_params if name.endswith("bias")]
+    param_groups: list[dict[str, Any]] = []
+    if lora_params:
+        param_groups.append({"params": lora_params, "weight_decay": args.lora_weight_decay})
+    if bias_params:
+        param_groups.append({"params": bias_params, "weight_decay": args.bias_weight_decay})
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=args.adam_eps)
     x, target = make_inputs(args, dtype)
 
     with torch.no_grad():
@@ -377,9 +384,9 @@ def run_dense_lora_baseline(
     y, loss = train_step(model, x, target, optimizer)
     torch.cuda.synchronize()
 
-    trainable_param_count = int(sum(param.numel() for param in params))
+    trainable_param_count = int(sum(param.numel() for _, param in named_params))
     trainable_names = {name for name, param in model.named_parameters() if param.requires_grad}
-    grads_finite = all(param.grad is not None and bool(torch.isfinite(param.grad).all()) for param in params)
+    grads_finite = all(param.grad is not None and bool(torch.isfinite(param.grad).all()) for _, param in named_params)
     checks = {
         "replaced_count_matches": len(replaced) == args.layers * 7,
         "trainable_param_count_positive": trainable_param_count > 0,

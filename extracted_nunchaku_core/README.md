@@ -565,6 +565,24 @@ python benchmarks/benchmark_fp4_lora_lowrank_grad.py \
 
 - `results/latest_fp4_lora_lowrank_grad.json`
 
+如果要拆开 FP4 dX 主路径，跑：
+
+```bash
+python benchmarks/benchmark_fp4_dx_pipeline.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+结果会写到：
+
+- `results/latest_fp4_dx_pipeline.json`
+
 RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 | dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
@@ -578,6 +596,13 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16 | 0.0855 | 0.0623 | 1.37x | 0.0928 | 0.92x |
 | FP16 | 0.0536 | 0.0390 | 1.37x | 0.0748 | 0.72x |
+
+FP4 dX pipeline 短测，`M=N=K=4096, rank=32`：
+
+| dtype | full dX ms | quantize dY ms | repack W^T ms | prequantized GEMM ms | cached-qweight upper bound | fused LoRA dX ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 0.1837 | 0.0365 | 0.0390 | 0.1068 | 1.33x | 0.2157 |
+| FP16 | 0.1858 | 0.0360 | 0.0391 | 0.1072 | 1.34x | 0.2281 |
 
 本轮 repack micro-optimization 后，RTX 5090 同形状 BF16 短测：
 
@@ -594,7 +619,7 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 - `dA/dB` 目前不是最大瓶颈；先写专用低秩梯度 kernel 的收益上限有限。
 - 单独给 `dA/dB` 加 CUDA stream overlap 在 5090 上反而变慢；后续低秩梯度 kernel 要优先围绕复用/消除 `dy_up` 中间量设计。
-- 下一步更应该看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
+- FP4 dX 主路径中 prequantized GEMM 占比最大，`dY` quantize 和 transient repack 各约 20%。预存 `W^T` 的 cached-qweight 消融上界只有约 `1.33x-1.34x`，且会带来第二份 backbone 内存，不作为默认方案。
 - LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
 
 ## 10.4 FP4 LoRA native pack validation
@@ -1207,6 +1232,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - fused / unfused 消融
 - `latest_native_fp4_backward.json`
   - backward benchmark
+- `latest_fp4_dx_pipeline.json`
+  - FP4 dX 主路径拆解 benchmark，分离 `dY` 量化、transient repack、prequantized GEMM 和 fused LoRA epilogue
 - `latest_native_fp4_backward_validation.json`
   - backward correctness
 - `latest_native_fp4_lora_training_validation.json`

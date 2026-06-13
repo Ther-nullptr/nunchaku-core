@@ -518,8 +518,10 @@ from native_fp4 import (
     FP4LoRAConfig,
     convert_linear_to_fp4_lora,
     fp4_lora_parameter_groups,
+    fp4_lora_peft_state_dict,
     fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
+    load_fp4_lora_peft_state_dict,
     load_fp4_lora_state_dict,
     register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
@@ -560,6 +562,12 @@ cache_hook = register_fp4_lora_cache_refresh_hook(optimizer, model)
 # 保存/加载时只处理 LoRA adapter，不保存 FP4 backbone buffers。
 adapter_state = fp4_lora_state_dict(model)
 load_fp4_lora_state_dict(model, adapter_state)
+
+# PEFT 风格导出：module.lora_A.default.weight / module.lora_B.default.weight。
+# 默认导出 padded effective rank，数值完全等价；如外部生态要求原始 rank，可裁剪导出。
+peft_state = fp4_lora_peft_state_dict(model)
+peft_trimmed_state = fp4_lora_peft_state_dict(model, trim_to_requested_rank=True)
+load_fp4_lora_peft_state_dict(model, peft_state)
 ```
 
 如果只想跑单分支 task LoRA，把 `frozen_residual_rank=0` 且 `frozen_residual_init="none"`。
@@ -599,6 +607,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 - `results/latest_native_fp4_lora_modeling_validation.json`
 - BF16 fused cached 路径：替换 4 个目标 Linear，`lm_head` 保持 dense，只有 LoRA A/B 可训练，optimizer 参数组、post-step cache refresh hook、LoRA-only state_dict strict load 和 backward 均通过。
 - `config_overrides` 路径：验证 `layers.1.down_proj` 可独立覆盖 rank/init，第二个模型 strict load 同样按该策略构造。
+- PEFT adapter 路径：验证 `lora_A/lora_B` exact round-trip；`trim_to_requested_rank=True` 会按 requested rank 导出，加载时 padded tail 清零。
 - dual-branch 路径：`frozen_residual_*` 是 frozen buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
 - FP16 下可打开 `fuse_frozen_residual_dx=True`，把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 下该路径目前误差偏大，默认关闭。
 
@@ -668,6 +677,10 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
   - 导出 LoRA-only adapter checkpoint，不包含 FP4 backbone buffers
 - `native_fp4.load_fp4_lora_state_dict`
   - strict 加载 LoRA-only adapter checkpoint，并清空 packed LoRA cache
+- `native_fp4.fp4_lora_peft_state_dict`
+  - 导出 PEFT 风格 `lora_A/lora_B` adapter checkpoint，默认保留 padded effective rank 以保证无损
+- `native_fp4.load_fp4_lora_peft_state_dict`
+  - 加载 PEFT 风格 adapter checkpoint，支持 requested-rank 输入并清零 padded tail
 - `native_fp4.refresh_fused_lora_dx_caches`
   - optimizer step 后显式刷新 fused dX packed LoRA cache
 - `native_fp4.clear_fused_lora_dx_caches`

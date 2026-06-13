@@ -131,18 +131,30 @@ model, replaced = convert_linear_to_fp4_lora(
 Adapter checkpoint 示例：
 
 ```python
-from native_fp4 import fp4_lora_state_dict, load_fp4_lora_state_dict
+from native_fp4 import (
+    fp4_lora_peft_state_dict,
+    fp4_lora_state_dict,
+    load_fp4_lora_peft_state_dict,
+    load_fp4_lora_state_dict,
+)
 
 adapter_state = fp4_lora_state_dict(model)
 missing, unexpected = load_fp4_lora_state_dict(model, adapter_state, strict=True)
+
+# PEFT 风格 key：module.lora_A.default.weight / module.lora_B.default.weight。
+peft_state = fp4_lora_peft_state_dict(model)
+peft_trimmed_state = fp4_lora_peft_state_dict(model, trim_to_requested_rank=True)
+missing, unexpected = load_fp4_lora_peft_state_dict(model, peft_state, strict=True)
 ```
 
 checkpoint 边界：
 
 - `fp4_lora_state_dict` 只导出 `lora_down/lora_up` 和可选 trainable bias。
+- `fp4_lora_peft_state_dict` 导出 PEFT 风格 `lora_A/lora_B`；默认导出 padded effective rank 以保证数值无损。
+- `trim_to_requested_rank=True` 会裁到用户请求的 rank；加载时 padded tail 清零，适合需要原始 rank 的外部生态，但会丢弃 tail rank。
 - 不导出 `qweight/wscales/wscales_bwd_*` 等 frozen FP4 backbone buffers。
 - 不导出 `frozen_residual_down/frozen_residual_up`；它们属于 quantized base model 的 frozen compensation branch，不属于 task adapter。
-- `load_fp4_lora_state_dict` 加载后会清空 packed LoRA dX cache，避免 adapter 参数与 cache 不一致。
+- `load_fp4_lora_state_dict` 和 `load_fp4_lora_peft_state_dict` 加载后都会清空 packed LoRA dX cache，避免 adapter 参数与 cache 不一致。
 
 Optimizer 示例：
 

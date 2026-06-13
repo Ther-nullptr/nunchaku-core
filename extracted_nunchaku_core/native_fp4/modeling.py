@@ -253,6 +253,72 @@ def fp4_lora_state_dict(
     return out
 
 
+def _export_tensor(
+    tensor: torch.Tensor,
+    destination: str | torch.device | None,
+    clone: bool,
+) -> torch.Tensor:
+    value = tensor.detach()
+    if destination is not None:
+        value = value.to(destination)
+    if clone:
+        value = value.clone()
+    return value
+
+
+def _peft_base_name(module_name: str, prefix: str) -> str:
+    clean_prefix = prefix.rstrip(".")
+    if clean_prefix and module_name:
+        return f"{clean_prefix}.{module_name}"
+    return clean_prefix or module_name
+
+
+def _peft_lora_keys(module_name: str, prefix: str, adapter_name: str | None) -> tuple[str, str]:
+    base = _peft_base_name(module_name, prefix)
+    if adapter_name:
+        suffix_a = f"lora_A.{adapter_name}.weight"
+        suffix_b = f"lora_B.{adapter_name}.weight"
+    else:
+        suffix_a = "lora_A.weight"
+        suffix_b = "lora_B.weight"
+    if not base:
+        return suffix_a, suffix_b
+    return f"{base}.{suffix_a}", f"{base}.{suffix_b}"
+
+
+def fp4_lora_peft_state_dict(
+    module: torch.nn.Module,
+    *,
+    adapter_name: str | None = "default",
+    prefix: str = "",
+    include_bias: bool = False,
+    destination: str | torch.device | None = "cpu",
+    clone: bool = True,
+    trim_to_requested_rank: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Return a PEFT-style LoRA adapter state dict.
+
+    By default this exports the padded effective rank, which is exact for this
+    kernel layout. ``trim_to_requested_rank=True`` emits the user-requested rank
+    for ecosystem compatibility and should only be used when dropping padded
+    tail channels is acceptable.
+    """
+
+    out: dict[str, torch.Tensor] = {}
+    for module_name, child in iter_fp4_lora_modules(module):
+        key_a, key_b = _peft_lora_keys(module_name, prefix, adapter_name)
+        rank = child.requested_rank if trim_to_requested_rank else child.rank
+        out[key_a] = _export_tensor(child.lora_down[:rank, :], destination, clone)
+        out[key_b] = _export_tensor(child.lora_up[:, :rank], destination, clone)
+
+        bias = getattr(child, "bias", None)
+        if include_bias and isinstance(bias, torch.nn.Parameter):
+            base = _peft_base_name(module_name, prefix)
+            key = f"{base}.bias" if base else "bias"
+            out[key] = _export_tensor(bias, destination, clone)
+    return out
+
+
 def load_fp4_lora_state_dict(
     module: torch.nn.Module,
     state_dict: Mapping[str, torch.Tensor],
@@ -289,6 +355,88 @@ def load_fp4_lora_state_dict(
                 raise ValueError(f"Shape mismatch for {key}: expected {tuple(param.shape)}, got {tuple(value.shape)}")
             param.copy_(value.to(device=param.device, dtype=param.dtype))
             loaded += 1
+
+    if loaded:
+        clear_fused_lora_dx_caches(module)
+    return missing, unexpected
+
+
+def load_fp4_lora_peft_state_dict(
+    module: torch.nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    adapter_name: str | None = "default",
+    prefix: str = "",
+    strict: bool = True,
+    include_bias: bool = False,
+    allow_padded_rank: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Load a PEFT-style LoRA adapter state dict into FP4 LoRA modules.
+
+    Exact padded-rank tensors are copied directly. If ``allow_padded_rank`` is
+    true, requested-rank tensors are copied into the leading channels and the
+    padded tail is zeroed so stale random tail weights cannot affect outputs.
+    """
+
+    expected: dict[str, tuple[NunchakuFP4LoRALinear, str]] = {}
+    for module_name, child in iter_fp4_lora_modules(module):
+        key_a, key_b = _peft_lora_keys(module_name, prefix, adapter_name)
+        expected[key_a] = (child, "lora_down")
+        expected[key_b] = (child, "lora_up")
+        bias = getattr(child, "bias", None)
+        if include_bias and isinstance(bias, torch.nn.Parameter):
+            base = _peft_base_name(module_name, prefix)
+            expected[f"{base}.bias" if base else "bias"] = (child, "bias")
+
+    missing = sorted(key for key in expected if key not in state_dict)
+    unexpected = sorted(key for key in state_dict if key not in expected)
+    if strict and (missing or unexpected):
+        raise ValueError(f"FP4 LoRA PEFT state_dict mismatch: missing={missing}, unexpected={unexpected}")
+
+    loaded = 0
+    with torch.no_grad():
+        for module_name, child in iter_fp4_lora_modules(module):
+            key_a, key_b = _peft_lora_keys(module_name, prefix, adapter_name)
+            if key_a in state_dict and key_b in state_dict:
+                down = state_dict[key_a]
+                up = state_dict[key_b]
+                if down.dim() != 2 or up.dim() != 2:
+                    raise ValueError(f"Expected 2D LoRA tensors for {module_name!r}")
+                if down.shape[1] != child.in_features or up.shape[0] != child.out_features:
+                    raise ValueError(
+                        f"Shape mismatch for {module_name!r}: "
+                        f"A={tuple(down.shape)}, B={tuple(up.shape)}, "
+                        f"expected (*, {child.in_features}) and ({child.out_features}, *)"
+                    )
+                rank = down.shape[0]
+                if up.shape[1] != rank:
+                    raise ValueError(f"Rank mismatch for {module_name!r}: A rank {rank}, B rank {up.shape[1]}")
+                if rank == child.rank:
+                    child.lora_down.copy_(down.to(device=child.lora_down.device, dtype=child.lora_down.dtype))
+                    child.lora_up.copy_(up.to(device=child.lora_up.device, dtype=child.lora_up.dtype))
+                elif allow_padded_rank and 0 < rank <= child.rank:
+                    child.lora_down.zero_()
+                    child.lora_up.zero_()
+                    child.lora_down[:rank, :].copy_(
+                        down.to(device=child.lora_down.device, dtype=child.lora_down.dtype)
+                    )
+                    child.lora_up[:, :rank].copy_(up.to(device=child.lora_up.device, dtype=child.lora_up.dtype))
+                else:
+                    raise ValueError(f"Rank mismatch for {module_name!r}: expected {child.rank}, got {rank}")
+                loaded += 2
+
+            bias = getattr(child, "bias", None)
+            if include_bias and isinstance(bias, torch.nn.Parameter):
+                base = _peft_base_name(module_name, prefix)
+                key = f"{base}.bias" if base else "bias"
+                if key in state_dict:
+                    value = state_dict[key]
+                    if value.shape != bias.shape:
+                        raise ValueError(
+                            f"Shape mismatch for {key}: expected {tuple(bias.shape)}, got {tuple(value.shape)}"
+                        )
+                    bias.copy_(value.to(device=bias.device, dtype=bias.dtype))
+                    loaded += 1
 
     if loaded:
         clear_fused_lora_dx_caches(module)

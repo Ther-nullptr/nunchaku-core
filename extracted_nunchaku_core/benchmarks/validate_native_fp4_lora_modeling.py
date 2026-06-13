@@ -18,10 +18,12 @@ from native_fp4 import (  # noqa: E402
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
     fp4_lora_parameter_groups,
+    fp4_lora_peft_state_dict,
     fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
     iter_fp4_lora_named_parameters,
     iter_fp4_lora_modules,
+    load_fp4_lora_peft_state_dict,
     load_fp4_lora_state_dict,
     register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
@@ -91,7 +93,7 @@ def main() -> None:
         fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
     )
-    override_rank = 16 if args.rank != 16 else 32
+    override_rank = 24 if args.rank != 24 else 16
     override_cfg = replace(cfg, rank=override_rank, init="zero")
     config_overrides = {"layers.1.down_proj": override_cfg}
     model, replaced = convert_linear_to_fp4_lora(
@@ -181,9 +183,74 @@ def main() -> None:
     except ValueError:
         strict_mismatch_raises = True
 
+    expected_peft_keys = {
+        f"{name}.{suffix}"
+        for name in expected_replaced
+        for suffix in ("lora_A.default.weight", "lora_B.default.weight")
+    }
+    peft_state = fp4_lora_peft_state_dict(model)
+    peft_state_finite = all(bool(torch.isfinite(value).all()) for value in peft_state.values())
+    model3 = TinyModel(args.hidden, dtype).cuda()
+    model3, replaced3 = convert_linear_to_fp4_lora(
+        model3,
+        cfg,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+        config_overrides=config_overrides,
+    )
+    peft_missing, peft_unexpected = load_fp4_lora_peft_state_dict(model3, peft_state, strict=True)
+    peft_loaded_state = fp4_lora_peft_state_dict(model3)
+    peft_loaded_matches = all(torch.equal(peft_state[key], peft_loaded_state[key]) for key in expected_peft_keys)
+
+    peft_trimmed_state = fp4_lora_peft_state_dict(model, trim_to_requested_rank=True)
+    model4 = TinyModel(args.hidden, dtype).cuda()
+    model4, replaced4 = convert_linear_to_fp4_lora(
+        model4,
+        cfg,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+        config_overrides=config_overrides,
+    )
+    peft_trimmed_missing, peft_trimmed_unexpected = load_fp4_lora_peft_state_dict(
+        model4,
+        peft_trimmed_state,
+        strict=True,
+    )
+    fp4_modules4 = dict(iter_fp4_lora_modules(model4))
+    peft_trimmed_shapes_match_requested_rank = all(
+        peft_trimmed_state[f"{name}.lora_A.default.weight"].shape
+        == (fp4_modules[name].requested_rank, fp4_modules[name].in_features)
+        and peft_trimmed_state[f"{name}.lora_B.default.weight"].shape
+        == (fp4_modules[name].out_features, fp4_modules[name].requested_rank)
+        for name in expected_replaced
+    )
+    peft_trimmed_load_leading_matches = all(
+        torch.equal(
+            fp4_modules4[name].lora_down[: fp4_modules[name].requested_rank, :].detach().cpu(),
+            fp4_modules[name].lora_down[: fp4_modules[name].requested_rank, :].detach().cpu(),
+        )
+        and torch.equal(
+            fp4_modules4[name].lora_up[:, : fp4_modules[name].requested_rank].detach().cpu(),
+            fp4_modules[name].lora_up[:, : fp4_modules[name].requested_rank].detach().cpu(),
+        )
+        for name in expected_replaced
+    )
+    peft_trimmed_load_tail_zero = all(
+        (
+            fp4_modules4[name].requested_rank == fp4_modules4[name].rank
+            or (
+                bool(torch.count_nonzero(fp4_modules4[name].lora_down[fp4_modules4[name].requested_rank :, :]) == 0)
+                and bool(torch.count_nonzero(fp4_modules4[name].lora_up[:, fp4_modules4[name].requested_rank :]) == 0)
+            )
+        )
+        for name in expected_replaced
+    )
+
     checks = {
         "replaced_expected_modules": set(replaced) == expected_replaced,
         "second_model_replaced_expected_modules": set(replaced2) == expected_replaced,
+        "peft_model_replaced_expected_modules": set(replaced3) == expected_replaced,
+        "trimmed_peft_model_replaced_expected_modules": set(replaced4) == expected_replaced,
         "lm_head_not_replaced": not isinstance(model.lm_head, NunchakuFP4LoRALinear),
         "all_replaced_are_fp4_lora": all(isinstance(fp4_modules[name], NunchakuFP4LoRALinear) for name in expected_replaced),
         "config_override_rank_applied": fp4_modules["layers.1.down_proj"].requested_rank == override_rank,
@@ -217,6 +284,17 @@ def main() -> None:
         "adapter_state_loaded_matches": loaded_matches,
         "adapter_load_clears_cache": caches_cleared_after_load,
         "strict_mismatch_raises": strict_mismatch_raises,
+        "peft_adapter_state_finite": peft_state_finite,
+        "peft_adapter_state_keys_match": set(peft_state) == expected_peft_keys,
+        "peft_adapter_state_excludes_frozen_residual": not any("frozen_residual" in key for key in peft_state),
+        "peft_adapter_state_load_missing_empty": peft_missing == [],
+        "peft_adapter_state_load_unexpected_empty": peft_unexpected == [],
+        "peft_adapter_state_loaded_matches": peft_loaded_matches,
+        "peft_trimmed_shapes_match_requested_rank": peft_trimmed_shapes_match_requested_rank,
+        "peft_trimmed_load_missing_empty": peft_trimmed_missing == [],
+        "peft_trimmed_load_unexpected_empty": peft_trimmed_unexpected == [],
+        "peft_trimmed_load_leading_matches": peft_trimmed_load_leading_matches,
+        "peft_trimmed_load_tail_zero": peft_trimmed_load_tail_zero,
     }
     payload = {
         "shape": {
@@ -251,6 +329,10 @@ def main() -> None:
             "optimizer_hook_refreshed": hook_refresh_count,
         },
         "adapter_state_keys": sorted(adapter_state),
+        "peft_adapter_state_keys": sorted(peft_state),
+        "peft_trimmed_adapter_shapes": {
+            key: list(value.shape) for key, value in sorted(peft_trimmed_state.items())
+        },
         "checks": checks,
         "all_passed": bool(all(checks.values())),
     }

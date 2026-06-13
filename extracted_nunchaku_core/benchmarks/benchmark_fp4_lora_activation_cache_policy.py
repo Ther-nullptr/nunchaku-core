@@ -200,7 +200,11 @@ def main() -> None:
             "naive_fp4_cache_materializes_dense_x_hat_in_backward": True,
         },
         "implementation": {
-            "fp4_cache_fused_d_lora_down": "cuda_rank_tiled_kvec2_rvec16",
+            "fp4_cache_fused_d_lora_down": (
+                "cuda_rank_tiled_kvec3_rvec16_rank_le_32"
+                if rank <= 32
+                else "cuda_rank_tiled_kvec2_rvec16"
+            ),
         },
         "latency_ms": {
             "forward_quantize_cache": quantize_cache_ms,

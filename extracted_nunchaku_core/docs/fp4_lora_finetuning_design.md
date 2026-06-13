@@ -395,8 +395,8 @@ RTX 5090 BF16 短测：
 
 | shape | saved x cache | FP4 cache | memory reduction | x_hat rel_l2 | dA rel_l2 | saved-x dA ms | FP4 dequant+dA ms | fused dA ms | fused vs dequant rel_l2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0284 | 0.0682 | 0.1300 | 2.86e-3 |
-| 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0389 | 0.1985 | 0.3920 | 7.84e-5 |
+| 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0249 | 0.0676 | 0.1281 | 2.86e-3 |
+| 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0363 | 0.2023 | 0.3460 | 7.84e-5 |
 
 训练接口接入后的短测，`benchmark_native_fp4_lora_training.py --warmup 5 --iters 10 --grad-accum-steps 4`，BF16，`fuse_lora_dx=True, cache_fused_lora_dx=True`：
 
@@ -410,7 +410,7 @@ RTX 5090 BF16 短测：
 | shape | exact activation context | FP4-cache activation context | context reduction | exact all saved | FP4-cache all saved | all-saved reduction | FP4-cache / exact step | dA rel_l2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2048^2, rank32 | 8.125 MiB | 2.375 MiB | 3.42x | 8.375 MiB | 2.625 MiB | 3.19x | 0.71x | 9.83e-2 |
-| 4096^2, rank32 | 32.25 MiB | 9.25 MiB | 3.49x | 32.75 MiB | 9.75 MiB | 3.36x | 0.74x | 9.78e-2 |
+| 4096^2, rank32 | 32.25 MiB | 9.25 MiB | 3.49x | 32.75 MiB | 9.75 MiB | 3.36x | 0.77x | 9.78e-2 |
 
 这里 `activation context = saved_x/qact/ascales + saved_lora_act`，`all saved` 额外包含 LoRA A/B 等权重引用。这个口径比只看 `x -> qact+ascales` 更接近 PyTorch autograd 真实保存量。
 
@@ -419,8 +419,9 @@ RTX 5090 BF16 短测：
 - FP4 cache 的显存收益明确，`qact + ascales` 约为 saved BF16/FP16 `x` 的 `28.1%`；训练接口实测 activation context 缩减约 `3.42x-3.49x`，all saved tensors 缩减约 `3.19x-3.36x`。
 - 直接用 FP4-dequant activation 计算 `dA` 会带来约 `1e-1` rel_l2 梯度误差；如果要保持 LoRA 梯度精确，默认仍应使用 `save_bf16` 或重算 `x` 来源。
 - 当前 naive CUDA dequant 仍要物化 dense `x_hat`，4096 形状比 saved-x `dA` 慢约 `5.1x`。
-- fused `dA` 原型避免了 dense `x_hat`，当前 `kVec=2,rVec=16` rank-tiled 标量 reduction 相比上一版 `kVec=8,rVec=4` 在 2048/4096 形状分别约 `1.22x/1.29x`；但它仍慢于 `dequant + GEMM`，4096 形状约 `0.51x`。下一步应把 FP4 decode staging 和 reduction 改成更 tensor-core/GEMM 友好的分块。
-- 接入训练 wrapper 后，该模式用约 `0.72x-0.73x` exact cached-pack step 速度换取 saved `x` 约 `3.56x` 缓存压缩；它当前是显存压力模式，不是性能模式。
+- fused `dA` 原型避免了 dense `x_hat`，rank<=32 当前使用 `kVec=3,rVec=16`，rank>32 仍回落 `kVec=2,rVec=16`。本轮候选记录见 `docs/fp4_kernel_research_notes.md`：`kVec=3,rVec=16` 对 2048 基本持平，对 4096 fused `dA` 从约 `0.391ms` 降到 `0.346ms`，约 `1.13x`。
+- 它仍慢于 `dequant + GEMM`，4096 形状约 `0.58x`。下一步应把 FP4 decode staging 和 reduction 改成更 tensor-core/GEMM 友好的分块。
+- 接入训练 wrapper 后，该模式用约 `0.77x` exact cached-pack step 速度换取 saved `x` 约 `3.56x` 缓存压缩；它当前是显存压力模式，不是性能模式。
 - 即便 fused `dA` 继续优化，它对齐的仍是 `dequant(qact, ascales)` 近似路径，不能消除 FP4 activation cache 自身带来的 `dA` 精度损失，因此只适合作为显存/近似训练模式。
 
 P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该 packed residual dX 路径误差偏大，默认仍保留 residual dense dX。BF16 exact overlap 支持 dual-branch，但 residual dX 保持 dense side stream。

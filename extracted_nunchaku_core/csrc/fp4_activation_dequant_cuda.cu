@@ -282,28 +282,54 @@ void fp4_activation_cache_lora_down_grad_cuda(
     TORCH_CHECK(output.size(0) == rank, "output rows must match dy_up rank");
     TORCH_CHECK(ascales.numel() == padded_rows * padded_cols / kFP4GroupSize, "ascales numel mismatch");
 
-    constexpr int kVec = 2;
-    constexpr int rVec = 16;
     constexpr int threads = 256;
-    const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf,
-        at::kBFloat16,
-        output.scalar_type(),
-        "fp4_activation_cache_lora_down_grad_cuda",
-        [&] {
-            fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec><<<blocks, threads, 0, stream>>>(
-                qact.data_ptr<uint8_t>(),
-                reinterpret_cast<const uint8_t*>(ascales.data_ptr()),
-                dy_up.data_ptr<scalar_t>(),
-                output.data_ptr<scalar_t>(),
-                rows,
-                cols,
-                rank,
-                static_cast<int>(padded_cols / kWarpK));
-        });
+    if (rank <= 32) {
+        // Rank-32 LoRA is the common finetuning case. kVec=3 reduces CTA count
+        // without changing rank tiling and stays within the 48KB static smem cap.
+        constexpr int kVec = 3;
+        constexpr int rVec = 16;
+        const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf,
+            at::kBFloat16,
+            output.scalar_type(),
+            "fp4_activation_cache_lora_down_grad_cuda_rank32",
+            [&] {
+                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec>
+                    <<<blocks, threads, 0, stream>>>(
+                        qact.data_ptr<uint8_t>(),
+                        reinterpret_cast<const uint8_t*>(ascales.data_ptr()),
+                        dy_up.data_ptr<scalar_t>(),
+                        output.data_ptr<scalar_t>(),
+                        rows,
+                        cols,
+                        rank,
+                        static_cast<int>(padded_cols / kWarpK));
+            });
+    } else {
+        constexpr int kVec = 2;
+        constexpr int rVec = 16;
+        const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf,
+            at::kBFloat16,
+            output.scalar_type(),
+            "fp4_activation_cache_lora_down_grad_cuda",
+            [&] {
+                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec>
+                    <<<blocks, threads, 0, stream>>>(
+                        qact.data_ptr<uint8_t>(),
+                        reinterpret_cast<const uint8_t*>(ascales.data_ptr()),
+                        dy_up.data_ptr<scalar_t>(),
+                        output.data_ptr<scalar_t>(),
+                        rows,
+                        cols,
+                        rank,
+                        static_cast<int>(padded_cols / kWarpK));
+            });
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

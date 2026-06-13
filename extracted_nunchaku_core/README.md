@@ -531,6 +531,8 @@ cfg = FP4LoRAConfig(
     frozen_residual_rank=32,
     frozen_residual_init="residual_svd",
     fuse_lora_dx=True,
+    # FP16-only experimental: fuse frozen residual dX into the same epilogue.
+    fuse_frozen_residual_dx=False,
     cache_fused_lora_dx=True,
 )
 
@@ -587,6 +589,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 - `results/latest_native_fp4_lora_modeling_validation.json`
 - BF16 fused cached 路径：替换 4 个目标 Linear，`lm_head` 保持 dense，只有 LoRA A/B 可训练，optimizer 参数组、post-step cache refresh hook、LoRA-only state_dict strict load 和 backward 均通过。
 - dual-branch 路径：`frozen_residual_*` 是 frozen buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
+- FP16 下可打开 `fuse_frozen_residual_dx=True`，把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 下该路径目前误差偏大，默认关闭。
 
 ## 11. 建议的完整实验顺序
 
@@ -603,11 +606,20 @@ python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --o
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
 python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
+python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
+python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```
+
+RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 5 --iters 10`：
+
+| path | train step ms | note |
+| --- | ---: | --- |
+| task LoRA fused + residual dense dX | 0.3480 | FP16 dual-branch baseline |
+| task LoRA + residual fused dX | 0.3038 | `1.146x` vs dense residual dX, `dX` rel_l2 `3.81e-4` |
 
 ## 12. 主要 Python 接口
 
@@ -626,7 +638,7 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-
 - `native_fp4.NunchakuFP4LoRALinear`
   - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口
 - `native_fp4.FP4LoRAConfig`
-  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`
+  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.freeze_non_fp4_lora_parameters`
@@ -664,6 +676,8 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-
   - FP4 LoRA training wrapper correctness
 - `latest_native_fp4_lora_training.json`
   - FP4 LoRA training benchmark
+- `latest_native_fp4_lora_dual_branch.json`
+  - dual-branch FP16 fused residual dX benchmark
 - `latest_native_fp4_lora_modeling_validation.json`
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
 

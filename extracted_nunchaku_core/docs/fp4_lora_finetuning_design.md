@@ -172,6 +172,7 @@ optimizer 边界：
   - `0/"none"`：只使用 trainable task LoRA。
   - `rank/"residual_svd"`：额外构造 frozen residual branch，推荐与 `init="zero"` 搭配，避免训练破坏量化补偿。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
+- `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
 - `target_modules/exclude_modules`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA。
 
 ## 当前 backward 边界
@@ -303,7 +304,14 @@ P4：加入 activation cache policy：
 - `recompute_lora_act`：只保存 `x`，少存一个 `[M, rank]`。
 - `checkpoint`：进一步重算上游 activation，面向长序列微调。
 
-P5：dual-branch residual/task LoRA 初始化已落地 P0；后续优化是把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue，避免当前 residual branch 的 dense PyTorch matmul。
+P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该路径误差偏大，默认仍保留 residual dense dX。
+
+RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 5 --iters 10`：
+
+| path | train step ms | result |
+| --- | ---: | --- |
+| task LoRA fused + residual dense dX | 0.3480 | baseline |
+| task LoRA + residual fused dX | 0.3038 | `1.146x`, `dX` rel_l2 `3.81e-4` |
 
 P6：加入 outlier-aware FP4 训练策略：
 
@@ -334,6 +342,20 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
   --dtype bf16 \
   --lowrank-dtype bf16 \
   --fuse-lora-dx \
+  --cache-fused-lora-dx
+
+conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
+  --m 129 \
+  --in-features 512 \
+  --out-features 768 \
+  --rank 32 \
+  --frozen-residual-rank 32 \
+  --frozen-residual-init residual_svd \
+  --init zero \
+  --dtype fp16 \
+  --lowrank-dtype fp16 \
+  --fuse-lora-dx \
+  --fuse-frozen-residual-dx \
   --cache-fused-lora-dx
 ```
 

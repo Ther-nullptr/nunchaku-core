@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
     p.add_argument("--fuse-lora-dx", action="store_true")
+    p.add_argument("--fuse-frozen-residual-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
@@ -86,6 +87,7 @@ def main() -> None:
         train_bias=False,
         cache_lora_act=True,
         fuse_lora_dx=args.fuse_lora_dx,
+        fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
     )
     model, replaced = convert_linear_to_fp4_lora(
@@ -212,6 +214,7 @@ def main() -> None:
             "lowrank_dtype": args.lowrank_dtype,
             "init": args.init,
             "fuse_lora_dx": args.fuse_lora_dx,
+            "fuse_frozen_residual_dx": args.fuse_frozen_residual_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
         },
         "replaced": replaced,

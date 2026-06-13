@@ -21,6 +21,7 @@ class FP4LoRAConfig:
     train_bias: bool = False
     cache_lora_act: bool = True
     fuse_lora_dx: bool = False
+    fuse_frozen_residual_dx: bool = False
     cache_fused_lora_dx: bool = False
     reuse_fused_dy_up_for_d_lora_down: bool = False
 
@@ -87,6 +88,7 @@ def convert_linear_to_fp4_lora(
                         train_bias=cfg.train_bias,
                         cache_lora_act=cfg.cache_lora_act,
                         fuse_lora_dx=cfg.fuse_lora_dx,
+                        fuse_frozen_residual_dx=cfg.fuse_frozen_residual_dx,
                         cache_fused_lora_dx=cfg.cache_fused_lora_dx,
                         reuse_fused_dy_up_for_d_lora_down=cfg.reuse_fused_dy_up_for_d_lora_down,
                     )

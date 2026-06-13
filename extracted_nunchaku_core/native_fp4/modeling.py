@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import torch
@@ -24,6 +25,57 @@ class FP4LoRAConfig:
     fuse_frozen_residual_dx: bool = False
     cache_fused_lora_dx: bool = False
     reuse_fused_dy_up_for_d_lora_down: bool = False
+
+
+def _ceil_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return int(value)
+    return ((int(value) + multiple - 1) // multiple) * multiple
+
+
+def fp4_lora_config_overrides_from_outlier_report(
+    report: Mapping[str, Any] | str,
+    base_config: FP4LoRAConfig,
+    *,
+    rank_field: str = "suggested_rank",
+    rank_multiple: int = 16,
+    min_rank: int | None = None,
+    max_rank: int | None = None,
+    force_init: LoRAInitMode | None = None,
+    disable_fuse_frozen_residual_dx: bool = False,
+) -> dict[str, FP4LoRAConfig]:
+    """Build per-module FP4 LoRA overrides from an outlier diagnostic report.
+
+    The expected input is the JSON emitted by
+    ``analyze_fp4_lora_activation_grad_outliers.py``. Only
+    ``summary.rank_bump_candidates`` is consumed; unsupported fields are ignored.
+    """
+
+    if isinstance(report, str):
+        with open(report, "r", encoding="utf-8") as f:
+            report_data = json.load(f)
+    else:
+        report_data = report
+
+    candidates = report_data.get("summary", {}).get("rank_bump_candidates", [])
+    overrides: dict[str, FP4LoRAConfig] = {}
+    for item in candidates:
+        module_name = item.get("module")
+        if not module_name:
+            continue
+        rank = int(item.get(rank_field, base_config.rank))
+        if min_rank is not None:
+            rank = max(rank, int(min_rank))
+        if max_rank is not None:
+            rank = min(rank, int(max_rank))
+        rank = _ceil_to_multiple(rank, rank_multiple)
+        overrides[str(module_name)] = replace(
+            base_config,
+            rank=rank,
+            init=base_config.init if force_init is None else force_init,
+            fuse_frozen_residual_dx=False if disable_fuse_frozen_residual_dx else base_config.fuse_frozen_residual_dx,
+        )
+    return overrides
 
 
 def _as_tuple(values: Iterable[str] | None) -> tuple[str, ...]:

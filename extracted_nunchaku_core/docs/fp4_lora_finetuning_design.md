@@ -101,7 +101,11 @@ y = op(x)
 ```python
 from dataclasses import replace
 
-from native_fp4 import FP4LoRAConfig, convert_linear_to_fp4_lora
+from native_fp4 import (
+    FP4LoRAConfig,
+    convert_linear_to_fp4_lora,
+    fp4_lora_config_overrides_from_outlier_report,
+)
 
 cfg = FP4LoRAConfig(
     rank=32,
@@ -118,6 +122,14 @@ sensitive_overrides = {
     # 典型用途：down_proj 或 activation outlier 明显的完整模块路径。
     "layers.1.mlp.down_proj": replace(cfg, rank=64, fuse_frozen_residual_dx=False),
 }
+
+auto_overrides = fp4_lora_config_overrides_from_outlier_report(
+    "results/latest_fp4_lora_activation_grad_outliers.json",
+    cfg,
+    force_init="zero",
+    disable_fuse_frozen_residual_dx=True,
+)
+sensitive_overrides.update(auto_overrides)
 
 model, replaced = convert_linear_to_fp4_lora(
     model.cuda().to(torch.bfloat16),
@@ -341,7 +353,7 @@ RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-featur
 P6：加入 outlier-aware FP4 训练策略：
 
 - `analyze_fp4_lora_activation_grad_outliers.py` 已落地 activation / grad-output 通道统计。
-- `summary.rank_bump_candidates` 可直接转成 `config_overrides`，对敏感 projection 单独提高 rank 或调整 residual/task LoRA 策略。
+- `summary.rank_bump_candidates` 可用 `fp4_lora_config_overrides_from_outlier_report` 直接转成 `config_overrides`，对敏感 projection 单独提高 rank 或调整 residual/task LoRA 策略。
 - `summary.smooth_bwd_candidates` 用 Spearman rank correlation 判断 activation outlier 是否能代理 backward `dY` outlier；当前只作为诊断，不直接改 kernel `smooth_bwd`。
 - 对真正不适合 FP4 的 projection，仍用 `exclude_modules` 保留 BF16。
 
@@ -360,6 +372,19 @@ python benchmarks/analyze_fp4_lora_activation_grad_outliers.py \
   --inject-outliers \
   --outlier-channel 0 \
   --outlier-scale 16
+```
+
+生成 overrides：
+
+```python
+from native_fp4 import fp4_lora_config_overrides_from_outlier_report
+
+config_overrides = fp4_lora_config_overrides_from_outlier_report(
+    "results/latest_fp4_lora_activation_grad_outliers.json",
+    cfg,
+    force_init="zero",
+    disable_fuse_frozen_residual_dx=True,
+)
 ```
 
 ## 验证命令

@@ -17,6 +17,7 @@ from native_fp4 import (  # noqa: E402
     NunchakuFP4LoRALinear,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
+    fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_parameter_groups,
     fp4_lora_peft_state_dict,
     fp4_lora_state_dict,
@@ -96,6 +97,22 @@ def main() -> None:
     override_rank = 24 if args.rank != 24 else 16
     override_cfg = replace(cfg, rank=override_rank, init="zero")
     config_overrides = {"layers.1.down_proj": override_cfg}
+    auto_override_rank = 48 if args.rank != 48 else 64
+    auto_overrides = fp4_lora_config_overrides_from_outlier_report(
+        {
+            "summary": {
+                "rank_bump_candidates": [
+                    {
+                        "module": "layers.1.down_proj",
+                        "suggested_rank": auto_override_rank,
+                    }
+                ]
+            }
+        },
+        cfg,
+        force_init="zero",
+        disable_fuse_frozen_residual_dx=True,
+    )
     model, replaced = convert_linear_to_fp4_lora(
         model,
         cfg,
@@ -183,6 +200,16 @@ def main() -> None:
     except ValueError:
         strict_mismatch_raises = True
 
+    model_auto = TinyModel(args.hidden, dtype).cuda()
+    model_auto, replaced_auto = convert_linear_to_fp4_lora(
+        model_auto,
+        cfg,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+        config_overrides=auto_overrides,
+    )
+    fp4_modules_auto = dict(iter_fp4_lora_modules(model_auto))
+
     expected_peft_keys = {
         f"{name}.{suffix}"
         for name in expected_replaced
@@ -251,6 +278,7 @@ def main() -> None:
         "second_model_replaced_expected_modules": set(replaced2) == expected_replaced,
         "peft_model_replaced_expected_modules": set(replaced3) == expected_replaced,
         "trimmed_peft_model_replaced_expected_modules": set(replaced4) == expected_replaced,
+        "auto_override_model_replaced_expected_modules": set(replaced_auto) == expected_replaced,
         "lm_head_not_replaced": not isinstance(model.lm_head, NunchakuFP4LoRALinear),
         "all_replaced_are_fp4_lora": all(isinstance(fp4_modules[name], NunchakuFP4LoRALinear) for name in expected_replaced),
         "config_override_rank_applied": fp4_modules["layers.1.down_proj"].requested_rank == override_rank,
@@ -261,6 +289,13 @@ def main() -> None:
             if name != "layers.1.down_proj"
         ),
         "second_model_config_override_rank_applied": fp4_modules2["layers.1.down_proj"].requested_rank == override_rank,
+        "outlier_report_override_rank_applied": (
+            fp4_modules_auto["layers.1.down_proj"].requested_rank == auto_override_rank
+        ),
+        "outlier_report_override_init_applied": fp4_modules_auto["layers.1.down_proj"].init_mode == "zero",
+        "outlier_report_override_disabled_fused_residual_dx": (
+            not fp4_modules_auto["layers.1.down_proj"].fuse_frozen_residual_dx
+        ),
         "only_lora_trainable": trainable_named == set(trainable),
         "trainable_grads_present": set(trainable).issubset(grad_named),
         "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
@@ -315,6 +350,14 @@ def main() -> None:
                 "rank": override_rank,
                 "init": "zero",
             }
+        },
+        "outlier_report_config_overrides": {
+            name: {
+                "rank": override.rank,
+                "init": override.init,
+                "fuse_frozen_residual_dx": override.fuse_frozen_residual_dx,
+            }
+            for name, override in auto_overrides.items()
         },
         "replaced": replaced,
         "trainable": trainable,

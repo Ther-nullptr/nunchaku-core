@@ -517,6 +517,7 @@ from dataclasses import replace
 from native_fp4 import (
     FP4LoRAConfig,
     convert_linear_to_fp4_lora,
+    fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_parameter_groups,
     fp4_lora_peft_state_dict,
     fp4_lora_state_dict,
@@ -545,6 +546,15 @@ sensitive_overrides = {
     # 用于 down_proj/outlier 层等敏感模块：可单独加 rank、改 init 或关闭实验 fusion。
     "layers.1.mlp.down_proj": replace(cfg, rank=64, fuse_frozen_residual_dx=False),
 }
+
+# 如果已经跑过 outlier 诊断，也可以直接从 JSON 生成 overrides。
+auto_overrides = fp4_lora_config_overrides_from_outlier_report(
+    "results/latest_fp4_lora_activation_grad_outliers.json",
+    cfg,
+    force_init="zero",
+    disable_fuse_frozen_residual_dx=True,
+)
+sensitive_overrides.update(auto_overrides)
 
 model, replaced = convert_linear_to_fp4_lora(
     model,
@@ -636,6 +646,19 @@ python benchmarks/analyze_fp4_lora_activation_grad_outliers.py \
 - `summary.rank_bump_candidates`：建议用 `config_overrides` 单独提高 rank 的模块。
 - `summary.smooth_bwd_candidates`：activation/grad-output 通道 rank correlation 足够高的模块。当前只作为诊断信号；直接改 `smooth_bwd` 需要同步权重量化/反缩放补偿，不能把它当成无损开关。
 
+把诊断结果转成模型转换策略：
+
+```python
+from native_fp4 import fp4_lora_config_overrides_from_outlier_report
+
+config_overrides = fp4_lora_config_overrides_from_outlier_report(
+    "results/latest_fp4_lora_activation_grad_outliers.json",
+    cfg,
+    force_init="zero",
+    disable_fuse_frozen_residual_dx=True,
+)
+```
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -691,6 +714,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
+- `native_fp4.fp4_lora_config_overrides_from_outlier_report`
+  - 从 outlier 诊断 JSON 自动生成 `config_overrides`
 - `native_fp4.freeze_non_fp4_lora_parameters`
   - 冻结非 LoRA 参数，只保留 LoRA A/B 可训练
 - `native_fp4.iter_fp4_lora_named_parameters`

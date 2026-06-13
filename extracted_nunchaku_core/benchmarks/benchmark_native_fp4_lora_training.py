@@ -234,6 +234,19 @@ def main() -> None:
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
     )
+    fp4_cached_fused_dx_cached_pack_overlap_exact = NunchakuFP4LoRALinear(
+        weight=weight,
+        bias=bias,
+        rank=args.rank,
+        lora_alpha=args.lora_alpha,
+        lowrank_dtype=lowrank_dtype,
+        init="gaussian",
+        train_bias=args.train_bias,
+        cache_lora_act=True,
+        fuse_lora_dx=True,
+        cache_fused_lora_dx=True,
+        overlap_lora_grad=True,
+    )
     fp4_cached_fused_dx_cached_pack_reuse_dy_up = None
     fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap = None
     if can_reuse_fused_dy_up:
@@ -279,6 +292,7 @@ def main() -> None:
             fp4_cached_fused_dx,
             fp4_recompute_fused_dx,
             fp4_cached_fused_dx_cached_pack,
+            fp4_cached_fused_dx_cached_pack_overlap_exact,
             dense,
         ]
         if fp4_cached_fused_dx_cached_pack_reuse_dy_up is not None:
@@ -327,6 +341,9 @@ def main() -> None:
     fp4_cached_fused_dx_cached_pack_train_step_ms = benchmark_train_step(
         fp4_cached_fused_dx_cached_pack, x, dy, args.warmup, args.iters
     )
+    fp4_cached_fused_dx_cached_pack_overlap_exact_train_step_ms = benchmark_train_step(
+        fp4_cached_fused_dx_cached_pack_overlap_exact, x, dy, args.warmup, args.iters
+    )
     fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step_ms = None
     if fp4_cached_fused_dx_cached_pack_reuse_dy_up is not None:
         fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step_ms = benchmark_train_step(
@@ -345,6 +362,9 @@ def main() -> None:
     )
     fp4_cached_fused_dx_cached_pack_grad_accum_total_ms = benchmark_grad_accum(
         fp4_cached_fused_dx_cached_pack, x, dy, args.warmup, args.iters, args.grad_accum_steps
+    )
+    fp4_cached_fused_dx_cached_pack_overlap_exact_grad_accum_total_ms = benchmark_grad_accum(
+        fp4_cached_fused_dx_cached_pack_overlap_exact, x, dy, args.warmup, args.iters, args.grad_accum_steps
     )
     fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_total_ms = None
     if fp4_cached_fused_dx_cached_pack_reuse_dy_up is not None:
@@ -373,17 +393,21 @@ def main() -> None:
 
     reuse_train_step_ms = fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step_ms
     reuse_grad_accum_total_ms = fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_total_ms
+    overlap_exact_train_step_ms = fp4_cached_fused_dx_cached_pack_overlap_exact_train_step_ms
+    overlap_exact_grad_accum_total_ms = fp4_cached_fused_dx_cached_pack_overlap_exact_grad_accum_total_ms
     overlap_train_step_ms = fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap_train_step_ms
     overlap_grad_accum_total_ms = fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap_grad_accum_total_ms
     reuse_grad_accum_per_micro_step_ms = (
         None if reuse_grad_accum_total_ms is None else reuse_grad_accum_total_ms / args.grad_accum_steps
     )
+    overlap_exact_grad_accum_per_micro_step_ms = overlap_exact_grad_accum_total_ms / args.grad_accum_steps
     overlap_grad_accum_per_micro_step_ms = (
         None if overlap_grad_accum_total_ms is None else overlap_grad_accum_total_ms / args.grad_accum_steps
     )
     reuse_backward_estimate_ms = (
         None if reuse_train_step_ms is None else reuse_train_step_ms - fp4_cached_forward_train_graph_ms
     )
+    overlap_exact_backward_estimate_ms = overlap_exact_train_step_ms - fp4_cached_forward_train_graph_ms
     overlap_backward_estimate_ms = (
         None if overlap_train_step_ms is None else overlap_train_step_ms - fp4_cached_forward_train_graph_ms
     )
@@ -415,6 +439,9 @@ def main() -> None:
             "fp4_cached_fused_dx_train_step": fp4_cached_fused_dx_train_step_ms,
             "fp4_recompute_fused_dx_train_step": fp4_recompute_fused_dx_train_step_ms,
             "fp4_cached_fused_dx_cached_pack_train_step": fp4_cached_fused_dx_cached_pack_train_step_ms,
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_train_step": (
+                fp4_cached_fused_dx_cached_pack_overlap_exact_train_step_ms
+            ),
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step": (
                 fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step_ms
             ),
@@ -427,6 +454,9 @@ def main() -> None:
             "dense_grad_accum_total": dense_grad_accum_total_ms,
             "fp4_cached_fused_dx_grad_accum_total": fp4_cached_fused_dx_grad_accum_total_ms,
             "fp4_cached_fused_dx_cached_pack_grad_accum_total": fp4_cached_fused_dx_cached_pack_grad_accum_total_ms,
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_grad_accum_total": (
+                fp4_cached_fused_dx_cached_pack_overlap_exact_grad_accum_total_ms
+            ),
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_total": (
                 fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_total_ms
             ),
@@ -441,6 +471,9 @@ def main() -> None:
             / args.grad_accum_steps,
             "fp4_cached_fused_dx_cached_pack_grad_accum_per_micro_step": (
                 fp4_cached_fused_dx_cached_pack_grad_accum_total_ms / args.grad_accum_steps
+            ),
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_grad_accum_per_micro_step": (
+                overlap_exact_grad_accum_per_micro_step_ms
             ),
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_per_micro_step": (
                 reuse_grad_accum_per_micro_step_ms
@@ -460,6 +493,7 @@ def main() -> None:
             - fp4_recompute_forward_train_graph_ms,
             "fp4_cached_fused_dx_cached_pack_backward_estimate": fp4_cached_fused_dx_cached_pack_train_step_ms
             - fp4_cached_forward_train_graph_ms,
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_backward_estimate": overlap_exact_backward_estimate_ms,
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_backward_estimate": reuse_backward_estimate_ms,
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap_backward_estimate": overlap_backward_estimate_ms,
         },
@@ -478,6 +512,8 @@ def main() -> None:
             / fp4_recompute_fused_dx_train_step_ms,
             "fp4_cached_fused_dx_cached_pack_train_step_vs_dense": dense_train_step_ms
             / fp4_cached_fused_dx_cached_pack_train_step_ms,
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_train_step_vs_dense": dense_train_step_ms
+            / overlap_exact_train_step_ms,
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_train_step_vs_dense": (
                 None if reuse_train_step_ms is None else dense_train_step_ms / reuse_train_step_ms
             ),
@@ -490,6 +526,8 @@ def main() -> None:
             / fp4_cached_fused_dx_grad_accum_total_ms,
             "fp4_cached_fused_dx_cached_pack_grad_accum_vs_dense": dense_grad_accum_total_ms
             / fp4_cached_fused_dx_cached_pack_grad_accum_total_ms,
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_grad_accum_vs_dense": dense_grad_accum_total_ms
+            / overlap_exact_grad_accum_total_ms,
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_vs_dense": (
                 None if reuse_grad_accum_total_ms is None else dense_grad_accum_total_ms / reuse_grad_accum_total_ms
             ),
@@ -514,6 +552,10 @@ def main() -> None:
                 dense_train_step_ms - dense_forward_train_graph_ms
             )
             / (fp4_cached_fused_dx_cached_pack_train_step_ms - fp4_cached_forward_train_graph_ms),
+            "fp4_cached_fused_dx_cached_pack_overlap_exact_backward_estimate_vs_dense": (
+                dense_train_step_ms - dense_forward_train_graph_ms
+            )
+            / overlap_exact_backward_estimate_ms,
             "fp4_cached_fused_dx_cached_pack_reuse_dy_up_backward_estimate_vs_dense": (
                 None
                 if reuse_backward_estimate_ms is None
@@ -529,6 +571,9 @@ def main() -> None:
             / fp4_cached_fused_dx_train_step_ms,
             "fused_dx_cached_pack_vs_dynamic_pack_train_step": fp4_cached_fused_dx_train_step_ms
             / fp4_cached_fused_dx_cached_pack_train_step_ms,
+            "fused_dx_cached_pack_overlap_exact_vs_cached_pack_train_step": (
+                fp4_cached_fused_dx_cached_pack_train_step_ms / overlap_exact_train_step_ms
+            ),
             "fused_dx_cached_pack_reuse_dy_up_vs_cached_pack_train_step": (
                 None
                 if reuse_train_step_ms is None
@@ -541,6 +586,9 @@ def main() -> None:
             / (fp4_cached_fused_dx_cached_pack_train_step_ms + refresh_fused_lora_dx_cache_ms),
             "fused_dx_cached_pack_vs_dynamic_pack_grad_accum": fp4_cached_fused_dx_grad_accum_total_ms
             / fp4_cached_fused_dx_cached_pack_grad_accum_total_ms,
+            "fused_dx_cached_pack_overlap_exact_vs_cached_pack_grad_accum": (
+                fp4_cached_fused_dx_cached_pack_grad_accum_total_ms / overlap_exact_grad_accum_total_ms
+            ),
             "fused_dx_cached_pack_reuse_dy_up_vs_cached_pack_grad_accum": (
                 None
                 if reuse_grad_accum_total_ms is None

@@ -274,9 +274,10 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。
 - 为保证训练梯度精度，默认 `dA` 仍使用 dense `dY @ B`；BF16 下复用 fused dX 产生的 packed `dY @ B` 会给 `dA` 带来约 `3.36e-3` rel_l2，不作为默认梯度来源。
 - FP16 下提供 `reuse_fused_dy_up_for_d_lora_down=True` 实验选项，复用 packed `dY @ B` 可通过 correctness，`dA` rel_l2 约 `3.35e-5`；性能收益较小且有噪声，4096/rank32 短测中单步约 `0.968x-1.018x`，梯度累积 per micro-step 约 `1.016x-1.036x`。
-- FP16 下新增 `overlap_lora_grad=True` 实验选项。它要求同时打开 `fuse_lora_dx=True`、`cache_fused_lora_dx=True`、`reuse_fused_dy_up_for_d_lora_down=True`，并且当前不支持 frozen residual branch；实现上用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 decoded `dA` GEMM。
-- `overlap_lora_grad` correctness：`validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --cache-fused-lora-dx --reuse-fused-dy-up-for-d-lora-down --overlap-lora-grad` 通过，`dX` rel_l2 `1.81e-5`，`dA` rel_l2 `3.36e-5`。
-- 4096/rank32 FP16 短测，`benchmark_native_fp4_lora_training.py --warmup 10 --iters 30 --grad-accum-steps 4`：cached-pack `0.9221 ms`，reuse `0.8984 ms`，reuse+overlap `0.8909 ms`；gradient accumulation per micro-step 分别为 `0.9443/0.9296/0.8962 ms`。overlap 单步仅 `1.008x` vs reuse，但 grad accumulation 中约 `1.037x` vs reuse。
+- `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`，并且当前不支持 frozen residual branch；实现上用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM。
+- BF16 exact overlap 不复用 packed 近似 `dY @ B`，`dA` 仍走 dense `dY @ B`。Correctness：`validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad` 通过，`dX` rel_l2 `1.55e-4`，`dA` rel_l2 `0`。
+- 4096/rank32 BF16 短测，`benchmark_native_fp4_lora_training.py --warmup 10 --iters 30 --grad-accum-steps 4`：cached-pack `0.9419 ms`，exact overlap `0.8948 ms`；gradient accumulation per micro-step `0.9597 -> 0.8952 ms`。单步 `1.053x` vs cached-pack，grad accumulation `1.072x` vs cached-pack。
+- FP16 reuse+overlap 路径同时打开 `reuse_fused_dy_up_for_d_lora_down=True`，复用 decoded packed `dY @ B`。Correctness：`dX` rel_l2 `1.81e-5`，`dA` rel_l2 `3.56e-5`；4096/rank32 短测中单步 `1.008x` vs reuse，grad accumulation `1.037x` vs reuse。
 - 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
 
 ## 后续优化路线

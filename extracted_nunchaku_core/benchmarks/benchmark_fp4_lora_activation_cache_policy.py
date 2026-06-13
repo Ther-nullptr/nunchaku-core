@@ -200,6 +200,15 @@ def main() -> None:
             "naive_fp4_cache_materializes_dense_x_hat_in_backward": True,
         },
         "implementation": {
+            "module_default_fp4_activation_cache_d_lora_down_backend": "fused",
+            "available_fp4_activation_cache_d_lora_down_backends": ["fused", "dequant_gemm"],
+            "fastest_measured_fp4_activation_cache_d_lora_down_backend": (
+                "fused" if fp4_cache_fused_d_lora_down_ms <= fp4_cache_d_lora_down_ms else "dequant_gemm"
+            ),
+            "backend_tradeoff": {
+                "fused": "directly consumes qact/ascales and avoids materializing dense x_hat",
+                "dequant_gemm": "materializes dense x_hat transiently, then uses torch GEMM for dA",
+            },
             "fp4_cache_fused_d_lora_down": (
                 "cuda_rank_tiled_kvec3_rvec16_rank_le_32"
                 if rank <= 32

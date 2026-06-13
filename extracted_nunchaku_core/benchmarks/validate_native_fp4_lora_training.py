@@ -11,7 +11,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from native_fp4 import NunchakuFP4LoRALinear, fp4_activation_cache_lora_down_grad  # noqa: E402
+from native_fp4 import NunchakuFP4LoRALinear, dequantize_fp4_activation, fp4_activation_cache_lora_down_grad  # noqa: E402
 from native_fp4.operators import pad_tensor  # noqa: E402
 
 
@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlap-lora-grad", action="store_true")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--fp4-activation-cache-d-lora-down", action="store_true")
+    p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -91,6 +92,7 @@ def main() -> None:
         overlap_lora_grad=args.overlap_lora_grad,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=args.fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
 
     cache_refresh_check = True
@@ -167,12 +169,17 @@ def main() -> None:
             if op.fp4_forward.k_pad != op.in_features:
                 x2d_fp4 = pad_tensor(x2d_fp4, divisor=op.fp4_forward.k_pad, dim=1)
             qact, ascales = op.fp4_forward.quantize_input(x2d_fp4)
-            d_down_ref = fp4_activation_cache_lora_down_grad(
-                qact,
-                ascales,
-                dy_up.contiguous(),
-                in_features=op.in_features,
-            )
+            if args.fp4_activation_cache_d_lora_down_backend == "fused":
+                d_down_ref = fp4_activation_cache_lora_down_grad(
+                    qact,
+                    ascales,
+                    dy_up.contiguous(),
+                    in_features=op.in_features,
+                )
+            else:
+                x_hat_pad, _ = dequantize_fp4_activation(qact, ascales, dtype=lowrank_dtype, return_scales=False)
+                x_hat = x_hat_pad[: x2d.shape[0], : op.in_features].contiguous()
+                d_down_ref = torch.matmul(dy_up.t(), x_hat)
             d_down_ref = d_down_ref.mul(op.scaling).to(op.lora_down.dtype)
         d_bias_ref = dy2d.sum(dim=0).to(op.bias.dtype)
 
@@ -239,6 +246,7 @@ def main() -> None:
             "overlap_lora_grad": args.overlap_lora_grad,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
+            "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "tolerances": {
             "forward_rel_l2": forward_tol,

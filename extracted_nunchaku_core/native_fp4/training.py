@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .layout import (
     build_backward_scales_from_forward_quant,
+    dequantize_fp4_activation,
     dequantize_fp4_weight,
     unpack_fp4_weight_scales,
 )
@@ -25,7 +26,30 @@ from .operators import (
 LoRAInitMode = Literal["zero", "gaussian", "residual_svd"]
 FrozenResidualInitMode = Literal["none", "residual_svd"]
 ResidualSVDMethod = Literal["full_svd", "svd_lowrank"]
+FP4ActivationCacheDLoRADownBackend = Literal["fused", "dequant_gemm"]
 DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS = 4096
+
+
+def _fp4_activation_cache_lora_down_grad(
+    qact: torch.Tensor,
+    ascales: torch.Tensor,
+    dy_up: torch.Tensor,
+    *,
+    in_features: int,
+    backend: FP4ActivationCacheDLoRADownBackend,
+) -> torch.Tensor:
+    if backend == "fused":
+        return fp4_activation_cache_lora_down_grad(
+            qact,
+            ascales,
+            dy_up.contiguous(),
+            in_features=in_features,
+        )
+    if backend == "dequant_gemm":
+        x_hat_pad, _ = dequantize_fp4_activation(qact, ascales, dtype=dy_up.dtype, return_scales=False)
+        x_hat = x_hat_pad[: dy_up.shape[0], :in_features].contiguous()
+        return torch.matmul(dy_up.t(), x_hat)
+    raise RuntimeError(f"Unsupported FP4 activation-cache dA backend: {backend}")
 
 
 class _FP4LoRALinearFunction(torch.autograd.Function):
@@ -51,6 +75,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         overlap_lora_grad: bool,
         overlap_lora_grad_min_rows: int,
         fp4_activation_cache_d_lora_down: bool,
+        fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend,
         packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         if x.shape[-1] != fp4_forward_op.in_features:
@@ -130,6 +155,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.overlap_lora_grad = bool(overlap_lora_grad)
         ctx.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
         ctx.fp4_activation_cache_d_lora_down = use_fp4_act_cache
+        ctx.fp4_activation_cache_d_lora_down_backend = fp4_activation_cache_d_lora_down_backend
         ctx.packed_lora_dx = packed_lora_dx
         ctx.has_frozen_residual = bool(has_frozen_residual)
         ctx.has_bias = bias is not None
@@ -231,6 +257,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         x_lr = None if ctx.fp4_activation_cache_d_lora_down else x2d.to(ctx.lowrank_dtype)
@@ -278,11 +305,12 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             dy_up = torch.matmul(dy_lr, up_lr)
         d_lora_up = torch.matmul(dy_lr.t(), lora_act).mul(ctx.scaling).to(lora_up.dtype)
         if ctx.fp4_activation_cache_d_lora_down:
-            d_lora_down = fp4_activation_cache_lora_down_grad(
+            d_lora_down = _fp4_activation_cache_lora_down_grad(
                 qact,
                 ascales,
-                dy_up.contiguous(),
+                dy_up,
                 in_features=ctx.in_features,
+                backend=ctx.fp4_activation_cache_d_lora_down_backend,
             )
             d_lora_down = d_lora_down.mul(ctx.scaling).to(lora_down.dtype)
         else:
@@ -302,6 +330,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             None,
             None,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -642,6 +671,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
         fp4_activation_cache_d_lora_down: bool = False,
+        fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
         residual_svd_method: ResidualSVDMethod = "full_svd",
         residual_svd_lowrank_oversample: int = 8,
         residual_svd_lowrank_niter: int = 2,
@@ -665,6 +695,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("frozen_residual_init must be one of: none, residual_svd")
         if residual_svd_method not in ("full_svd", "svd_lowrank"):
             raise ValueError("residual_svd_method must be one of: full_svd, svd_lowrank")
+        if fp4_activation_cache_d_lora_down_backend not in ("fused", "dequant_gemm"):
+            raise ValueError("fp4_activation_cache_d_lora_down_backend must be one of: fused, dequant_gemm")
         if residual_svd_lowrank_oversample < 0:
             raise ValueError("residual_svd_lowrank_oversample must be non-negative")
         if residual_svd_lowrank_niter < 0:
@@ -723,6 +755,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.overlap_lora_grad = bool(overlap_lora_grad)
         self.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
         self.fp4_activation_cache_d_lora_down = bool(fp4_activation_cache_d_lora_down)
+        self.fp4_activation_cache_d_lora_down_backend = fp4_activation_cache_d_lora_down_backend
         self.init_mode = init
         self.frozen_residual_init = frozen_residual_init
         self.residual_svd_method = residual_svd_method
@@ -800,6 +833,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
         fp4_activation_cache_d_lora_down: bool = False,
+        fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
         frozen_residual_rank: int = 0,
         frozen_residual_init: FrozenResidualInitMode = "none",
         residual_svd_method: ResidualSVDMethod = "full_svd",
@@ -826,6 +860,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             overlap_lora_grad=overlap_lora_grad,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
             fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+            fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
             residual_svd_method=residual_svd_method,
             residual_svd_lowrank_oversample=residual_svd_lowrank_oversample,
             residual_svd_lowrank_niter=residual_svd_lowrank_niter,
@@ -976,6 +1011,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.overlap_lora_grad,
             self.overlap_lora_grad_min_rows,
             self.fp4_activation_cache_d_lora_down,
+            self.fp4_activation_cache_d_lora_down_backend,
             self._get_fused_lora_dx_cache(),
         )
 
@@ -1010,5 +1046,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}, "
             f"overlap_lora_grad={self.overlap_lora_grad}, "
             f"overlap_lora_grad_min_rows={self.overlap_lora_grad_min_rows}, "
-            f"fp4_activation_cache_d_lora_down={self.fp4_activation_cache_d_lora_down}"
+            f"fp4_activation_cache_d_lora_down={self.fp4_activation_cache_d_lora_down}, "
+            f"fp4_activation_cache_d_lora_down_backend={self.fp4_activation_cache_d_lora_down_backend}"
         )

@@ -142,6 +142,27 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
 
 该验证 `all_passed=true`，`lora_down_grad_vs_manual rel_l2=0`，FP4-cache `dA` 相对 exact saved-x `dA` 的 rel_l2 约 `9.69e-2`。
 
+## Backend policy follow-up
+
+由于 rank32-rank512 的 fused `dA` fast path 仍慢于 `dequant + GEMM`，本轮把训练接口改成显式 backend 策略，而不是继续只追加 rank specialization：
+
+- `fp4_activation_cache_d_lora_down_backend="fused"`：默认路径，直接从 `qact + ascales` 计算 `dA`，不在 backward 物化 dense `x_hat`，用于峰值显存优先。
+- `fp4_activation_cache_d_lora_down_backend="dequant_gemm"`：先用 CUDA dequant fast path 生成 dense `x_hat`，再用 torch GEMM 算 `dA`，用于显存允许时的速度消融。
+
+5090 BF16 复测，`m=in=out=4096, rank=64, warmup=5, iters=15`：
+
+| path | latency ms | note |
+| --- | ---: | --- |
+| saved BF16 `x` dA | 0.0550 | exact gradient, highest saved activation memory |
+| FP4 cache `dequant_gemm` | 0.2142 | fastest FP4-cache backend, transient dense `x_hat` |
+| FP4 cache fused | 0.9916 | lower transient memory, current CUDA reduction still slow |
+
+Correctness gates:
+
+- `validate_native_fp4_lora_training.py --rank 64 --fp4-activation-cache-d-lora-down --fp4-activation-cache-d-lora-down-backend fused` 通过。
+- `validate_native_fp4_lora_training.py --rank 64 --fp4-activation-cache-d-lora-down --fp4-activation-cache-d-lora-down-backend dequant_gemm` 通过。
+- `validate_fp4_lora_training_policies.py --modes memory_saving --steps 2 --fp4-activation-cache-d-lora-down-backend dequant_gemm` 通过。
+
 ## 下一步
 
 - 若继续追求性能，需要把 `dA` 改写成更接近 tensor-core GEMM 的形式，例如分块 dequant 到 shared/register 后做 rank tile MMA，或者显式分离 `qact` dequant staging 与 rank GEMM reduction。

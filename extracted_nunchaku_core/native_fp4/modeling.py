@@ -10,6 +10,7 @@ import torch
 
 from .training import (
     DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    FP4ActivationCacheDLoRADownBackend,
     FrozenResidualInitMode,
     LoRAInitMode,
     NunchakuFP4LoRALinear,
@@ -51,6 +52,7 @@ class FP4LoRAConfig:
     overlap_lora_grad: bool = False
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS
     fp4_activation_cache_d_lora_down: bool = False
+    fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused"
 
 
 @dataclass
@@ -87,6 +89,7 @@ def fp4_lora_finetune_config(
     cache_lora_act: bool = True,
     activation_checkpoint: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
 ) -> FP4LoRAConfig:
     """Return a recommended FP4 LoRA fine-tuning config.
 
@@ -111,6 +114,8 @@ def fp4_lora_finetune_config(
         lowrank_dtype = dtype
     if lowrank_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("lowrank_dtype must be torch.float16 or torch.bfloat16")
+    if fp4_activation_cache_d_lora_down_backend not in ("fused", "dequant_gemm"):
+        raise ValueError("fp4_activation_cache_d_lora_down_backend must be one of: fused, dequant_gemm")
     if overlap_lora_grad_min_rows < 0:
         raise ValueError("overlap_lora_grad_min_rows must be non-negative")
 
@@ -173,6 +178,7 @@ def fp4_lora_finetune_config(
         overlap_lora_grad=overlap_lora_grad,
         overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
     )
 
 
@@ -318,6 +324,9 @@ def convert_linear_to_fp4_lora(
                         overlap_lora_grad=child_cfg.overlap_lora_grad,
                         overlap_lora_grad_min_rows=child_cfg.overlap_lora_grad_min_rows,
                         fp4_activation_cache_d_lora_down=child_cfg.fp4_activation_cache_d_lora_down,
+                        fp4_activation_cache_d_lora_down_backend=(
+                            child_cfg.fp4_activation_cache_d_lora_down_backend
+                        ),
                     )
                     setattr(parent, child_name, fp4_lora)
                     replaced.append(full_name)
@@ -686,6 +695,7 @@ def prepare_fp4_lora_finetuning(
     cache_lora_act: bool = True,
     activation_checkpoint: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
     target_modules: Iterable[str] | None = DEFAULT_FP4_LORA_TARGET_MODULES,
     exclude_modules: Iterable[str] | None = DEFAULT_FP4_LORA_EXCLUDE_MODULES,
     config_overrides: Mapping[str, FP4LoRAConfig] | None = None,
@@ -726,6 +736,7 @@ def prepare_fp4_lora_finetuning(
             cache_lora_act=cache_lora_act,
             activation_checkpoint=activation_checkpoint,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
+            fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
         )
     else:
         train_bias = cfg.train_bias

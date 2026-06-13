@@ -169,6 +169,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--grad-accum-steps", type=int, default=4)
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -269,6 +270,7 @@ def main() -> None:
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
         fp4_activation_cache_d_lora_down=True,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     fp4_cached_fused_dx_cached_pack_reuse_dy_up = None
     fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap = None
@@ -482,6 +484,7 @@ def main() -> None:
             "grad_accum_steps": args.grad_accum_steps,
             "can_reuse_fused_dy_up": can_reuse_fused_dy_up,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "activation_cache_bytes": {
             "saved_x": saved_x_bytes,

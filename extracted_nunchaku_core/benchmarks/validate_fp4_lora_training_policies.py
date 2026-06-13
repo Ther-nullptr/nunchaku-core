@@ -80,16 +80,18 @@ def make_module(
         overlap_lora_grad=cfg.overlap_lora_grad,
         overlap_lora_grad_min_rows=cfg.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=cfg.fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_d_lora_down_backend=cfg.fp4_activation_cache_d_lora_down_backend,
     )
 
 
-def mode_expectations(mode: str, dtype: torch.dtype, lowrank_dtype: torch.dtype) -> dict[str, bool]:
+def mode_expectations(mode: str, dtype: torch.dtype, lowrank_dtype: torch.dtype, backend: str) -> dict[str, Any]:
     fuse_frozen_residual_dx = mode == "throughput" and dtype == torch.float16 and lowrank_dtype == torch.float16
     return {
         "fuse_lora_dx": mode != "accuracy",
         "cache_fused_lora_dx": mode != "accuracy",
         "overlap_lora_grad": mode in ("balanced", "throughput") and not fuse_frozen_residual_dx,
         "fp4_activation_cache_d_lora_down": mode == "memory_saving",
+        "fp4_activation_cache_d_lora_down_backend": backend,
         "fuse_lowrank_forward": mode == "throughput",
         "fuse_frozen_residual_dx": fuse_frozen_residual_dx,
     }
@@ -119,6 +121,7 @@ def run_policy(
         frozen_residual_rank=None if args.frozen_residual_rank is None else args.frozen_residual_rank,
         train_bias=args.train_bias,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     module = make_module(cfg, weight=weight, bias=bias).train()
     if cfg.cache_fused_lora_dx:
@@ -168,12 +171,13 @@ def run_policy(
     expected_trainable = {"lora_down", "lora_up"}
     if cfg.train_bias:
         expected_trainable.add("bias")
-    expected_flags = mode_expectations(mode, dtype, lowrank_dtype)
+    expected_flags = mode_expectations(mode, dtype, lowrank_dtype, args.fp4_activation_cache_d_lora_down_backend)
     actual_flags = {
         "fuse_lora_dx": module.fuse_lora_dx,
         "cache_fused_lora_dx": module.cache_fused_lora_dx,
         "overlap_lora_grad": module.overlap_lora_grad,
         "fp4_activation_cache_d_lora_down": module.fp4_activation_cache_d_lora_down,
+        "fp4_activation_cache_d_lora_down_backend": module.fp4_activation_cache_d_lora_down_backend,
         "fuse_lowrank_forward": module.fuse_lowrank_forward,
         "fuse_frozen_residual_dx": module.fuse_frozen_residual_dx,
     }
@@ -236,6 +240,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-bias", action="store_true")
     p.add_argument("--no-frozen-residual", action="store_true")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -271,6 +276,7 @@ def main() -> None:
             "no_frozen_residual": args.no_frozen_residual,
             "train_bias": args.train_bias,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "steps": args.steps,
         },
         "policies": {record["mode"]: record for record in records},

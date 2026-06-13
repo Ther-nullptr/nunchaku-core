@@ -441,12 +441,12 @@ FP4 activation-cache `dA` 接入训练接口后的 BF16 短测，`fuse_lora_dx=T
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
 - `fuse_lowrank_forward=True` 是 dual-branch opt-in 实验选项：把 task LoRA forward 和 frozen residual forward 合成一次拼接 low-rank GEMM。它减少 launch/GEMM 次数，但会改变低秩分支的浮点归约顺序；验证脚本会 strict 检查当前调度，并额外用 `5e-4` rel_l2 tolerance 报告它相对“两支分开计算”公式的差异。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
-- `fp4_activation_cache_d_lora_down=True` 是显存/近似训练模式：forward 保存主分支已有的 `qact + ascales` 而不是 BF16/FP16 `x`，backward 用 `fp4_activation_cache_lora_down_grad` 计算 `dA`。它要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
+- `fp4_activation_cache_d_lora_down=True` 是显存/近似训练模式：forward 保存主分支已有的 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 是默认值，直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 backward 临时物化 dense `x_hat`；`"dequant_gemm"` 会先反量化出 dense `x_hat` 再走 torch GEMM，通常更快但有额外 transient 显存。该模式要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 FP16-only 实验选项：复用 fused dX quantize kernel 产生的 packed `dY @ B`，decode 后用于 `dA = (dY @ B).T @ X`，避免额外 dense `dY @ B` matmul。
 - `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`，用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM；exact overlap 支持 frozen residual branch，但 residual dX 保持 dense 计算。
 - `overlap_lora_grad_min_rows=4096` 是默认 auto gate：小于该 flattened row 数时自动回落到 sequential cached fused-dX 路径，避免 2048 形状上多 stream 调度变慢；传 `--overlap-lora-grad-min-rows 0` 可强制 always-overlap 做消融。
 - BF16 下 `overlap_lora_grad=True` 仍保留 dense `dY @ B` 计算 `dA`，不复用 packed 近似中间量；`fuse_frozen_residual_dx=True` 仍不用于 BF16。
-- BF16 下 `fp4_activation_cache_d_lora_down=True` 可省 saved `x` 约 `3.56x`，但 `dA` 相对 exact saved-x 约 `1e-1` rel_l2，且当前 fused dA kernel 仍慢；4096 train step 只有 exact cached-pack 的约 `0.72x`。它是显存压力模式，不是默认性能模式。
+- BF16 下 `fp4_activation_cache_d_lora_down=True` 可省 saved `x` 约 `3.56x`，但 `dA` 相对 exact saved-x 约 `1e-1` rel_l2，且当前 fused dA kernel 仍慢；4096 train step 只有 exact cached-pack 的约 `0.72x`。它是显存压力模式，不是默认性能模式；如果显存允许临时 dense `x_hat`，可把 backend 切到 `"dequant_gemm"` 做速度消融。
 - FP16 下如果同时打开 `reuse_fused_dy_up_for_d_lora_down=True`，`overlap_lora_grad=True` 会复用 decoded packed `dY @ B`，这是更快但有小量 `dA` 误差的实验路径。
 - reuse-based overlap 目前不支持 frozen residual branch；如果需要 dual-branch 训练，使用默认 exact overlap。
 - `activation_checkpoint=True` 是逐 `NunchakuFP4LoRALinear` 的局部 checkpoint，只能省该算子内部的 `lora_act` 等 saved tensors；真正要省多层输入 activation，应在 transformer block/segment 外层用 `torch.utils.checkpoint`。
@@ -675,7 +675,18 @@ load_fp4_lora_peft_state_dict(model, peft_state)
 | `accuracy` | 精度优先 / 调试 | `full_svd` 初始化，LoRA dX 走 dense BF16/FP16，关闭 overlap |
 | `balanced` | 默认推荐 | `svd_lowrank`，fused cached LoRA dX，exact `dA/dB`，大 batch 自动 overlap |
 | `throughput` | 速度消融 | 在 `balanced` 基础上打开 fused low-rank forward；FP16 会自动 fused frozen-residual dX 并关闭 overlap |
-| `memory_saving` | 显存压力模式 | fused cached LoRA dX，但用 FP4 activation cache 计算近似 `dA`，自动关闭 overlap |
+| `memory_saving` | 显存压力模式 | fused cached LoRA dX，但用 FP4 activation cache 计算近似 `dA`，默认 fused `dA` backend，自动关闭 overlap |
+
+`memory_saving` 的 `dA` backend 可显式选择：
+
+```python
+cfg = fp4_lora_finetune_config(
+    mode="memory_saving",
+    fp4_activation_cache_d_lora_down_backend="dequant_gemm",  # 或默认 "fused"
+)
+```
+
+选择原则：`"fused"` 不物化 dense `x_hat`，峰值显存更低；`"dequant_gemm"` 会临时物化 `x_hat`，但当前在 5090 上通常比 fused 原型更快。
 
 验证这些预设是否能实际跑 forward/backward/optimizer step：
 
@@ -940,6 +951,8 @@ python benchmarks/benchmark_fp4_lora_activation_cache_policy.py \
 - `latency_ms.fp4_cache_dequant_only`
 - `latency_ms.fp4_cache_dequant_plus_d_lora_down`
 - `latency_ms.fp4_cache_fused_d_lora_down`
+- `implementation.module_default_fp4_activation_cache_d_lora_down_backend`
+- `implementation.fastest_measured_fp4_activation_cache_d_lora_down_backend`
 - `implementation.fp4_cache_fused_d_lora_down`
 - `errors.d_lora_down_fp4_cache_vs_saved_x`
 - `errors.d_lora_down_fp4_cache_fused_vs_dequant_gemm`
@@ -973,7 +986,7 @@ RTX 5090 BF16 短测：
 - 但 `dA` 直接用 FP4-dequant `x_hat` 会引入约 `1e-1` rel_l2 的 LoRA A 梯度误差，不适合作为默认精度路径。
 - naive `dequant -> dense x_hat -> GEMM` 需要在 backward 重新物化 dense `x_hat`，4096 形状比直接用 saved BF16 `x` 慢约 `5.1x`。
 - 已加入 `fp4_activation_cache_lora_down_grad` fused CUDA 原型，避免 dense `x_hat` 中间张量；rank<=32 使用 `kVec=3,rVec=16`，rank<=512 使用 `kVec=3,rVec=32,threads=128`，rank>512 回落 `kVec=2,rVec=16`。tile sweep 中 rank32 的 4096 fused `dA` 从约 `0.391ms` 降到 `0.346ms`，约 `1.13x`；rank64 从约 `1.50ms` 降到 `0.99ms`，约 `1.52x`；rank128 从约 `3.34ms` 降到 `1.86ms`，约 `1.79x`；rank256 从约 `5.72ms` 降到 `3.68ms`，约 `1.55x`；rank512 从约 `11.54ms` 降到 `7.23ms`，约 `1.60x`；候选记录见 [docs/fp4_kernel_research_notes.md](/home/wyj24/projects/nunchaku/extracted_nunchaku_core/docs/fp4_kernel_research_notes.md)。
-- 这个 fused 原型仍慢于 `dequant + GEMM`，4096 形状约 `0.58x`，说明后续要继续优化 decode staging/reduction 或改成 tensor-core 友好的分块，而不是直接把该原型设为默认性能路径。
+- 这个 fused 原型仍慢于 `dequant + GEMM`。本轮 5090 复测 4096/rank64：saved-x `dA` `0.0550ms`，`dequant_gemm` `0.2142ms`，fused `0.9916ms`；`implementation.fastest_measured_fp4_activation_cache_d_lora_down_backend="dequant_gemm"`。后续要继续优化 decode staging/reduction 或改成 tensor-core 友好的分块。
 - 精度上 fused 原型对齐的是 `dequant(qact, ascales)` 近似路径，不解决 FP4 activation cache 本身带来的约 `1e-1` `dA` 误差。因此它仍应作为显存模式或近似训练消融，而非默认精度路径。
 
 训练接口接入后的实际 autograd saved tensor 测量：
@@ -990,9 +1003,12 @@ python benchmarks/benchmark_fp4_lora_saved_tensors.py \
   --iters 10
 ```
 
+可选加 `--fp4-activation-cache-d-lora-down-backend dequant_gemm` 测“临时物化 dense `x_hat` + GEMM”的训练 wrapper 开销；默认 `fused` 测最低 transient memory 路径。
+
 输出：
 
 - `results/latest_fp4_lora_saved_tensors.json`
+- `shape.fp4_activation_cache_d_lora_down_backend`
 - `saved_tensors.exact_cached_pack`
 - `saved_tensors.fp4_activation_cache_d_lora_down`
 - `saved_bytes.activation_context_reduction`
@@ -1095,13 +1111,13 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
 - `native_fp4.NunchakuFP4LowRankBackwardDXOp`
   - backward 混合算子和 full backward 多种路径
 - `native_fp4.NunchakuFP4LoRALinear`
-  - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口；支持 opt-in `fp4_activation_cache_d_lora_down` 显存/近似训练模式
+  - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口；支持 opt-in `fp4_activation_cache_d_lora_down` 显存/近似训练模式，并可通过 `fp4_activation_cache_d_lora_down_backend` 选择 `fused` 或 `dequant_gemm`
 - `native_fp4.dequantize_fp4_activation`
   - 反解 native `qact/ascales` activation layout；`return_scales=False` 时走 CUDA fast path，供 FP4 activation cache 消融和后续 fused `dA` kernel 使用
 - `native_fp4.fp4_activation_cache_lora_down_grad`
   - 直接从 native FP4 activation cache 计算 LoRA `dA` 的 fused CUDA 原型；rank<=32 使用 `kVec=3,rVec=16` fast path，rank<=512 使用 `kVec=3,rVec=32,threads=128` fast path，rank>512 回落 `kVec=2,rVec=16`；用于显存/近似训练消融，当前不建议默认开启
 - `native_fp4.FP4LoRAConfig`
-  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`fp4_activation_cache_d_lora_down` 和 FP16-only `fuse_frozen_residual_dx`
+  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`fp4_activation_cache_d_lora_down`、`fp4_activation_cache_d_lora_down_backend` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.fp4_lora_config_overrides_from_outlier_report`

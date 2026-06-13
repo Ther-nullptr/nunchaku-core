@@ -13,6 +13,7 @@ torch::Tensor fp4_repack_backward_cuda(
     torch::Tensor bwd_scales_logical);
 void decode_lora_act_cuda(torch::Tensor packed_lora_act, torch::Tensor dense_lora_act);
 torch::Tensor pack_lowrank_weight_cuda(torch::Tensor weight, bool down);
+void dequantize_fp4_activation_cuda(torch::Tensor qact, torch::Tensor ascales, torch::Tensor output);
 
 void gemm_w4a4(
     std::optional<torch::Tensor> act,
@@ -187,6 +188,28 @@ torch::Tensor pack_lowrank_weight(torch::Tensor weight, bool down) {
     return pack_lowrank_weight_cuda(weight, down);
 }
 
+void dequantize_fp4_activation(torch::Tensor qact, torch::Tensor ascales, torch::Tensor output) {
+    TORCH_CHECK(qact.is_cuda(), "qact must be a CUDA tensor");
+    TORCH_CHECK(qact.is_contiguous(), "qact must be contiguous");
+    TORCH_CHECK(qact.dim() == 2, "qact must be 2D [M_pad, K_pad / 2]");
+    TORCH_CHECK(qact.scalar_type() == torch::kUInt8, "qact dtype must be uint8");
+
+    TORCH_CHECK(ascales.is_cuda(), "ascales must be a CUDA tensor");
+    TORCH_CHECK(ascales.is_contiguous(), "ascales must be contiguous");
+    TORCH_CHECK(ascales.dim() == 2, "ascales must be 2D [K_pad / 16, M_pad] logical storage");
+    TORCH_CHECK(ascales.scalar_type() == torch::kFloat8_e4m3fn, "ascales dtype must be float8_e4m3fn");
+
+    TORCH_CHECK(output.is_cuda(), "output must be a CUDA tensor");
+    TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(output.dim() == 2, "output must be 2D [M_pad, K_pad]");
+    TORCH_CHECK(
+        output.scalar_type() == torch::kHalf || output.scalar_type() == torch::kBFloat16 ||
+            output.scalar_type() == torch::kFloat,
+        "output dtype must be float16, bfloat16, or float32");
+
+    dequantize_fp4_activation_cuda(qact, ascales, output);
+}
+
 } // namespace nunchaku_core::ops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -196,4 +219,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp4_repack_backward", nunchaku_core::ops::fp4_repack_backward);
     m.def("decode_lora_act", nunchaku_core::ops::decode_lora_act);
     m.def("pack_lowrank_weight", nunchaku_core::ops::pack_lowrank_weight);
+    m.def("dequantize_fp4_activation", nunchaku_core::ops::dequantize_fp4_activation);
 }

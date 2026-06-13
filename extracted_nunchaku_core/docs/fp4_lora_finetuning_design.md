@@ -365,6 +365,7 @@ P4：加入 activation cache policy：
 
 - `save_bf16`：保存 BF16 `x` 和 `lora_act`，速度优先。
 - `recompute_lora_act`：只保存 `x`，少存一个 `[M, rank]`。
+- `save_fp4_cache`：保存 forward FP4 主分支已经生成的 `qact + ascales`，不保存 BF16/FP16 `x`。这能显著省 activation cache，但 `dA=(dY@B).T@x` 会变成近似梯度，且 naive dequant 会在 backward 重新物化 dense `x_hat`。
 - `checkpoint`：进一步重算上游 activation，面向长序列微调。实测逐 Linear checkpoint 只省内部 `lora_act`，收益很小；应按 transformer block/segment 做 checkpoint。
 
 RTX 5090 短测，`benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --warmup 5 --iters 10`：
@@ -377,6 +378,24 @@ RTX 5090 短测，`benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hid
 | stack/block | silu | 1.6642 | 7.6% | 推荐作为长序列/多层微调的显存模式，按 block 粒度打开 |
 
 正确性：`module` 和 `stack` checkpoint 的 forward、`dX`、首尾 LoRA A/B 梯度与 no-checkpoint reference 均为 `rel_l2=0`。
+
+`save_fp4_cache` 消融已落地：
+
+- 新增 `native_fp4.layout.dequantize_fp4_activation(qact, ascales, return_scales=False)`；CUDA kernel 直接按 Nunchaku `uint4` activation layout 和 FP8 scale layout 反量化，和 Torch fallback 对齐到 `rel_l2=0`。
+- 新增 `benchmark_fp4_lora_activation_cache_policy.py`，比较 saved BF16/FP16 `x` 与 FP4 activation cache 对 `dA` 的显存、速度和精度影响。
+
+RTX 5090 BF16 短测：
+
+| shape | saved x cache | FP4 cache | memory reduction | x_hat rel_l2 | dA rel_l2 | saved-x dA ms | FP4 dequant+dA ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0279 | 0.0681 |
+| 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0391 | 0.1993 |
+
+结论：
+
+- FP4 cache 的显存收益明确，`qact + ascales` 约为 saved BF16/FP16 `x` 的 `28.1%`。
+- 直接用 FP4-dequant activation 计算 `dA` 会带来约 `1e-1` rel_l2 梯度误差；如果要保持 LoRA 梯度精确，默认仍应使用 `save_bf16` 或重算 `x` 来源。
+- 当前 naive CUDA dequant 仍要物化 dense `x_hat`，4096 形状比 saved-x `dA` 慢约 `5.1x`。下一步应写 fused `dequant(qact, ascales) + dA` 小 rank CUDA kernel，避免中间张量；即便 fused 后，它也应作为显存/近似训练模式，而非默认精度路径。
 
 P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该 packed residual dX 路径误差偏大，默认仍保留 residual dense dX。BF16 exact overlap 支持 dual-branch，但 residual dX 保持 dense side stream。
 

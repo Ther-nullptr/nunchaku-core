@@ -802,6 +802,52 @@ RTX 5090 短测，`batch=512, hidden=1024, layers=4, rank=32, BF16, fused dX cac
 
 正确性：`module` 和 `stack` checkpoint 的 forward、`dX`、首尾 LoRA A/B 梯度与 no-checkpoint reference 均为 `rel_l2=0`。
 
+## 10.9 FP4 LoRA activation cache policy 消融
+
+如果你想判断“能不能不保存 BF16/FP16 `x`，改存 forward 已有的 FP4 activation cache”，跑：
+
+```bash
+python benchmarks/benchmark_fp4_lora_activation_cache_policy.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 10 \
+  --iters 30
+```
+
+输出：
+
+- `results/latest_fp4_lora_activation_cache_policy.json`
+- `cache_bytes.fp4_qact_plus_fp8_ascales_padded`
+- `derived.fp4_cache_reduction_vs_unpadded_x`
+- `latency_ms.fp4_cache_dequant_only`
+- `latency_ms.fp4_cache_dequant_plus_d_lora_down`
+- `errors.d_lora_down_fp4_cache_vs_saved_x`
+
+这个脚本复用 native forward quantize 生成的 `qact/ascales`，再用新增 CUDA kernel `dequantize_fp4_activation` 还原 dense `x_hat`，并比较：
+
+```text
+dA_ref       = (dY @ B).T @ x
+dA_fp4_cache = (dY @ B).T @ dequant(qact, ascales)
+```
+
+RTX 5090 BF16 短测：
+
+| shape | saved x cache | FP4 cache | memory reduction | x_hat rel_l2 | dA rel_l2 | saved-x dA ms | FP4 dequant+dA ms | result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0279 | 0.0681 | `0.41x`，慢于 saved-x |
+| 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0391 | 0.1993 | `0.20x`，慢于 saved-x |
+
+当前结论：
+
+- `qact + ascales` 的缓存体积是 BF16/FP16 `x` 的约 `28.1%`，理论显存节省明确。
+- 但 `dA` 直接用 FP4-dequant `x_hat` 会引入约 `1e-1` rel_l2 的 LoRA A 梯度误差，不适合作为默认精度路径。
+- naive `dequant -> dense x_hat -> GEMM` 需要在 backward 重新物化 dense `x_hat`，4096 形状比直接用 saved BF16 `x` 慢约 `5.1x`。
+- 这个路径的合理下一步不是默认启用，而是写 fused `dequant(qact, ascales) + dA` 小 rank CUDA kernel，避免 dense `x_hat` 中间张量；精度上仍应作为显存模式或近似训练模式。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -824,6 +870,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --intermediate-activation silu --warmup 5 --iters 10
+python benchmarks/benchmark_fp4_lora_activation_cache_policy.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30 --fuse-lowrank-forward
@@ -881,6 +928,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - backward 混合算子和 full backward 多种路径
 - `native_fp4.NunchakuFP4LoRALinear`
   - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口
+- `native_fp4.dequantize_fp4_activation`
+  - 反解 native `qact/ascales` activation layout；`return_scales=False` 时走 CUDA fast path，供 FP4 activation cache 消融和后续 fused `dA` kernel 使用
 - `native_fp4.FP4LoRAConfig`
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`activation_checkpoint` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`
@@ -936,6 +985,10 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - FP4 LoRA activation / grad-output outlier 诊断和 rank/smooth 建议
 - `latest_fp4_lora_outlier_override_overhead.json`
   - outlier-driven `config_overrides` 相对 base config 的 train-step 开销
+- `latest_fp4_lora_activation_checkpoint.json`
+  - activation checkpoint 显存/速度消融
+- `latest_fp4_lora_activation_cache_policy.json`
+  - FP4 activation cache 替代 saved BF16/FP16 `x` 的显存、速度和 `dA` 精度消融
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

@@ -3,8 +3,13 @@ from __future__ import annotations
 import torch
 
 
+BLOCK_M = 256
+WARP_M = 32
 WARP_N = 128
 WARP_K = 64
+WARP_M_TILES = 2
+NUM_WARPS = 8
+WARP_SIZE = 32
 FP4_GROUP_SIZE = 16
 FP4_QMAX = 6.0
 
@@ -191,6 +196,129 @@ def dequantize_fp4_weight(
     lut = FP4_LUT.to(device=qweight.device, dtype=dtype)
     weight = lut[codes.long()] * logical_scales.to(dtype).repeat_interleave(FP4_GROUP_SIZE, dim=1)
     return weight, logical_scales
+
+
+def unpack_fp4_activation_codes(qact: torch.Tensor) -> torch.Tensor:
+    _require_2d("qact", qact)
+    if qact.dtype != torch.uint8:
+        raise ValueError(f"qact must be uint8, got {qact.dtype}")
+
+    rows, packed_cols = qact.shape
+    cols = packed_cols * 2
+    if rows % BLOCK_M != 0:
+        raise ValueError(f"qact rows must be divisible by {BLOCK_M}, got {rows}")
+    if cols % WARP_K != 0:
+        raise ValueError(f"qact cols must be divisible by {WARP_K}, got {cols}")
+
+    m_blocks = rows // BLOCK_M
+    k_tiles = cols // WARP_K
+    raw = qact.contiguous().view(
+        m_blocks,
+        k_tiles,
+        NUM_WARPS,
+        WARP_M_TILES,
+        WARP_SIZE,
+        16,
+    )
+    tiled = torch.empty(
+        m_blocks,
+        NUM_WARPS,
+        WARP_M_TILES,
+        16,
+        k_tiles,
+        WARP_K,
+        dtype=torch.uint8,
+        device=qact.device,
+    )
+
+    for row_high in range(2):
+        for row_low in range(8):
+            logical_row = row_high * 8 + row_low
+            for frag in range(8):
+                lane = row_low * 4 + (frag % 4)
+                word_offset = 8 if frag >= 4 else 0
+                for pair in range(4):
+                    byte = raw[:, :, :, :, lane, row_high * 4 + word_offset + pair]
+                    col = frag * 8 + pair * 2
+                    tiled[:, :, :, logical_row, :, col].copy_(
+                        torch.bitwise_and(byte, 0x0F).permute(0, 2, 3, 1)
+                    )
+                    tiled[:, :, :, logical_row, :, col + 1].copy_(
+                        torch.bitwise_right_shift(byte, 4).permute(0, 2, 3, 1)
+                    )
+
+    return tiled.contiguous().view(rows, cols)
+
+
+def unpack_fp4_activation_scales(packed_ascales: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    _require_2d("packed_ascales", packed_ascales)
+    if packed_ascales.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"packed_ascales must be float8_e4m3fn, got {packed_ascales.dtype}")
+    if rows % BLOCK_M != 0:
+        raise ValueError(f"rows must be divisible by {BLOCK_M}, got {rows}")
+    if cols % WARP_K != 0:
+        raise ValueError(f"cols must be divisible by {WARP_K}, got {cols}")
+    if packed_ascales.numel() != rows * cols // FP4_GROUP_SIZE:
+        raise ValueError(
+            "packed_ascales numel mismatch: "
+            f"expected {rows * cols // FP4_GROUP_SIZE}, got {packed_ascales.numel()}"
+        )
+
+    m_blocks = rows // BLOCK_M
+    k_tiles = cols // WARP_K
+    raw = packed_ascales.contiguous().view(m_blocks, k_tiles, NUM_WARPS, WARP_SIZE, 4)
+    tiled = torch.empty(
+        m_blocks,
+        NUM_WARPS,
+        WARP_M_TILES,
+        16,
+        k_tiles,
+        WARP_K // FP4_GROUP_SIZE,
+        dtype=torch.float8_e4m3fn,
+        device=packed_ascales.device,
+    )
+
+    for tile_m in range(WARP_M_TILES):
+        for row_high in range(2):
+            for row_low in range(8):
+                lane = row_low * 4 + tile_m * 2 + row_high
+                logical_row = row_high * 8 + row_low
+                for group in range(WARP_K // FP4_GROUP_SIZE):
+                    scale = raw[:, :, :, lane, group]
+                    tiled[:, :, tile_m, logical_row, :, group].copy_(scale.permute(0, 2, 1))
+
+    return tiled.contiguous().view(rows, cols // FP4_GROUP_SIZE).to(torch.float32)
+
+
+def dequantize_fp4_activation(
+    qact: torch.Tensor,
+    packed_ascales: torch.Tensor,
+    dtype: torch.dtype = torch.float16,
+    return_scales: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("dtype must be float16, bfloat16, or float32")
+
+    rows, packed_cols = qact.shape
+    cols = packed_cols * 2
+    if qact.is_cuda:
+        try:
+            from nunchaku_core import _fp4_native_cuda as ops
+        except Exception:
+            ops = None
+        if ops is not None and hasattr(ops, "dequantize_fp4_activation"):
+            activation = torch.empty(rows, cols, dtype=dtype, device=qact.device)
+            ops.dequantize_fp4_activation(qact.contiguous(), packed_ascales.contiguous(), activation)
+            if not return_scales:
+                return activation, None
+            scales = unpack_fp4_activation_scales(packed_ascales, rows=rows, cols=cols)
+            return activation, scales
+
+    codes = unpack_fp4_activation_codes(qact)
+    scales = unpack_fp4_activation_scales(packed_ascales, rows=rows, cols=cols)
+    lut = FP4_LUT.to(device=qact.device, dtype=dtype)
+    activation = lut[codes.long()] * scales.to(dtype).repeat_interleave(FP4_GROUP_SIZE, dim=1)
+    return activation, scales if return_scales else None
 
 
 def build_backward_scales_from_forward_quant(

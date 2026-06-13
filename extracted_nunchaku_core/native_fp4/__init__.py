@@ -5,6 +5,7 @@ from .operators import (
     NunchakuFP4LowRankOp,
     NunchakuFP4LowRankUnfusedOp,
 )
+from .layout import dequantize_fp4_activation, unpack_fp4_activation_codes, unpack_fp4_activation_scales
 from .modeling import (
     FP4LoRAConfig,
     FP4LoRACacheRefreshHook,
@@ -47,4 +48,7 @@ __all__ = [
     "load_fp4_lora_state_dict",
     "register_fp4_lora_cache_refresh_hook",
     "refresh_fused_lora_dx_caches",
+    "dequantize_fp4_activation",
+    "unpack_fp4_activation_codes",
+    "unpack_fp4_activation_scales",
 ]

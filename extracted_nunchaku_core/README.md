@@ -610,16 +610,20 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
-python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 5 --iters 10
+python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
+python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype fp16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```
 
-RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 5 --iters 10`：
+RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 10 --iters 30`：
 
-| path | train step ms | note |
-| --- | ---: | --- |
-| task LoRA fused + residual dense dX | 0.3480 | FP16 dual-branch baseline |
-| task LoRA + residual fused dX | 0.3038 | `1.146x` vs dense residual dX, `dX` rel_l2 `3.81e-4` |
+| path | dtype | train step ms | note |
+| --- | --- | ---: | --- |
+| task LoRA only, fused dX | bf16 | 0.2586 | task-only reference |
+| dual branch, residual dense dX | bf16 | 0.3367 | `1.302x` overhead vs task-only；BF16 fused residual dX 暂不启用 |
+| task LoRA only, fused dX | fp16 | 0.2575 | task-only reference |
+| dual branch, residual dense dX | fp16 | 0.3046 | `1.183x` overhead vs task-only |
+| dual branch, residual fused dX | fp16 | 0.2765 | `1.101x` vs residual dense dX，`dX` rel_l2 `3.80e-4` |
 
 ## 12. 主要 Python 接口
 
@@ -676,7 +680,9 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
   - FP4 LoRA training wrapper correctness
 - `latest_native_fp4_lora_training.json`
   - FP4 LoRA training benchmark
-- `latest_native_fp4_lora_dual_branch.json`
+- `latest_native_fp4_lora_dual_branch_bf16.json`
+  - dual-branch BF16 residual dense dX benchmark
+- `latest_native_fp4_lora_dual_branch_fp16.json`
   - dual-branch FP16 fused residual dX benchmark
 - `latest_native_fp4_lora_modeling_validation.json`
   - 模型级 Linear 替换、参数冻结和 cache 管理验证

@@ -306,12 +306,15 @@ P4：加入 activation cache policy：
 
 P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该路径误差偏大，默认仍保留 residual dense dX。
 
-RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 5 --iters 10`：
+RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 10 --iters 30`：
 
-| path | train step ms | result |
-| --- | ---: | --- |
-| task LoRA fused + residual dense dX | 0.3480 | baseline |
-| task LoRA + residual fused dX | 0.3038 | `1.146x`, `dX` rel_l2 `3.81e-4` |
+| path | dtype | train step ms | result |
+| --- | --- | ---: | --- |
+| task LoRA only, fused dX | bf16 | 0.2586 | task-only reference |
+| dual branch, residual dense dX | bf16 | 0.3367 | `1.302x` overhead vs task-only；BF16 fused residual dX 暂不启用 |
+| task LoRA only, fused dX | fp16 | 0.2575 | task-only reference |
+| dual branch, residual dense dX | fp16 | 0.3046 | `1.183x` overhead vs task-only |
+| dual branch, residual fused dX | fp16 | 0.2765 | `1.101x` vs residual dense dX，`dX` rel_l2 `3.80e-4` |
 
 P6：加入 outlier-aware FP4 训练策略：
 

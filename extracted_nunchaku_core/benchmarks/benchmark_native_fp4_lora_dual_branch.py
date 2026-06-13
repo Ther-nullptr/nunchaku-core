@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-features", type=int, default=2048)
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--frozen-residual-rank", type=int, default=32)
+    p.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--seed", type=int, default=0)
@@ -86,14 +87,25 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     torch.manual_seed(args.seed)
 
-    dtype = torch.float16
-    lowrank_dtype = torch.float16
-    x_dense = torch.randn(args.m, args.in_features, device="cuda", dtype=dtype, requires_grad=True)
+    dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    lowrank_dtype = dtype
+    x_task = torch.randn(args.m, args.in_features, device="cuda", dtype=dtype, requires_grad=True)
+    x_dense = x_task.detach().clone().requires_grad_(True)
     x_fused = x_dense.detach().clone().requires_grad_(True)
     dy = torch.randn(args.m, args.out_features, device="cuda", dtype=dtype)
     weight = torch.randn(args.out_features, args.in_features, device="cuda", dtype=dtype)
     bias = torch.randn(args.out_features, device="cuda", dtype=dtype)
 
+    task_only = NunchakuFP4LoRALinear(
+        weight=weight,
+        bias=bias,
+        rank=args.rank,
+        lowrank_dtype=lowrank_dtype,
+        init="gaussian",
+        cache_lora_act=True,
+        fuse_lora_dx=True,
+        cache_fused_lora_dx=True,
+    )
     dense_residual_dx = NunchakuFP4LoRALinear(
         weight=weight,
         bias=bias,
@@ -107,46 +119,58 @@ def main() -> None:
         fuse_frozen_residual_dx=False,
         cache_fused_lora_dx=True,
     )
-    fused_residual_dx = NunchakuFP4LoRALinear(
-        weight=weight,
-        bias=bias,
-        rank=args.rank,
-        lowrank_dtype=lowrank_dtype,
-        init="gaussian",
-        frozen_residual_rank=args.frozen_residual_rank,
-        frozen_residual_init="residual_svd",
-        cache_lora_act=True,
-        fuse_lora_dx=True,
-        fuse_frozen_residual_dx=True,
-        cache_fused_lora_dx=True,
-    )
+    fused_residual_dx = None
+    if dtype == torch.float16:
+        fused_residual_dx = NunchakuFP4LoRALinear(
+            weight=weight,
+            bias=bias,
+            rank=args.rank,
+            lowrank_dtype=lowrank_dtype,
+            init="gaussian",
+            frozen_residual_rank=args.frozen_residual_rank,
+            frozen_residual_init="residual_svd",
+            cache_lora_act=True,
+            fuse_lora_dx=True,
+            fuse_frozen_residual_dx=True,
+            cache_fused_lora_dx=True,
+        )
     with torch.no_grad():
-        fused_residual_dx.lora_down.copy_(dense_residual_dx.lora_down)
-        fused_residual_dx.lora_up.copy_(dense_residual_dx.lora_up)
-        fused_residual_dx.frozen_residual_down.copy_(dense_residual_dx.frozen_residual_down)
-        fused_residual_dx.frozen_residual_up.copy_(dense_residual_dx.frozen_residual_up)
+        task_only.lora_down.copy_(dense_residual_dx.lora_down)
+        task_only.lora_up.copy_(dense_residual_dx.lora_up)
+        if fused_residual_dx is not None:
+            fused_residual_dx.lora_down.copy_(dense_residual_dx.lora_down)
+            fused_residual_dx.lora_up.copy_(dense_residual_dx.lora_up)
+            fused_residual_dx.frozen_residual_down.copy_(dense_residual_dx.frozen_residual_down)
+            fused_residual_dx.frozen_residual_up.copy_(dense_residual_dx.frozen_residual_up)
 
+    task_only.refresh_fused_lora_dx_cache()
     dense_residual_dx.refresh_fused_lora_dx_cache()
-    fused_residual_dx.refresh_fused_lora_dx_cache()
+    if fused_residual_dx is not None:
+        fused_residual_dx.refresh_fused_lora_dx_cache()
 
-    y_dense = dense_residual_dx(x_dense)
-    loss_dense = (y_dense.float() * dy.float()).sum()
-    loss_dense.backward()
-    y_fused = fused_residual_dx(x_fused)
-    loss_fused = (y_fused.float() * dy.float()).sum()
-    loss_fused.backward()
+    errors = None
+    if fused_residual_dx is not None:
+        y_dense = dense_residual_dx(x_dense)
+        loss_dense = (y_dense.float() * dy.float()).sum()
+        loss_dense.backward()
+        y_fused = fused_residual_dx(x_fused)
+        loss_fused = (y_fused.float() * dy.float()).sum()
+        loss_fused.backward()
 
-    errors = {
-        "forward": tensor_error(y_fused, y_dense),
-        "dx": tensor_error(x_fused.grad, x_dense.grad),
-        "lora_down_grad": tensor_error(fused_residual_dx.lora_down.grad, dense_residual_dx.lora_down.grad),
-        "lora_up_grad": tensor_error(fused_residual_dx.lora_up.grad, dense_residual_dx.lora_up.grad),
-    }
-    zero_grads(dense_residual_dx, x_dense)
-    zero_grads(fused_residual_dx, x_fused)
+        errors = {
+            "forward": tensor_error(y_fused, y_dense),
+            "dx": tensor_error(x_fused.grad, x_dense.grad),
+            "lora_down_grad": tensor_error(fused_residual_dx.lora_down.grad, dense_residual_dx.lora_down.grad),
+            "lora_up_grad": tensor_error(fused_residual_dx.lora_up.grad, dense_residual_dx.lora_up.grad),
+        }
+        zero_grads(dense_residual_dx, x_dense)
+        zero_grads(fused_residual_dx, x_fused)
 
+    task_only_train_step_ms = train_step_ms(task_only, x_task, dy, args.warmup, args.iters)
     dense_residual_dx_train_step_ms = train_step_ms(dense_residual_dx, x_dense, dy, args.warmup, args.iters)
-    fused_residual_dx_train_step_ms = train_step_ms(fused_residual_dx, x_fused, dy, args.warmup, args.iters)
+    fused_residual_dx_train_step_ms = None
+    if fused_residual_dx is not None:
+        fused_residual_dx_train_step_ms = train_step_ms(fused_residual_dx, x_fused, dy, args.warmup, args.iters)
 
     payload = {
         "shape": {
@@ -157,32 +181,45 @@ def main() -> None:
             "effective_rank": dense_residual_dx.rank,
             "frozen_residual_rank": args.frozen_residual_rank,
             "effective_frozen_residual_rank": dense_residual_dx.frozen_residual_rank,
-            "dtype": "fp16",
-            "lowrank_dtype": "fp16",
+            "dtype": args.dtype,
+            "lowrank_dtype": args.dtype,
+            "fused_residual_dx_available": fused_residual_dx is not None,
         },
         "latency_ms": {
+            "task_only_fused_dx_train_step": task_only_train_step_ms,
             "dual_branch_dense_residual_dx_train_step": dense_residual_dx_train_step_ms,
             "dual_branch_fused_residual_dx_train_step": fused_residual_dx_train_step_ms,
         },
         "speedups": {
+            "dual_dense_residual_dx_over_task_only_fused_dx_train_step": (
+                dense_residual_dx_train_step_ms / task_only_train_step_ms
+            ),
             "fused_residual_dx_vs_dense_residual_dx_train_step": (
-                dense_residual_dx_train_step_ms / fused_residual_dx_train_step_ms
+                None
+                if fused_residual_dx_train_step_ms is None
+                else dense_residual_dx_train_step_ms / fused_residual_dx_train_step_ms
             ),
         },
         "errors": errors,
-        "checks": {
-            "forward_rel_l2_lt_1e-6": errors["forward"]["rel_l2"] < 1e-6,
-            "dx_rel_l2_lt_5e-4": errors["dx"]["rel_l2"] < 5e-4,
-            "lora_down_grad_rel_l2_lt_1e-6": errors["lora_down_grad"]["rel_l2"] < 1e-6,
-            "lora_up_grad_rel_l2_lt_1e-6": errors["lora_up_grad"]["rel_l2"] < 1e-6,
-        },
+        "checks": {},
     }
+    if errors is None:
+        payload["checks"]["fused_residual_dx_unavailable_for_bf16"] = args.dtype == "bf16"
+    else:
+        payload["checks"].update(
+            {
+                "forward_rel_l2_lt_1e-6": errors["forward"]["rel_l2"] < 1e-6,
+                "dx_rel_l2_lt_5e-4": errors["dx"]["rel_l2"] < 5e-4,
+                "lora_down_grad_rel_l2_lt_1e-6": errors["lora_down_grad"]["rel_l2"] < 1e-6,
+                "lora_up_grad_rel_l2_lt_1e-6": errors["lora_up_grad"]["rel_l2"] < 1e-6,
+            }
+        )
     payload["all_passed"] = bool(all(payload["checks"].values()))
 
     os.makedirs(args.results_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(args.results_dir, f"native_fp4_lora_dual_branch_{stamp}.json")
-    latest_path = os.path.join(args.results_dir, "latest_native_fp4_lora_dual_branch.json")
+    out_path = os.path.join(args.results_dir, f"native_fp4_lora_dual_branch_{args.dtype}_{stamp}.json")
+    latest_path = os.path.join(args.results_dir, f"latest_native_fp4_lora_dual_branch_{args.dtype}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     with open(latest_path, "w", encoding="utf-8") as f:

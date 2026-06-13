@@ -40,6 +40,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         frozen_residual_scaling: float,
         lowrank_dtype: torch.dtype,
         cache_lora_act: bool,
+        fuse_lowrank_forward: bool,
         fuse_lora_dx: bool,
         fuse_frozen_residual_dx: bool,
         reuse_fused_dy_up_for_d_lora_down: bool,
@@ -55,13 +56,29 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         has_frozen_residual = frozen_residual_down.numel() > 0 and frozen_residual_up.numel() > 0
 
         y_main = fp4_forward_op(x)
-        lora_act = torch.matmul(x_lr, down_lr.t())
-        lora_out = torch.matmul(lora_act, up_lr.t()).mul(float(scaling)).to(y_main.dtype)
-        y = y_main + lora_out.reshape(*x.shape[:-1], fp4_forward_op.out_features)
-        if has_frozen_residual:
-            residual_act = torch.matmul(x_lr, frozen_residual_down.to(lowrank_dtype).t())
-            residual_out = torch.matmul(residual_act, frozen_residual_up.to(lowrank_dtype).t())
-            y = y + residual_out.mul(float(frozen_residual_scaling)).to(y_main.dtype).reshape_as(y_main)
+        if has_frozen_residual and fuse_lowrank_forward:
+            residual_down_lr = frozen_residual_down.to(lowrank_dtype)
+            residual_up_lr = frozen_residual_up.to(lowrank_dtype)
+            combined_down = torch.cat((down_lr, residual_down_lr), dim=0)
+            combined_up = torch.cat(
+                (
+                    up_lr.mul(float(scaling)),
+                    residual_up_lr.mul(float(frozen_residual_scaling)),
+                ),
+                dim=1,
+            )
+            combined_act = torch.matmul(x_lr, combined_down.t())
+            lora_act = combined_act[:, : lora_down.shape[0]]
+            lowrank_out = torch.matmul(combined_act, combined_up.t()).to(y_main.dtype)
+        else:
+            lora_act = torch.matmul(x_lr, down_lr.t())
+            lora_out = torch.matmul(lora_act, up_lr.t()).mul(float(scaling)).to(y_main.dtype)
+            lowrank_out = lora_out
+            if has_frozen_residual:
+                residual_act = torch.matmul(x_lr, frozen_residual_down.to(lowrank_dtype).t())
+                residual_out = torch.matmul(residual_act, frozen_residual_up.to(lowrank_dtype).t())
+                lowrank_out = lowrank_out + residual_out.mul(float(frozen_residual_scaling)).to(y_main.dtype)
+        y = y_main + lowrank_out.reshape(*x.shape[:-1], fp4_forward_op.out_features)
         if bias is not None:
             y = y + bias.to(y.dtype)
 
@@ -75,6 +92,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.frozen_residual_scaling = float(frozen_residual_scaling)
         ctx.lowrank_dtype = lowrank_dtype
         ctx.cache_lora_act = bool(cache_lora_act)
+        ctx.fuse_lowrank_forward = bool(fuse_lowrank_forward)
         ctx.fuse_lora_dx = bool(fuse_lora_dx)
         ctx.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
         ctx.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
@@ -150,6 +168,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             None,
             None,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -293,6 +312,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         frozen_residual_init: FrozenResidualInitMode = "none",
         train_bias: bool = False,
         cache_lora_act: bool = True,
+        fuse_lowrank_forward: bool = False,
         fuse_lora_dx: bool = False,
         fuse_frozen_residual_dx: bool = False,
         cache_fused_lora_dx: bool = False,
@@ -342,6 +362,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.scaling = self.lora_alpha / float(self.rank)
         self.frozen_residual_scaling = 1.0
         self.cache_lora_act = bool(cache_lora_act)
+        self.fuse_lowrank_forward = bool(fuse_lowrank_forward)
         self.fuse_lora_dx = bool(fuse_lora_dx)
         self.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
         self.cache_fused_lora_dx = bool(cache_fused_lora_dx)
@@ -411,6 +432,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         init: LoRAInitMode = "zero",
         train_bias: bool = False,
         cache_lora_act: bool = True,
+        fuse_lowrank_forward: bool = False,
         fuse_lora_dx: bool = False,
         fuse_frozen_residual_dx: bool = False,
         cache_fused_lora_dx: bool = False,
@@ -429,6 +451,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             frozen_residual_init=frozen_residual_init,
             train_bias=train_bias,
             cache_lora_act=cache_lora_act,
+            fuse_lowrank_forward=fuse_lowrank_forward,
             fuse_lora_dx=fuse_lora_dx,
             fuse_frozen_residual_dx=fuse_frozen_residual_dx,
             cache_fused_lora_dx=cache_fused_lora_dx,
@@ -567,6 +590,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.frozen_residual_scaling,
             self.lowrank_dtype,
             self.cache_lora_act,
+            self.fuse_lowrank_forward,
             self.fuse_lora_dx,
             self.fuse_frozen_residual_dx,
             self.reuse_fused_dy_up_for_d_lora_down,
@@ -590,7 +614,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"frozen_residual_rank={self.frozen_residual_rank}, "
             f"lowrank_dtype={self.lowrank_dtype}, init={self.init_mode}, "
             f"frozen_residual_init={self.frozen_residual_init}, "
-            f"cache_lora_act={self.cache_lora_act}, fuse_lora_dx={self.fuse_lora_dx}, "
+            f"cache_lora_act={self.cache_lora_act}, fuse_lowrank_forward={self.fuse_lowrank_forward}, "
+            f"fuse_lora_dx={self.fuse_lora_dx}, "
             f"fuse_frozen_residual_dx={self.fuse_frozen_residual_dx}, "
             f"cache_fused_lora_dx={self.cache_fused_lora_dx}, "
             f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}"

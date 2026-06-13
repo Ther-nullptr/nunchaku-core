@@ -21,6 +21,7 @@ class FP4LoRAConfig:
     frozen_residual_init: FrozenResidualInitMode = "none"
     train_bias: bool = False
     cache_lora_act: bool = True
+    fuse_lowrank_forward: bool = False
     fuse_lora_dx: bool = False
     fuse_frozen_residual_dx: bool = False
     cache_fused_lora_dx: bool = False
@@ -157,6 +158,7 @@ def convert_linear_to_fp4_lora(
                         frozen_residual_init=child_cfg.frozen_residual_init,
                         train_bias=child_cfg.train_bias,
                         cache_lora_act=child_cfg.cache_lora_act,
+                        fuse_lowrank_forward=child_cfg.fuse_lowrank_forward,
                         fuse_lora_dx=child_cfg.fuse_lora_dx,
                         fuse_frozen_residual_dx=child_cfg.fuse_frozen_residual_dx,
                         cache_fused_lora_dx=child_cfg.cache_fused_lora_dx,

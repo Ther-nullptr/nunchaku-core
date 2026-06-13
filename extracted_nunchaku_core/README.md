@@ -425,6 +425,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 
 - `backward estimate = train_step - train_graph_forward`，用于判断 backward 优化方向，不是单独 CUDA event 包住 backward 的精确拆分。
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
+- `fuse_lowrank_forward=True` 是 dual-branch opt-in 实验选项：把 task LoRA forward 和 frozen residual forward 合成一次拼接 low-rank GEMM。它减少 launch/GEMM 次数，但会改变低秩分支的浮点归约顺序；验证脚本会 strict 检查当前调度，并额外用 `5e-4` rel_l2 tolerance 报告它相对“两支分开计算”公式的差异。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 FP16-only 实验选项：复用 fused dX quantize kernel 产生的 packed `dY @ B`，decode 后用于 `dA = (dY @ B).T @ X`，避免额外 dense `dY @ B` matmul。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 训练 step 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
@@ -535,6 +536,8 @@ cfg = FP4LoRAConfig(
     init="zero",
     frozen_residual_rank=32,
     frozen_residual_init="residual_svd",
+    # Optional: fuse task LoRA + frozen residual forward low-rank GEMMs.
+    fuse_lowrank_forward=False,
     fuse_lora_dx=True,
     # FP16-only experimental: fuse frozen residual dX into the same epilogue.
     fuse_frozen_residual_dx=False,
@@ -619,6 +622,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 - `config_overrides` 路径：验证 `layers.1.down_proj` 可独立覆盖 rank/init，第二个模型 strict load 同样按该策略构造。
 - PEFT adapter 路径：验证 `lora_A/lora_B` exact round-trip；`trim_to_requested_rank=True` 会按 requested rank 导出，加载时 padded tail 清零。
 - dual-branch 路径：`frozen_residual_*` 是 frozen buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
+- `fuse_lowrank_forward=True` 可用于测试 forward 低秩分支合并收益；它只改变 low-rank forward 的调度和归约顺序，不改变默认数学公式。
 - FP16 下可打开 `fuse_frozen_residual_dx=True`，把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 下该路径目前误差偏大，默认关闭。
 
 ## 10.6 FP4 LoRA activation / grad outlier 诊断
@@ -698,6 +702,7 @@ python benchmarks/validate_native_fp4_backward.py --m 256 --in-features 4096 --o
 python benchmarks/benchmark_native_fp4_backward.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype fp16 --warmup 10 --iters 20
 python benchmarks/validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
+python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fuse-lowrank-forward
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
@@ -705,6 +710,7 @@ python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidde
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
+python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30 --fuse-lowrank-forward
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype fp16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_training_breakdown.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 ```
@@ -718,6 +724,19 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
 | task LoRA only, fused dX | fp16 | 0.2575 | task-only reference |
 | dual branch, residual dense dX | fp16 | 0.3046 | `1.183x` overhead vs task-only |
 | dual branch, residual fused dX | fp16 | 0.2765 | `1.101x` vs residual dense dX，`dX` rel_l2 `3.80e-4` |
+
+`fuse_lowrank_forward=True` 消融，RTX 5090 同形状 `warmup=10,iters=30`：
+
+| path | dtype | train step ms | result |
+| --- | --- | ---: | --- |
+| dual branch, residual dense dX | bf16 | 0.3122 | default reference |
+| dual branch, residual dense dX + fused lowrank forward | bf16 | 0.3092 | `1.010x` vs default dual，接近噪声 |
+| dual branch, residual dense dX | fp16 | 0.2999 | default reference |
+| dual branch, residual dense dX + fused lowrank forward | fp16 | 0.3400 | slower，`0.882x` vs default dual |
+| dual branch, residual fused dX | fp16 | 0.2791 | default fused dX reference |
+| dual branch, residual fused dX + fused lowrank forward | fp16 | 0.2797 | essentially tied，`0.998x` vs default fused dX |
+
+结论：当前 fused low-rank forward 只作为消融保留，不建议默认打开。它减少了一次低秩 branch 的 matmul/launch，但拼接 rank 后的 GEMM 形状不一定更优，训练 step 收益在 BF16 下接近噪声，在 FP16 dense residual dX 路径反而变慢。
 
 ## 12. 主要 Python 接口
 

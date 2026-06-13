@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--frozen-residual-rank", type=int, default=32)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
+    p.add_argument("--fuse-lowrank-forward", action="store_true")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--seed", type=int, default=0)
@@ -103,6 +104,7 @@ def main() -> None:
         lowrank_dtype=lowrank_dtype,
         init="gaussian",
         cache_lora_act=True,
+        fuse_lowrank_forward=args.fuse_lowrank_forward,
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
     )
@@ -115,6 +117,7 @@ def main() -> None:
         frozen_residual_rank=args.frozen_residual_rank,
         frozen_residual_init="residual_svd",
         cache_lora_act=True,
+        fuse_lowrank_forward=args.fuse_lowrank_forward,
         fuse_lora_dx=True,
         fuse_frozen_residual_dx=False,
         cache_fused_lora_dx=True,
@@ -130,6 +133,7 @@ def main() -> None:
             frozen_residual_rank=args.frozen_residual_rank,
             frozen_residual_init="residual_svd",
             cache_lora_act=True,
+            fuse_lowrank_forward=args.fuse_lowrank_forward,
             fuse_lora_dx=True,
             fuse_frozen_residual_dx=True,
             cache_fused_lora_dx=True,
@@ -183,6 +187,7 @@ def main() -> None:
             "effective_frozen_residual_rank": dense_residual_dx.frozen_residual_rank,
             "dtype": args.dtype,
             "lowrank_dtype": args.dtype,
+            "fuse_lowrank_forward": args.fuse_lowrank_forward,
             "fused_residual_dx_available": fused_residual_dx is not None,
         },
         "latency_ms": {
@@ -208,7 +213,8 @@ def main() -> None:
     else:
         payload["checks"].update(
             {
-                "forward_rel_l2_lt_1e-6": errors["forward"]["rel_l2"] < 1e-6,
+                "forward_rel_l2_lt_tol": errors["forward"]["rel_l2"]
+                < (5e-4 if args.fuse_lowrank_forward else 1e-6),
                 "dx_rel_l2_lt_5e-4": errors["dx"]["rel_l2"] < 5e-4,
                 "lora_down_grad_rel_l2_lt_1e-6": errors["lora_down_grad"]["rel_l2"] < 1e-6,
                 "lora_up_grad_rel_l2_lt_1e-6": errors["lora_up_grad"]["rel_l2"] < 1e-6,

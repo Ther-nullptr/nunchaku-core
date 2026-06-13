@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-cache-lora-act", action="store_true")
+    p.add_argument("--fuse-lowrank-forward", action="store_true")
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--fuse-frozen-residual-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
@@ -70,6 +71,7 @@ def main() -> None:
         frozen_residual_init=args.frozen_residual_init,
         train_bias=True,
         cache_lora_act=not args.no_cache_lora_act,
+        fuse_lowrank_forward=args.fuse_lowrank_forward,
         fuse_lora_dx=args.fuse_lora_dx,
         fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
@@ -107,7 +109,8 @@ def main() -> None:
         y_main = op.fp4_forward(x.detach())
         lora_act = torch.matmul(x_lr, down_lr.t())
         y_lora = torch.matmul(lora_act, up_lr.t()).mul(op.scaling).to(dtype)
-        y_ref = y_main + y_lora.reshape_as(y_main)
+        lowrank_out = y_lora
+        separate_lowrank_out = None
 
         dy_up = torch.matmul(dy_lr, up_lr)
         dx_ref = op.fp4_backward(dy) + torch.matmul(dy_up, down_lr).mul(op.scaling).reshape_as(x).to(dtype)
@@ -116,11 +119,31 @@ def main() -> None:
             residual_up_lr = op.frozen_residual_up.detach().to(lowrank_dtype)
             residual_act = torch.matmul(x_lr, residual_down_lr.t())
             y_residual = torch.matmul(residual_act, residual_up_lr.t()).mul(op.frozen_residual_scaling)
-            y_ref = y_ref + y_residual.reshape_as(y_main).to(dtype)
+            separate_lowrank_out = y_lora + y_residual.to(dtype)
+            if args.fuse_lowrank_forward:
+                combined_down = torch.cat((down_lr, residual_down_lr), dim=0)
+                combined_up = torch.cat(
+                    (
+                        up_lr.mul(float(op.scaling)),
+                        residual_up_lr.mul(float(op.frozen_residual_scaling)),
+                    ),
+                    dim=1,
+                )
+                combined_act = torch.matmul(x_lr, combined_down.t())
+                lora_act = combined_act[:, : op.rank]
+                lowrank_out = torch.matmul(combined_act, combined_up.t()).to(dtype)
+            else:
+                lowrank_out = separate_lowrank_out
             dy_residual_up = torch.matmul(dy_lr, residual_up_lr)
             dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(op.frozen_residual_scaling)
             dx_ref = dx_ref + dx_residual.reshape_as(x).to(dtype)
+        y_ref = y_main + lowrank_out.reshape_as(y_main)
+        separate_y_ref = None
+        if separate_lowrank_out is not None:
+            separate_y_ref = y_main + separate_lowrank_out.reshape_as(y_main)
         y_ref = y_ref + op.bias.detach().to(dtype)
+        if separate_y_ref is not None:
+            separate_y_ref = separate_y_ref + op.bias.detach().to(dtype)
         d_up_ref = torch.matmul(dy_lr.t(), lora_act).mul(op.scaling).to(op.lora_up.dtype)
         d_down_ref = torch.matmul(dy_up.t(), x_lr).mul(op.scaling).to(op.lora_down.dtype)
         d_bias_ref = dy2d.sum(dim=0).to(op.bias.dtype)
@@ -132,9 +155,12 @@ def main() -> None:
         "lora_down_grad_vs_manual": tensor_error(op.lora_down.grad, d_down_ref),
         "bias_grad_vs_manual": tensor_error(op.bias.grad, d_bias_ref),
     }
+    if args.fuse_lowrank_forward and separate_y_ref is not None:
+        errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
     grad_tol = 5e-4 if args.fuse_lora_dx else 1e-6
+    forward_tol = 1e-6
     checks = {
-        "forward_rel_l2_lt_1e-6": errors["forward_vs_manual"]["rel_l2"] < 1e-6,
+        "forward_rel_l2_lt_1e-6": errors["forward_vs_manual"]["rel_l2"] < forward_tol,
         "dx_rel_l2_lt_5e-4": errors["dx_vs_manual"]["rel_l2"] < 5e-4,
         "lora_up_grad_rel_l2_lt_1e-6": errors["lora_up_grad_vs_manual"]["rel_l2"] < 1e-6,
         "lora_down_grad_rel_l2_lt_tol": errors["lora_down_grad_vs_manual"]["rel_l2"] < grad_tol,
@@ -152,6 +178,10 @@ def main() -> None:
         ),
         "cache_refresh_after_param_update": cache_refresh_check,
     }
+    if "forward_vs_separate_lowrank_manual" in errors:
+        checks["fused_forward_separate_formula_rel_l2_lt_5e-4"] = (
+            errors["forward_vs_separate_lowrank_manual"]["rel_l2"] < 5e-4
+        )
 
     payload = {
         "shape": {
@@ -167,10 +197,16 @@ def main() -> None:
             "lowrank_dtype": args.lowrank_dtype,
             "init": args.init,
             "cache_lora_act": not args.no_cache_lora_act,
+            "fuse_lowrank_forward": args.fuse_lowrank_forward,
             "fuse_lora_dx": args.fuse_lora_dx,
             "fuse_frozen_residual_dx": args.fuse_frozen_residual_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
+        },
+        "tolerances": {
+            "forward_rel_l2": forward_tol,
+            "fused_forward_separate_formula_rel_l2": 5e-4,
+            "lora_down_grad_rel_l2": grad_tol,
         },
         "errors": errors,
         "checks": checks,

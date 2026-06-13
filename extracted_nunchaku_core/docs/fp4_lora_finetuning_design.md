@@ -206,6 +206,7 @@ optimizer 边界：
   - `0/"none"`：只使用 trainable task LoRA。
   - `rank/"residual_svd"`：额外构造 frozen residual branch，推荐与 `init="zero"` 搭配，避免训练破坏量化补偿。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
+- `fuse_lowrank_forward`：dual-branch opt-in 实验选项，把 task LoRA forward 与 frozen residual forward 合成一次拼接 low-rank GEMM；减少 launch/GEMM 次数，但会改变浮点归约顺序。验证脚本 strict 检查当前调度，并额外报告相对“两支分开计算”公式的 rel_l2；默认关闭。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
 - `target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
 
@@ -340,6 +341,8 @@ P4：加入 activation cache policy：
 
 P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该路径误差偏大，默认仍保留 residual dense dX。
 
+P5.1：`fuse_lowrank_forward=True` 已作为 opt-in forward 消融路径加入。该路径把 `x @ A.T @ B.T` 与 `x @ R_down.T @ R_up.T` 拼成一次 low-rank GEMM，预期降低 dual-branch forward overhead；由于归约顺序不同，验证脚本对当前调度保持严格 `1e-6`，同时用 `5e-4` rel_l2 tolerance 报告相对“两支分开计算”公式的差异。
+
 RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --warmup 10 --iters 30`：
 
 | path | dtype | train step ms | result |
@@ -349,6 +352,19 @@ RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-featur
 | task LoRA only, fused dX | fp16 | 0.2575 | task-only reference |
 | dual branch, residual dense dX | fp16 | 0.3046 | `1.183x` overhead vs task-only |
 | dual branch, residual fused dX | fp16 | 0.2765 | `1.101x` vs residual dense dX，`dX` rel_l2 `3.80e-4` |
+
+`fuse_lowrank_forward=True` 消融，RTX 5090 同形状 `warmup=10,iters=30`：
+
+| path | dtype | train step ms | result |
+| --- | --- | ---: | --- |
+| dual branch, residual dense dX | bf16 | 0.3122 | default reference |
+| dual branch, residual dense dX + fused lowrank forward | bf16 | 0.3092 | `1.010x` vs default dual，接近噪声 |
+| dual branch, residual dense dX | fp16 | 0.2999 | default reference |
+| dual branch, residual dense dX + fused lowrank forward | fp16 | 0.3400 | slower，`0.882x` vs default dual |
+| dual branch, residual fused dX | fp16 | 0.2791 | default fused dX reference |
+| dual branch, residual fused dX + fused lowrank forward | fp16 | 0.2797 | essentially tied，`0.998x` vs default fused dX |
+
+因此当前不把 `fuse_lowrank_forward` 设为默认。它的价值主要是量化 dual-branch forward 合并的上限；实际训练 step 的瓶颈仍更偏向 dX 主路径和 residual dX 融合。
 
 P6：加入 outlier-aware FP4 训练策略：
 

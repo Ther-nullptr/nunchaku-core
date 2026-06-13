@@ -148,6 +148,13 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                     in_features=ctx.in_features,
                     out_features=ctx.out_features,
                     packed_lora_dx=ctx.packed_lora_dx,
+                    frozen_residual_down=frozen_residual_down
+                    if ctx.has_frozen_residual and not ctx.fuse_frozen_residual_dx
+                    else None,
+                    frozen_residual_up=frozen_residual_up
+                    if ctx.has_frozen_residual and not ctx.fuse_frozen_residual_dx
+                    else None,
+                    frozen_residual_scaling=ctx.frozen_residual_scaling,
                 )
             d_bias = dy2d.sum(dim=0).to(grad_output.dtype) if ctx.has_bias else None
             return (
@@ -361,11 +368,20 @@ def _fused_lora_backward_overlap_exact(
     in_features: int,
     out_features: int,
     packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
+    frozen_residual_down: torch.Tensor | None = None,
+    frozen_residual_up: torch.Tensor | None = None,
+    frozen_residual_scaling: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if packed_lora_dx is None:
         raise ValueError("overlap_lora_grad requires cached packed LoRA dX factors")
     if not dy.is_cuda:
         raise ValueError("overlap_lora_grad requires CUDA tensors")
+    has_frozen_residual = (
+        frozen_residual_down is not None
+        and frozen_residual_up is not None
+        and frozen_residual_down.numel() > 0
+        and frozen_residual_up.numel() > 0
+    )
 
     orig_shape = dy.shape
     dy2d_src = dy.reshape(-1, out_features)
@@ -382,6 +398,7 @@ def _fused_lora_backward_overlap_exact(
     dx_stream = torch.cuda.Stream(device=dy.device)
     up_stream = torch.cuda.Stream(device=dy.device)
     down_stream = torch.cuda.Stream(device=dy.device)
+    residual_stream = torch.cuda.Stream(device=dy.device) if has_frozen_residual else None
     repack_done = torch.cuda.Event()
     quant_done = torch.cuda.Event()
 
@@ -400,6 +417,14 @@ def _fused_lora_backward_overlap_exact(
         dy_up = torch.matmul(dy2d_src.to(lowrank_dtype), lora_up.to(lowrank_dtype))
         d_lora_down = torch.matmul(dy_up.t(), x2d.to(lowrank_dtype))
         d_lora_down = d_lora_down.mul(float(scaling)).to(lora_down.dtype)
+
+    if residual_stream is not None:
+        residual_stream.wait_stream(current_stream)
+        with torch.cuda.stream(residual_stream):
+            residual_down_lr = frozen_residual_down.to(lowrank_dtype)
+            residual_up_lr = frozen_residual_up.to(lowrank_dtype)
+            dy_residual_up = torch.matmul(dy2d_src.to(lowrank_dtype), residual_up_lr)
+            dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(float(frozen_residual_scaling))
 
     qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
         dy2d,
@@ -424,8 +449,12 @@ def _fused_lora_backward_overlap_exact(
     current_stream.wait_stream(up_stream)
     current_stream.wait_stream(down_stream)
     current_stream.wait_stream(dx_stream)
+    if residual_stream is not None:
+        current_stream.wait_stream(residual_stream)
 
     dx = dx_pad[: dy2d_src.shape[0], :in_features].reshape(*orig_shape[:-1], in_features)
+    if has_frozen_residual:
+        dx = dx.to(dx_residual.dtype) + dx_residual.reshape(*orig_shape[:-1], in_features)
     return dx, d_lora_down, d_lora_up
 
 
@@ -579,8 +608,12 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("overlap_lora_grad requires fuse_lora_dx=True")
         if overlap_lora_grad and not cache_fused_lora_dx:
             raise ValueError("overlap_lora_grad requires cache_fused_lora_dx=True")
-        if overlap_lora_grad and frozen_residual_init != "none":
-            raise ValueError("overlap_lora_grad does not currently support frozen residual branches")
+        if overlap_lora_grad and reuse_fused_dy_up_for_d_lora_down and frozen_residual_init != "none":
+            raise ValueError(
+                "reuse-based overlap_lora_grad does not currently support frozen residual branches"
+            )
+        if overlap_lora_grad and fuse_frozen_residual_dx:
+            raise ValueError("exact overlap_lora_grad expects frozen residual dX to stay dense")
 
         self.out_features, self.in_features = weight.shape
         self.rank = max(16, ceil_divide(rank, 16) * 16)

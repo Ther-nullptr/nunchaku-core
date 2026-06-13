@@ -45,6 +45,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         fuse_lora_dx: bool,
         fuse_frozen_residual_dx: bool,
         reuse_fused_dy_up_for_d_lora_down: bool,
+        overlap_lora_grad: bool,
         packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         if x.shape[-1] != fp4_forward_op.in_features:
@@ -97,6 +98,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.fuse_lora_dx = bool(fuse_lora_dx)
         ctx.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
         ctx.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
+        ctx.overlap_lora_grad = bool(overlap_lora_grad)
         ctx.packed_lora_dx = packed_lora_dx
         ctx.has_frozen_residual = bool(has_frozen_residual)
         ctx.has_bias = bias is not None
@@ -111,6 +113,49 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
 
         x2d = x.reshape(-1, ctx.in_features)
         dy2d = dy.reshape(-1, ctx.out_features)
+
+        if ctx.overlap_lora_grad:
+            if ctx.cache_lora_act:
+                lora_act = saved_lora_act
+            else:
+                x_lr_for_act = x2d.to(ctx.lowrank_dtype)
+                down_lr_for_act = lora_down.to(ctx.lowrank_dtype)
+                lora_act = torch.matmul(x_lr_for_act, down_lr_for_act.t())
+            dx, d_lora_down, d_lora_up = _fused_lora_backward_overlap(
+                dy=dy,
+                x2d=x2d,
+                lora_act=lora_act,
+                lora_down=lora_down,
+                lora_up=lora_up,
+                fp4_backward_op=ctx.fp4_backward_op,
+                scaling=ctx.scaling,
+                lowrank_dtype=ctx.lowrank_dtype,
+                in_features=ctx.in_features,
+                out_features=ctx.out_features,
+                packed_lora_dx=ctx.packed_lora_dx,
+            )
+            d_bias = dy2d.sum(dim=0).to(grad_output.dtype) if ctx.has_bias else None
+            return (
+                dx.to(x.dtype),
+                d_lora_down,
+                d_lora_up,
+                None,
+                None,
+                d_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
         x_lr = x2d.to(ctx.lowrank_dtype)
         dy_lr = dy2d.to(ctx.lowrank_dtype)
         down_lr = lora_down.to(ctx.lowrank_dtype)
@@ -169,6 +214,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             None,
             None,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -288,6 +334,86 @@ def _fused_lora_dx(
     return dx, dy_up
 
 
+def _fused_lora_backward_overlap(
+    dy: torch.Tensor,
+    x2d: torch.Tensor,
+    lora_act: torch.Tensor,
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
+    fp4_backward_op: NunchakuFP4BackwardDXOp,
+    scaling: float,
+    lowrank_dtype: torch.dtype,
+    in_features: int,
+    out_features: int,
+    packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if packed_lora_dx is None:
+        raise ValueError("overlap_lora_grad requires cached packed LoRA dX factors")
+    if not dy.is_cuda:
+        raise ValueError("overlap_lora_grad requires CUDA tensors")
+
+    orig_shape = dy.shape
+    dy2d_src = dy.reshape(-1, out_features)
+    dy2d = dy2d_src
+    if fp4_backward_op.n_pad != out_features:
+        dy2d = pad_tensor(dy2d, divisor=fp4_backward_op.n_pad, dim=1)
+
+    lora_down_bwd_packed, lora_up_bwd_packed = packed_lora_dx
+    packed_rank = lora_down_bwd_packed.shape[1]
+    lora_scales = [1.0] * ceil_divide(packed_rank, 16)
+
+    current_stream = torch.cuda.current_stream(device=dy.device)
+    repack_stream = torch.cuda.Stream(device=dy.device)
+    dx_stream = torch.cuda.Stream(device=dy.device)
+    up_stream = torch.cuda.Stream(device=dy.device)
+    down_stream = torch.cuda.Stream(device=dy.device)
+    repack_done = torch.cuda.Event()
+    quant_done = torch.cuda.Event()
+
+    repack_stream.wait_stream(current_stream)
+    with torch.cuda.stream(repack_stream):
+        qweight_bwd = fp4_backward_op.repack_qweight_for_backward()
+        repack_done.record(repack_stream)
+
+    up_stream.wait_stream(current_stream)
+    with torch.cuda.stream(up_stream):
+        d_lora_up = torch.matmul(dy2d_src.to(lowrank_dtype).t(), lora_act.to(lowrank_dtype))
+        d_lora_up = d_lora_up.mul(float(scaling)).to(lora_up.dtype)
+
+    qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
+        dy2d,
+        lora_down_packed=lora_down_bwd_packed,
+        smooth=fp4_backward_op.smooth_bwd,
+        pad_size=256,
+    )
+    quant_done.record(current_stream)
+
+    with torch.cuda.stream(down_stream):
+        down_stream.wait_event(quant_done)
+        dense_dy_up = decode_lora_act(packed_dy_up, lowrank_dtype)[: dy2d_src.shape[0], : lora_down.shape[0]]
+        d_lora_down = torch.matmul(dense_dy_up.t(), x2d.to(lowrank_dtype))
+        d_lora_down = d_lora_down.mul(float(scaling)).to(lora_down.dtype)
+
+    with torch.cuda.stream(dx_stream):
+        dx_stream.wait_event(quant_done)
+        dx_stream.wait_event(repack_done)
+        dx_pad = fp4_backward_op.backward_prequantized(
+            qdy,
+            ascales,
+            qweight_bwd,
+            lora_act=packed_dy_up,
+            lora_up=lora_up_bwd_packed,
+            lora_scales=lora_scales,
+        )
+
+    current_stream.wait_stream(up_stream)
+    current_stream.wait_stream(down_stream)
+    current_stream.wait_stream(dx_stream)
+
+    dx = dx_pad[: dy2d_src.shape[0], :in_features].reshape(*orig_shape[:-1], in_features)
+    return dx, d_lora_down, d_lora_up
+
+
 class NunchakuFP4LoRALinear(torch.nn.Module):
     """Trainable LoRA wrapper over a frozen native FP4 backbone.
 
@@ -319,6 +445,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         fuse_frozen_residual_dx: bool = False,
         cache_fused_lora_dx: bool = False,
         reuse_fused_dy_up_for_d_lora_down: bool = False,
+        overlap_lora_grad: bool = False,
     ):
         super().__init__()
         if not weight.is_cuda:
@@ -353,6 +480,12 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("reuse_fused_dy_up_for_d_lora_down requires fuse_lora_dx=True")
         if reuse_fused_dy_up_for_d_lora_down and (weight.dtype != torch.float16 or lowrank_dtype != torch.float16):
             raise ValueError("reuse_fused_dy_up_for_d_lora_down is currently only validated for FP16 weight and LoRA")
+        if overlap_lora_grad and not reuse_fused_dy_up_for_d_lora_down:
+            raise ValueError("overlap_lora_grad requires reuse_fused_dy_up_for_d_lora_down=True")
+        if overlap_lora_grad and not cache_fused_lora_dx:
+            raise ValueError("overlap_lora_grad requires cache_fused_lora_dx=True")
+        if overlap_lora_grad and frozen_residual_init != "none":
+            raise ValueError("overlap_lora_grad does not currently support frozen residual branches")
 
         self.out_features, self.in_features = weight.shape
         self.rank = max(16, ceil_divide(rank, 16) * 16)
@@ -370,6 +503,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
         self.cache_fused_lora_dx = bool(cache_fused_lora_dx)
         self.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
+        self.overlap_lora_grad = bool(overlap_lora_grad)
         self.init_mode = init
         self.frozen_residual_init = frozen_residual_init
 
@@ -441,6 +575,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         fuse_frozen_residual_dx: bool = False,
         cache_fused_lora_dx: bool = False,
         reuse_fused_dy_up_for_d_lora_down: bool = False,
+        overlap_lora_grad: bool = False,
         frozen_residual_rank: int = 0,
         frozen_residual_init: FrozenResidualInitMode = "none",
     ) -> "NunchakuFP4LoRALinear":
@@ -461,6 +596,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             fuse_frozen_residual_dx=fuse_frozen_residual_dx,
             cache_fused_lora_dx=cache_fused_lora_dx,
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
+            overlap_lora_grad=overlap_lora_grad,
         )
 
     def clear_fused_lora_dx_cache(self) -> None:
@@ -599,6 +735,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.fuse_lora_dx,
             self.fuse_frozen_residual_dx,
             self.reuse_fused_dy_up_for_d_lora_down,
+            self.overlap_lora_grad,
             self._get_fused_lora_dx_cache(),
         )
 
@@ -629,5 +766,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"fuse_lora_dx={self.fuse_lora_dx}, "
             f"fuse_frozen_residual_dx={self.fuse_frozen_residual_dx}, "
             f"cache_fused_lora_dx={self.cache_fused_lora_dx}, "
-            f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}"
+            f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}, "
+            f"overlap_lora_grad={self.overlap_lora_grad}"
         )

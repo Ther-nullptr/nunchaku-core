@@ -400,10 +400,12 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
 - `speedups.fp4_cached_fused_dx_cached_pack_plus_refresh_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_cached_pack_grad_accum_vs_dense`
 - `speedups.fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_vs_dense`
+- `speedups.fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap_grad_accum_vs_dense`
 - `speedups.fp4_cached_backward_estimate_vs_dense`
 - `speedups.fp4_cached_fused_dx_backward_estimate_vs_dense`
 - `speedups.fused_dx_cached_pack_vs_dynamic_pack_train_step`
 - `speedups.fused_dx_cached_pack_reuse_dy_up_vs_cached_pack_train_step`
+- `speedups.fused_dx_cached_pack_reuse_overlap_vs_reuse_train_step`
 - `speedups.fused_dx_cached_pack_plus_refresh_vs_dynamic_pack_train_step`
 - `speedups.fused_dx_cached_pack_vs_dynamic_pack_grad_accum`
 
@@ -428,6 +430,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - `fuse_lowrank_forward=True` 是 dual-branch opt-in 实验选项：把 task LoRA forward 和 frozen residual forward 合成一次拼接 low-rank GEMM。它减少 launch/GEMM 次数，但会改变低秩分支的浮点归约顺序；验证脚本会 strict 检查当前调度，并额外用 `5e-4` rel_l2 tolerance 报告它相对“两支分开计算”公式的差异。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 FP16-only 实验选项：复用 fused dX quantize kernel 产生的 packed `dY @ B`，decode 后用于 `dA = (dY @ B).T @ X`，避免额外 dense `dY @ B` matmul。
+- `overlap_lora_grad=True` 是 FP16-only 的更激进实验选项：要求同时打开 `fuse_lora_dx=True`、`cache_fused_lora_dx=True` 和 `reuse_fused_dy_up_for_d_lora_down=True`，用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 decoded `dA` GEMM；当前不支持 frozen residual branch。
 - `activation_checkpoint=True` 是逐 `NunchakuFP4LoRALinear` 的局部 checkpoint，只能省该算子内部的 `lora_act` 等 saved tensors；真正要省多层输入 activation，应在 transformer block/segment 外层用 `torch.utils.checkpoint`。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 训练 step 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation 数字对测量顺序更敏感，建议看多轮结果再定默认策略。
@@ -451,6 +454,34 @@ python benchmarks/validate_native_fp4_lora_training.py \
 RTX 5090 上该路径 correctness 通过，`d_lora_down` rel_l2 约 `3.35e-5`。BF16 下同一复用方式会把 `d_lora_down` rel_l2 放大到约 `3.36e-3`，因此构造函数会拒绝 BF16 weight/LoRA 打开此选项。
 
 性能上它是噪声敏感的小优化：FP16 `M=N=K=4096, rank=32` 两次短测中，单步相对 cached-pack 约 `0.968x-1.018x`，gradient accumulation per micro-step 约 `1.016x-1.036x`。建议只在实际训练循环里确认收益后启用。
+
+FP16 overlap 消融：
+
+```bash
+python benchmarks/validate_native_fp4_lora_training.py \
+  --m 257 \
+  --in-features 3072 \
+  --out-features 3584 \
+  --rank 32 \
+  --dtype fp16 \
+  --lowrank-dtype fp16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx \
+  --reuse-fused-dy-up-for-d-lora-down \
+  --overlap-lora-grad
+```
+
+RTX 5090 correctness：`dX` rel_l2 `1.81e-5`，`d_lora_down` rel_l2 `3.36e-5`。
+
+4096/rank32 FP16 短测，`benchmark_native_fp4_lora_training.py --warmup 10 --iters 30 --grad-accum-steps 4`：
+
+| path | train step ms | backward estimate ms | grad accum per micro-step ms | speedup vs dense step |
+| --- | ---: | ---: | ---: | ---: |
+| cached-pack | 0.9221 | 0.5824 | 0.9443 | 1.943x |
+| reuse packed `dY @ B` | 0.8984 | 0.5587 | 0.9296 | 1.994x |
+| reuse + overlap | 0.8909 | 0.5512 | 0.8962 | 2.011x |
+
+当前结论：overlap 单步收益较小，`1.008x` vs reuse；在 4-step gradient accumulation 中收益约 `1.037x` vs reuse。它适合作为真实训练 loop 里的 opt-in latency-smoothing/overlap 选项，不作为默认路径。
 
 ## 10.3 FP4 LoRA training backward breakdown
 

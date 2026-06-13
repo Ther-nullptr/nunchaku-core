@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--fuse-frozen-residual-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
+    p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
+    p.add_argument("--overlap-lora-grad", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -97,6 +99,8 @@ def main() -> None:
         fuse_lora_dx=args.fuse_lora_dx,
         fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        overlap_lora_grad=args.overlap_lora_grad,
     )
     override_rank = 24 if args.rank != 24 else 16
     override_cfg = replace(cfg, rank=override_rank, init="zero")
@@ -350,6 +354,8 @@ def main() -> None:
             "fuse_lora_dx": args.fuse_lora_dx,
             "fuse_frozen_residual_dx": args.fuse_frozen_residual_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
+            "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
+            "overlap_lora_grad": args.overlap_lora_grad,
         },
         "config_overrides": {
             "layers.1.down_proj": {

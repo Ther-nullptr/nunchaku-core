@@ -757,6 +757,38 @@ RTX 5090 BF16 `2048^2, rank32, weight_std=0.02` 短测：
 - `svd_lowrank` 保留了大部分误差收益，同时显著降低 frozen residual 构造开销；适合大模型批量替换时先用作默认。
 - trainable `init="residual_svd"` 如果搭配 `fuse_lora_dx=True`，BF16 下较大的 residual factors 会放大 fused LoRA dX 近似误差；需要精确梯度时用 dense LoRA dX，或采用推荐的 `frozen_residual_init="residual_svd" + init="zero"`。
 
+### 10.5.2 单层微调收敛验证
+
+验证推荐训练形态是否真的可优化：冻结 FP4 backbone 和 frozen `residual_svd` 量化补偿，只训练 zero-init task LoRA。默认 `target_base=fp4_initial`，即 teacher 目标为初始 `FP4 + frozen residual` 输出再叠加一个低秩 task delta；这样不会要求 LoRA 去拟合高秩 FP4 量化误差，验证点集中在 LoRA 梯度、optimizer 和 fused dX cache 路径。
+
+```bash
+python benchmarks/validate_fp4_lora_finetune_convergence.py
+```
+
+输出：
+
+- `results/latest_fp4_lora_finetune_convergence.json`
+- `loss.initial`
+- `loss.final`
+- `loss.final_over_initial`
+- `errors.final_vs_target`
+- `errors.predicted_delta_vs_target_delta_from_initial`
+- `checks.*`
+
+RTX 5090 BF16 默认短测，`m=256, in=512, out=768, rank=32, target_rank=8, steps=80`：
+
+| target base | initial loss | final loss | final / initial | final vs target rel_l2 | fitted delta rel_l2 | checks |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| FP4 initial + teacher low-rank delta | 1.0753e-2 | 2.9362e-6 | 2.7307e-4 | 3.5572e-3 | 1.6525e-2 | pass |
+
+验证项：
+
+- loss 显著下降，默认要求 `final / initial < 0.35`。
+- `lora_down/lora_up` 均发生更新，梯度和 loss 全部 finite。
+- `frozen_residual_down/up` 保持不变，确认 residual branch 是 frozen buffer。
+- 只有 LoRA A/B 可训练；打开 `--train-bias` 时才额外训练 bias。
+- 默认 fused dX cache 的 optimizer post-step refresh hook 会运行。
+
 ## 10.6 FP4 LoRA activation / grad outlier 诊断
 
 如果要把 sensitivity scan 的结论转成 `config_overrides`，先看每个 FP4 LoRA Linear 的输入 activation 和 backward `dY` 通道 outlier：
@@ -965,6 +997,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
+python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --intermediate-activation silu --warmup 5 --iters 10
@@ -1084,6 +1117,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
+- `latest_fp4_lora_finetune_convergence.json`
+  - frozen FP4 backbone + frozen residual_svd + zero-init task LoRA 的单层微调 loss 收敛验证
 - `latest_fp4_lora_activation_grad_outliers.json`
   - FP4 LoRA activation / grad-output outlier 诊断和 rank/smooth 建议
 - `latest_fp4_lora_outlier_override_overhead.json`

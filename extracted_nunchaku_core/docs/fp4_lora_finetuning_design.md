@@ -304,6 +304,14 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 | trainable residual_svd LoRA | svd_lowrank | 1.4013 | 1.026x | 0.0720 | 0.2654 |
 | frozen residual_svd + zero LoRA | svd_lowrank | 1.4013 | 1.026x | 0.0042 | 0.3188 |
 
+单层微调收敛验证，RTX 5090 BF16，`validate_fp4_lora_finetune_convergence.py` 默认配置：
+
+| target base | initial loss | final loss | final / initial | final vs target rel_l2 | fitted delta rel_l2 | checks |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| FP4 initial + teacher low-rank delta | 1.0753e-2 | 2.9362e-6 | 2.7307e-4 | 3.5572e-3 | 1.6525e-2 | pass |
+
+这个实验对应 personal-vault 中的“单层微调 loss 收敛曲线”待办。默认 `target_base=fp4_initial`，目标是初始 `FP4 + frozen residual` 输出加 teacher low-rank delta，避免把高秩量化误差混进 task LoRA 的低秩拟合目标。验证通过项包括 loss 显著下降、LoRA A/B 参数发生更新、梯度 finite、frozen residual buffer 不变、只有预期参数可训练，以及 fused dX cache 的 optimizer post-step refresh hook 已运行。
+
 ## 后续优化路线
 
 ### Breakdown 证据
@@ -569,6 +577,8 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
   --fuse-lora-dx \
   --fuse-frozen-residual-dx \
   --cache-fused-lora-dx
+
+conda run -n triton python benchmarks/validate_fp4_lora_finetune_convergence.py
 ```
 
 验证项：

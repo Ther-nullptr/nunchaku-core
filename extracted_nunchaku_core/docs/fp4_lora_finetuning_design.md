@@ -106,6 +106,7 @@ from native_fp4 import (
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_finetune_config,
+    prepare_fp4_lora_finetuning,
 )
 
 cfg = fp4_lora_finetune_config(
@@ -129,13 +130,15 @@ auto_overrides = fp4_lora_config_overrides_from_outlier_report(
 )
 sensitive_overrides.update(auto_overrides)
 
-model, replaced = convert_linear_to_fp4_lora(
+prepared = prepare_fp4_lora_finetuning(
     model.cuda().to(torch.bfloat16),
-    cfg,
+    config=cfg,
     target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
     config_overrides=sensitive_overrides,
+    lr=1e-4,
 )
+model = prepared.model
 ```
 
 `fp4_lora_finetune_config(mode=...)` 是微调推荐入口，用来避免手动拼装不兼容开关：
@@ -148,6 +151,8 @@ model, replaced = convert_linear_to_fp4_lora(
 | `memory_saving` | 显存压力模式 | 保存 FP4 activation cache 计算近似 `dA`，自动关闭 overlap |
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则。
+
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、LoRA-only 冻结、optimizer 参数组、cache hook 和一次 backward/optimizer step；BF16 balanced 和 FP16 throughput 均通过。
 
 Adapter checkpoint 示例：
 
@@ -590,6 +595,15 @@ conda run -n triton python benchmarks/validate_fp4_lora_training_policies.py \
   --lowrank-dtype fp16 \
   --modes throughput \
   --steps 2
+
+conda run -n triton python benchmarks/validate_fp4_lora_prepare.py
+
+conda run -n triton python benchmarks/validate_fp4_lora_prepare.py \
+  --dtype fp16 \
+  --lowrank-dtype fp16 \
+  --mode throughput \
+  --batch 4 \
+  --hidden 128
 
 conda run -n triton python benchmarks/validate_fp4_lora_finetune_convergence.py
 ```

@@ -8,8 +8,11 @@ from .operators import (
 )
 from .layout import dequantize_fp4_activation, unpack_fp4_activation_codes, unpack_fp4_activation_scales
 from .modeling import (
+    DEFAULT_FP4_LORA_EXCLUDE_MODULES,
+    DEFAULT_FP4_LORA_TARGET_MODULES,
     FP4LoRAConfig,
     FP4LoRACacheRefreshHook,
+    FP4LoRAPrepareResult,
     clear_fused_lora_dx_caches,
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
@@ -22,6 +25,7 @@ from .modeling import (
     iter_fp4_lora_modules,
     load_fp4_lora_peft_state_dict,
     load_fp4_lora_state_dict,
+    prepare_fp4_lora_finetuning,
     register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
 )
@@ -30,8 +34,11 @@ from .training import FrozenResidualInitMode, NunchakuFP4LoRALinear, ResidualSVD
 __all__ = [
     "FP4LoRAConfig",
     "FP4LoRACacheRefreshHook",
+    "FP4LoRAPrepareResult",
     "FrozenResidualInitMode",
     "ResidualSVDMethod",
+    "DEFAULT_FP4_LORA_TARGET_MODULES",
+    "DEFAULT_FP4_LORA_EXCLUDE_MODULES",
     "NunchakuFP4GemmOp",
     "NunchakuFP4LowRankOp",
     "NunchakuFP4LowRankUnfusedOp",
@@ -50,6 +57,7 @@ __all__ = [
     "iter_fp4_lora_modules",
     "load_fp4_lora_peft_state_dict",
     "load_fp4_lora_state_dict",
+    "prepare_fp4_lora_finetuning",
     "register_fp4_lora_cache_refresh_hook",
     "refresh_fused_lora_dx_caches",
     "dequantize_fp4_activation",

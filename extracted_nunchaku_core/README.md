@@ -614,6 +614,7 @@ from native_fp4 import (
     freeze_non_fp4_lora_parameters,
     load_fp4_lora_peft_state_dict,
     load_fp4_lora_state_dict,
+    prepare_fp4_lora_finetuning,
     register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
 )
@@ -640,18 +641,18 @@ auto_overrides = fp4_lora_config_overrides_from_outlier_report(
 )
 sensitive_overrides.update(auto_overrides)
 
-model, replaced = convert_linear_to_fp4_lora(
+prepared = prepare_fp4_lora_finetuning(
     model,
-    cfg,
+    config=cfg,
     target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
     config_overrides=sensitive_overrides,
+    lr=1e-4,
 )
-trainable = freeze_non_fp4_lora_parameters(model)
-refresh_fused_lora_dx_caches(model)
+model = prepared.model
 
-optimizer = torch.optim.AdamW(fp4_lora_parameter_groups(model), lr=1e-4, eps=1e-4)
-cache_hook = register_fp4_lora_cache_refresh_hook(optimizer, model)
+optimizer = torch.optim.AdamW(prepared.optimizer_param_groups, eps=1e-4)
+cache_hook = prepared.register_cache_refresh_hook(optimizer)
 
 # 保存/加载时只处理 LoRA adapter，不保存 FP4 backbone buffers。
 adapter_state = fp4_lora_state_dict(model)
@@ -687,6 +688,21 @@ RTX 5090 验证结果：
 
 - BF16 `accuracy/balanced/throughput/memory_saving`：全部通过，LoRA A/B 更新、frozen residual 不变、optimizer cache hook 按需运行。
 - FP16 `throughput`：自动配置 `fuse_frozen_residual_dx=True` 且 `overlap_lora_grad=False`，通过。
+
+`prepare_fp4_lora_finetuning` 是推荐的真实微调入口，会一次性完成：
+
+- 按 `target_modules/exclude_modules/config_overrides/outlier_report` 替换模型 Linear。
+- 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
+- 按需刷新 fused dX cache。
+- 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
+- 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache。
+
+验证 prepare 接口：
+
+```bash
+python benchmarks/validate_fp4_lora_prepare.py
+python benchmarks/validate_fp4_lora_prepare.py --dtype fp16 --lowrank-dtype fp16 --mode throughput --batch 4 --hidden 128
+```
 
 验证批量替换、冻结参数、cache refresh/clear 和 backward：
 
@@ -1007,6 +1023,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/validate_fp4_lora_training_policies.py
+python benchmarks/validate_fp4_lora_prepare.py
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
@@ -1128,6 +1145,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
 - `latest_fp4_lora_training_policies_validation.json`
   - `accuracy/balanced/throughput/memory_saving` 四种 FP4 LoRA 微调预设的 forward/backward/optimizer step 验证
+- `latest_fp4_lora_prepare_validation.json`
+  - 高层 `prepare_fp4_lora_finetuning` 接口的模型替换、冻结、optimizer 参数组和 cache hook 验证
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`

@@ -17,6 +17,16 @@ from .training import (
 )
 
 FP4LoRAFinetuneMode = Literal["accuracy", "balanced", "throughput", "memory_saving"]
+DEFAULT_FP4_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+DEFAULT_FP4_LORA_EXCLUDE_MODULES = ("lm_head",)
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,24 @@ class FP4LoRAConfig:
     overlap_lora_grad: bool = False
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS
     fp4_activation_cache_d_lora_down: bool = False
+
+
+@dataclass
+class FP4LoRAPrepareResult:
+    """Artifacts returned by ``prepare_fp4_lora_finetuning``."""
+
+    model: torch.nn.Module
+    config: FP4LoRAConfig
+    replaced_modules: list[str]
+    trainable_names: list[str]
+    trainable_param_count: int
+    optimizer_param_groups: list[dict[str, Any]]
+    refreshed_cache_count: int
+    target_modules: tuple[str, ...]
+    exclude_modules: tuple[str, ...]
+
+    def register_cache_refresh_hook(self, optimizer: torch.optim.Optimizer) -> FP4LoRACacheRefreshHook:
+        return register_fp4_lora_cache_refresh_hook(optimizer, self.model)
 
 
 def fp4_lora_finetune_config(
@@ -638,3 +666,116 @@ def freeze_non_fp4_lora_parameters(module: torch.nn.Module, train_bias: bool = F
         if allow:
             trainable.append(name)
     return trainable
+
+
+def prepare_fp4_lora_finetuning(
+    module: torch.nn.Module,
+    config: FP4LoRAConfig | None = None,
+    *,
+    mode: FP4LoRAFinetuneMode = "balanced",
+    rank: int = 32,
+    lora_alpha: float | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    lowrank_dtype: torch.dtype | None = None,
+    use_frozen_residual: bool = True,
+    frozen_residual_rank: int | None = None,
+    residual_svd_method: ResidualSVDMethod | None = None,
+    residual_svd_lowrank_oversample: int = 8,
+    residual_svd_lowrank_niter: int = 2,
+    train_bias: bool = False,
+    cache_lora_act: bool = True,
+    activation_checkpoint: bool = False,
+    overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    target_modules: Iterable[str] | None = DEFAULT_FP4_LORA_TARGET_MODULES,
+    exclude_modules: Iterable[str] | None = DEFAULT_FP4_LORA_EXCLUDE_MODULES,
+    config_overrides: Mapping[str, FP4LoRAConfig] | None = None,
+    outlier_report: Mapping[str, Any] | str | None = None,
+    outlier_rank_field: str = "suggested_rank",
+    outlier_rank_multiple: int = 16,
+    outlier_min_rank: int | None = None,
+    outlier_max_rank: int | None = None,
+    inplace: bool = True,
+    refresh_caches: bool = True,
+    lora_weight_decay: float = 0.0,
+    bias_weight_decay: float = 0.0,
+    lr: float | None = None,
+) -> FP4LoRAPrepareResult:
+    """Convert a model and prepare LoRA-only optimizer inputs for FP4 fine-tuning.
+
+    This is the high-level training entry point: it creates a recommended config
+    when one is not provided, replaces selected ``Linear`` modules, freezes all
+    non-LoRA parameters, optionally refreshes fused dX caches, and returns
+    LoRA-only optimizer parameter groups. The caller still owns optimizer and
+    scheduler construction.
+    """
+
+    cfg = config
+    if cfg is None:
+        cfg = fp4_lora_finetune_config(
+            mode=mode,
+            rank=rank,
+            lora_alpha=lora_alpha,
+            dtype=dtype,
+            lowrank_dtype=lowrank_dtype,
+            use_frozen_residual=use_frozen_residual,
+            frozen_residual_rank=frozen_residual_rank,
+            residual_svd_method=residual_svd_method,
+            residual_svd_lowrank_oversample=residual_svd_lowrank_oversample,
+            residual_svd_lowrank_niter=residual_svd_lowrank_niter,
+            train_bias=train_bias,
+            cache_lora_act=cache_lora_act,
+            activation_checkpoint=activation_checkpoint,
+            overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
+        )
+    else:
+        train_bias = cfg.train_bias
+
+    merged_overrides: dict[str, FP4LoRAConfig] = {}
+    if config_overrides:
+        merged_overrides.update(config_overrides)
+    if outlier_report is not None:
+        auto_overrides = fp4_lora_config_overrides_from_outlier_report(
+            outlier_report,
+            cfg,
+            rank_field=outlier_rank_field,
+            rank_multiple=outlier_rank_multiple,
+            min_rank=outlier_min_rank,
+            max_rank=outlier_max_rank,
+            force_init="zero",
+            disable_fuse_frozen_residual_dx=True,
+        )
+        for key, value in auto_overrides.items():
+            merged_overrides.setdefault(key, value)
+
+    targets = _as_tuple(target_modules)
+    excludes = _as_tuple(exclude_modules)
+    prepared_model, replaced = convert_linear_to_fp4_lora(
+        module,
+        cfg,
+        target_modules=targets,
+        exclude_modules=excludes,
+        config_overrides=merged_overrides or None,
+        inplace=inplace,
+    )
+    trainable_names = freeze_non_fp4_lora_parameters(prepared_model, train_bias=train_bias)
+    refreshed = refresh_fused_lora_dx_caches(prepared_model) if refresh_caches else 0
+    param_groups = fp4_lora_parameter_groups(
+        prepared_model,
+        train_bias=train_bias,
+        lora_weight_decay=lora_weight_decay,
+        bias_weight_decay=bias_weight_decay,
+        lr=lr,
+    )
+    trainable_param_count = int(sum(param.numel() for group in param_groups for param in group["params"]))
+
+    return FP4LoRAPrepareResult(
+        model=prepared_model,
+        config=cfg,
+        replaced_modules=replaced,
+        trainable_names=trainable_names,
+        trainable_param_count=trainable_param_count,
+        optimizer_param_groups=param_groups,
+        refreshed_cache_count=refreshed,
+        target_modules=targets,
+        exclude_modules=excludes,
+    )

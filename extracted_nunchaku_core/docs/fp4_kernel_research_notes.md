@@ -24,7 +24,7 @@
 
 ## 本轮候选记录
 
-目标：优化 `fp4_activation_cache_lora_down_grad` 的 rank32/rank64 常见 LoRA 形状，降低 `fp4_activation_cache_d_lora_down=True` 显存模式的 backward 开销。
+目标：优化 `fp4_activation_cache_lora_down_grad` 的 rank32/rank64/rank128 常见 LoRA 形状，降低 `fp4_activation_cache_d_lora_down=True` 显存模式的 backward 开销。
 
 Rank32，RTX 5090，BF16，`benchmark_fp4_lora_activation_cache_policy.py --warmup 5 --iters 10`：
 
@@ -69,8 +69,32 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
 
 该验证 `all_passed=true`，`lora_down_grad_vs_manual rel_l2=0`，FP4-cache `dA` 相对 exact saved-x `dA` 的 rel_l2 约 `9.68e-2`，符合该显存模式的近似边界。
 
+Rank128，RTX 5090，BF16：
+
+| candidate | 2048 fused dA ms | 4096 fused dA ms | status | reason |
+| --- | ---: | ---: | --- | --- |
+| baseline `kVec=2,rVec=16,threads=256` | 0.7334 | 3.3392 | replaced | repeats activation decode across eight rank tiles |
+| `kVec=3,rVec=32,threads=128` | 0.5633 | 1.8640 | promoted | reuses the rank64 tile, halves rank tiles, and reduces column tile count |
+
+Correctness gate:
+
+```bash
+conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
+  --m 257 \
+  --in-features 512 \
+  --out-features 768 \
+  --rank 128 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx \
+  --fp4-activation-cache-d-lora-down
+```
+
+该验证 `all_passed=true`，`lora_down_grad_vs_manual rel_l2=0`，FP4-cache `dA` 相对 exact saved-x `dA` 的 rel_l2 约 `9.77e-2`。
+
 ## 下一步
 
 - 若继续追求性能，需要把 `dA` 改写成更接近 tensor-core GEMM 的形式，例如分块 dequant 到 shared/register 后做 rank tile MMA，或者显式分离 `qact` dequant staging 与 rank GEMM reduction。
-- 对 rank64 以外的更高 LoRA rank 仍需继续做 tile sweep；当前 rank > 64 保持旧 `kVec=2,rVec=16`，避免无证据推广。
+- 对 rank128 以外的更高 LoRA rank 仍需继续做 tile sweep；当前 rank > 128 保持旧 `kVec=2,rVec=16`，避免无证据推广。
 - `dA` 精度瓶颈来自 FP4 activation cache 本身，kernel tile 只能优化速度，不能消除约 `1e-1` 的 exact saved-x `dA` 误差。

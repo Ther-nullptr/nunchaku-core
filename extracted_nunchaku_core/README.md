@@ -607,6 +607,7 @@ from native_fp4 import (
     FP4LoRAConfig,
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
+    fp4_lora_finetune_config,
     fp4_lora_parameter_groups,
     fp4_lora_peft_state_dict,
     fp4_lora_state_dict,
@@ -617,23 +618,11 @@ from native_fp4 import (
     refresh_fused_lora_dx_caches,
 )
 
-cfg = FP4LoRAConfig(
+cfg = fp4_lora_finetune_config(
+    mode="balanced",
     rank=32,
+    dtype=torch.bfloat16,
     lowrank_dtype=torch.bfloat16,
-    # 推荐微调形态：冻结 residual_svd 量化补偿，只训练 zero-init task LoRA。
-    init="zero",
-    frozen_residual_rank=32,
-    frozen_residual_init="residual_svd",
-    # full_svd 精度最高；大模型批量转换可改为 svd_lowrank 降低初始化开销。
-    residual_svd_method="svd_lowrank",
-    # Optional: fuse task LoRA + frozen residual forward low-rank GEMMs.
-    fuse_lowrank_forward=False,
-    fuse_lora_dx=True,
-    # FP16-only experimental: fuse frozen residual dX into the same epilogue.
-    fuse_frozen_residual_dx=False,
-    cache_fused_lora_dx=True,
-    overlap_lora_grad=True,
-    overlap_lora_grad_min_rows=4096,
 )
 
 sensitive_overrides = {
@@ -677,6 +666,27 @@ load_fp4_lora_peft_state_dict(model, peft_state)
 
 如果只想跑单分支 task LoRA，把 `frozen_residual_rank=0` 且 `frozen_residual_init="none"`。
 如果已经通过 sensitivity scan 发现某些完整模块路径不适合 FP4，可用 `exclude_modules` 保持 BF16；如果只是需要更强补偿能力，优先用 `config_overrides` 对这些模块单独提高 rank 或调整 residual/task LoRA 策略。
+
+`fp4_lora_finetune_config` 提供四种预设，均采用“frozen residual_svd 量化补偿 + zero-init task LoRA”的推荐形态：
+
+| mode | 用途 | 关键开关 |
+| --- | --- | --- |
+| `accuracy` | 精度优先 / 调试 | `full_svd` 初始化，LoRA dX 走 dense BF16/FP16，关闭 overlap |
+| `balanced` | 默认推荐 | `svd_lowrank`，fused cached LoRA dX，exact `dA/dB`，大 batch 自动 overlap |
+| `throughput` | 速度消融 | 在 `balanced` 基础上打开 fused low-rank forward；FP16 会自动 fused frozen-residual dX 并关闭 overlap |
+| `memory_saving` | 显存压力模式 | fused cached LoRA dX，但用 FP4 activation cache 计算近似 `dA`，自动关闭 overlap |
+
+验证这些预设是否能实际跑 forward/backward/optimizer step：
+
+```bash
+python benchmarks/validate_fp4_lora_training_policies.py
+python benchmarks/validate_fp4_lora_training_policies.py --dtype fp16 --lowrank-dtype fp16 --modes throughput --steps 2
+```
+
+RTX 5090 验证结果：
+
+- BF16 `accuracy/balanced/throughput/memory_saving`：全部通过，LoRA A/B 更新、frozen residual 不变、optimizer cache hook 按需运行。
+- FP16 `throughput`：自动配置 `fuse_frozen_residual_dx=True` 且 `overlap_lora_grad=False`，通过。
 
 验证批量替换、冻结参数、cache refresh/clear 和 backward：
 
@@ -996,6 +1006,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
+python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
@@ -1115,6 +1126,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - dual-branch FP16 fused residual dX benchmark
 - `latest_native_fp4_lora_modeling_validation.json`
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
+- `latest_fp4_lora_training_policies_validation.json`
+  - `accuracy/balanced/throughput/memory_saving` 四种 FP4 LoRA 微调预设的 forward/backward/optimizer step 验证
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`

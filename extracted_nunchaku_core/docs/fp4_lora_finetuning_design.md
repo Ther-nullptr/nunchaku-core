@@ -105,20 +105,14 @@ from native_fp4 import (
     FP4LoRAConfig,
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
+    fp4_lora_finetune_config,
 )
 
-cfg = FP4LoRAConfig(
+cfg = fp4_lora_finetune_config(
+    mode="balanced",
     rank=32,
+    dtype=torch.bfloat16,
     lowrank_dtype=torch.bfloat16,
-    init="zero",
-    frozen_residual_rank=32,
-    frozen_residual_init="residual_svd",
-    fuse_lora_dx=True,
-    cache_fused_lora_dx=True,
-    overlap_lora_grad=True,
-    overlap_lora_grad_min_rows=4096,
-    # 显存/近似训练模式，默认关闭。
-    fp4_activation_cache_d_lora_down=False,
 )
 
 sensitive_overrides = {
@@ -143,6 +137,17 @@ model, replaced = convert_linear_to_fp4_lora(
     config_overrides=sensitive_overrides,
 )
 ```
+
+`fp4_lora_finetune_config(mode=...)` 是微调推荐入口，用来避免手动拼装不兼容开关：
+
+| mode | 目标 | 关键策略 |
+| --- | --- | --- |
+| `accuracy` | 精度优先 / 调试 | `full_svd` frozen residual，dense LoRA dX，exact `dA/dB` |
+| `balanced` | 默认推荐 | `svd_lowrank` frozen residual，fused cached LoRA dX，exact `dA/dB`，大 batch exact overlap |
+| `throughput` | 速度消融 | fused low-rank forward；FP16 自动 fused frozen-residual dX，并关闭不兼容的 overlap |
+| `memory_saving` | 显存压力模式 | 保存 FP4 activation cache 计算近似 `dA`，自动关闭 overlap |
+
+`validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则。
 
 Adapter checkpoint 示例：
 
@@ -577,6 +582,14 @@ conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
   --fuse-lora-dx \
   --fuse-frozen-residual-dx \
   --cache-fused-lora-dx
+
+conda run -n triton python benchmarks/validate_fp4_lora_training_policies.py
+
+conda run -n triton python benchmarks/validate_fp4_lora_training_policies.py \
+  --dtype fp16 \
+  --lowrank-dtype fp16 \
+  --modes throughput \
+  --steps 2
 
 conda run -n triton python benchmarks/validate_fp4_lora_finetune_convergence.py
 ```

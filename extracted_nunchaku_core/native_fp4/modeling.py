@@ -4,11 +4,19 @@ import copy
 import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 import torch
 
-from .training import FrozenResidualInitMode, LoRAInitMode, NunchakuFP4LoRALinear, ResidualSVDMethod
+from .training import (
+    DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    FrozenResidualInitMode,
+    LoRAInitMode,
+    NunchakuFP4LoRALinear,
+    ResidualSVDMethod,
+)
+
+FP4LoRAFinetuneMode = Literal["accuracy", "balanced", "throughput", "memory_saving"]
 
 
 @dataclass(frozen=True)
@@ -31,8 +39,113 @@ class FP4LoRAConfig:
     cache_fused_lora_dx: bool = False
     reuse_fused_dy_up_for_d_lora_down: bool = False
     overlap_lora_grad: bool = False
-    overlap_lora_grad_min_rows: int = 4096
+    overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS
     fp4_activation_cache_d_lora_down: bool = False
+
+
+def fp4_lora_finetune_config(
+    *,
+    mode: FP4LoRAFinetuneMode = "balanced",
+    rank: int = 32,
+    lora_alpha: float | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    lowrank_dtype: torch.dtype | None = None,
+    use_frozen_residual: bool = True,
+    frozen_residual_rank: int | None = None,
+    residual_svd_method: ResidualSVDMethod | None = None,
+    residual_svd_lowrank_oversample: int = 8,
+    residual_svd_lowrank_niter: int = 2,
+    train_bias: bool = False,
+    cache_lora_act: bool = True,
+    activation_checkpoint: bool = False,
+    overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+) -> FP4LoRAConfig:
+    """Return a recommended FP4 LoRA fine-tuning config.
+
+    Modes:
+      - ``accuracy``: exact BF16/FP16 LoRA gradients and dense LoRA dX.
+      - ``balanced``: exact LoRA gradients with fused cached LoRA dX and auto-gated overlap.
+      - ``throughput``: balanced plus fused low-rank forward; FP16 also fuses frozen residual dX.
+      - ``memory_saving``: balanced dX, but stores FP4 activation cache for approximate dA.
+
+    The returned config follows the SVDQuant-inspired training policy from the
+    project notes: freeze the residual-SVD quantization compensation and train a
+    separate zero-init task LoRA branch.
+    """
+
+    if mode not in ("accuracy", "balanced", "throughput", "memory_saving"):
+        raise ValueError("mode must be one of: accuracy, balanced, throughput, memory_saving")
+    if rank <= 0:
+        raise ValueError("rank must be positive")
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("dtype must be torch.float16 or torch.bfloat16")
+    if lowrank_dtype is None:
+        lowrank_dtype = dtype
+    if lowrank_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("lowrank_dtype must be torch.float16 or torch.bfloat16")
+    if overlap_lora_grad_min_rows < 0:
+        raise ValueError("overlap_lora_grad_min_rows must be non-negative")
+
+    if frozen_residual_rank is None:
+        effective_frozen_residual_rank = int(rank) if use_frozen_residual else 0
+    else:
+        effective_frozen_residual_rank = int(frozen_residual_rank)
+    if not use_frozen_residual:
+        effective_frozen_residual_rank = 0
+    if effective_frozen_residual_rank < 0:
+        raise ValueError("frozen_residual_rank must be non-negative")
+    frozen_residual_init: FrozenResidualInitMode = (
+        "residual_svd" if effective_frozen_residual_rank > 0 else "none"
+    )
+
+    if residual_svd_method is None:
+        residual_svd_method = "full_svd" if mode == "accuracy" else "svd_lowrank"
+
+    fuse_lora_dx = mode != "accuracy"
+    cache_fused_lora_dx = fuse_lora_dx
+    overlap_lora_grad = mode in ("balanced", "throughput")
+    fp4_activation_cache_d_lora_down = mode == "memory_saving"
+    if fp4_activation_cache_d_lora_down and not cache_lora_act:
+        raise ValueError("mode='memory_saving' requires cache_lora_act=True")
+    if fp4_activation_cache_d_lora_down:
+        # FP4 activation-cache dA is an approximate gradient path and cannot
+        # currently share the exact-overlap schedule.
+        overlap_lora_grad = False
+    fuse_lowrank_forward = mode == "throughput"
+    fuse_frozen_residual_dx = (
+        mode == "throughput"
+        and effective_frozen_residual_rank > 0
+        and dtype == torch.float16
+        and lowrank_dtype == torch.float16
+    )
+    if fuse_frozen_residual_dx:
+        # The exact overlap implementation keeps frozen residual dX on a dense
+        # side stream. When residual dX is fused into the epilogue, use the
+        # sequential cached fused-dX path.
+        overlap_lora_grad = False
+
+    return FP4LoRAConfig(
+        rank=rank,
+        lora_alpha=lora_alpha,
+        lowrank_dtype=lowrank_dtype,
+        init="zero",
+        frozen_residual_rank=effective_frozen_residual_rank,
+        frozen_residual_init=frozen_residual_init,
+        residual_svd_method=residual_svd_method,
+        residual_svd_lowrank_oversample=residual_svd_lowrank_oversample,
+        residual_svd_lowrank_niter=residual_svd_lowrank_niter,
+        train_bias=train_bias,
+        cache_lora_act=cache_lora_act,
+        activation_checkpoint=activation_checkpoint,
+        fuse_lowrank_forward=fuse_lowrank_forward,
+        fuse_lora_dx=fuse_lora_dx,
+        fuse_frozen_residual_dx=fuse_frozen_residual_dx,
+        cache_fused_lora_dx=cache_fused_lora_dx,
+        reuse_fused_dy_up_for_d_lora_down=False,
+        overlap_lora_grad=overlap_lora_grad,
+        overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
+        fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+    )
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:

@@ -340,9 +340,27 @@ RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-featur
 
 P6：加入 outlier-aware FP4 训练策略：
 
-- activation smooth / online scale 统计。
-- 对敏感 projection 保留 BF16。
-- residual LoRA 初始化和 task LoRA 初始化分离后的 scale/outlier 策略。
+- `analyze_fp4_lora_activation_grad_outliers.py` 已落地 activation / grad-output 通道统计。
+- `summary.rank_bump_candidates` 可直接转成 `config_overrides`，对敏感 projection 单独提高 rank 或调整 residual/task LoRA 策略。
+- `summary.smooth_bwd_candidates` 用 Spearman rank correlation 判断 activation outlier 是否能代理 backward `dY` outlier；当前只作为诊断，不直接改 kernel `smooth_bwd`。
+- 对真正不适合 FP4 的 projection，仍用 `exclude_modules` 保留 BF16。
+
+示例：
+
+```bash
+python benchmarks/analyze_fp4_lora_activation_grad_outliers.py \
+  --batch 4 \
+  --hidden 128 \
+  --layers 2 \
+  --steps 2 \
+  --rank 32 \
+  --override-rank 64 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --inject-outliers \
+  --outlier-channel 0 \
+  --outlier-scale 16
+```
 
 ## 验证命令
 

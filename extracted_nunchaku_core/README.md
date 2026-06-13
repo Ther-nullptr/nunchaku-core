@@ -611,6 +611,31 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 - dual-branch 路径：`frozen_residual_*` 是 frozen buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
 - FP16 下可打开 `fuse_frozen_residual_dx=True`，把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 下该路径目前误差偏大，默认关闭。
 
+## 10.6 FP4 LoRA activation / grad outlier 诊断
+
+如果要把 sensitivity scan 的结论转成 `config_overrides`，先看每个 FP4 LoRA Linear 的输入 activation 和 backward `dY` 通道 outlier：
+
+```bash
+python benchmarks/analyze_fp4_lora_activation_grad_outliers.py \
+  --batch 4 \
+  --hidden 128 \
+  --layers 2 \
+  --steps 2 \
+  --rank 32 \
+  --override-rank 64 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --inject-outliers \
+  --outlier-channel 0 \
+  --outlier-scale 16
+```
+
+输出：
+
+- `results/latest_fp4_lora_activation_grad_outliers.json`
+- `summary.rank_bump_candidates`：建议用 `config_overrides` 单独提高 rank 的模块。
+- `summary.smooth_bwd_candidates`：activation/grad-output 通道 rank correlation 足够高的模块。当前只作为诊断信号；直接改 `smooth_bwd` 需要同步权重量化/反缩放补偿，不能把它当成无损开关。
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -629,6 +654,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
+python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype fp16 --warmup 10 --iters 30
@@ -710,6 +736,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
   - dual-branch FP16 fused residual dX benchmark
 - `latest_native_fp4_lora_modeling_validation.json`
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
+- `latest_fp4_lora_activation_grad_outliers.json`
+  - FP4 LoRA activation / grad-output outlier 诊断和 rank/smooth 建议
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

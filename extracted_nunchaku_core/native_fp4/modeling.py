@@ -99,6 +99,7 @@ def fp4_lora_finetune_config(
     train_bias: bool = False,
     cache_lora_act: bool = True,
     activation_checkpoint: bool = False,
+    reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
 ) -> FP4LoRAConfig:
@@ -129,6 +130,12 @@ def fp4_lora_finetune_config(
         raise ValueError("fp4_activation_cache_d_lora_down_backend must be one of: fused, dequant_gemm")
     if overlap_lora_grad_min_rows < 0:
         raise ValueError("overlap_lora_grad_min_rows must be non-negative")
+    if reuse_fused_dy_up_for_d_lora_down and dtype != lowrank_dtype:
+        raise ValueError("reuse_fused_dy_up_for_d_lora_down requires dtype to match lowrank_dtype")
+    if reuse_fused_dy_up_for_d_lora_down and mode == "accuracy":
+        raise ValueError("reuse_fused_dy_up_for_d_lora_down requires mode with fuse_lora_dx enabled")
+    if reuse_fused_dy_up_for_d_lora_down and mode == "memory_saving":
+        raise ValueError("reuse_fused_dy_up_for_d_lora_down is incompatible with mode='memory_saving'")
 
     if frozen_residual_rank is None:
         effective_frozen_residual_rank = int(rank) if use_frozen_residual else 0
@@ -154,6 +161,10 @@ def fp4_lora_finetune_config(
     if fp4_activation_cache_d_lora_down:
         # FP4 activation-cache dA is an approximate gradient path and cannot
         # currently share the exact-overlap schedule.
+        overlap_lora_grad = False
+    if reuse_fused_dy_up_for_d_lora_down and effective_frozen_residual_rank > 0:
+        # The reuse-based overlap path only carries the trainable LoRA dy_up.
+        # Keep frozen residual dX on the sequential dense side path.
         overlap_lora_grad = False
     fuse_lowrank_forward = mode == "throughput"
     fuse_frozen_residual_dx = (
@@ -185,7 +196,7 @@ def fp4_lora_finetune_config(
         fuse_lora_dx=fuse_lora_dx,
         fuse_frozen_residual_dx=fuse_frozen_residual_dx,
         cache_fused_lora_dx=cache_fused_lora_dx,
-        reuse_fused_dy_up_for_d_lora_down=False,
+        reuse_fused_dy_up_for_d_lora_down=bool(reuse_fused_dy_up_for_d_lora_down),
         overlap_lora_grad=overlap_lora_grad,
         overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
@@ -826,6 +837,7 @@ def prepare_fp4_lora_finetuning(
     train_bias: bool = False,
     cache_lora_act: bool = True,
     activation_checkpoint: bool = False,
+    reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
     target_modules: Iterable[str] | None = DEFAULT_FP4_LORA_TARGET_MODULES,
@@ -875,6 +887,7 @@ def prepare_fp4_lora_finetuning(
             train_bias=train_bias,
             cache_lora_act=cache_lora_act,
             activation_checkpoint=activation_checkpoint,
+            reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
             fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
         )

@@ -299,18 +299,18 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - `fp4_activation_cache_d_lora_down=True`：forward 保存主分支已有 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 dense `x_hat`；`"dequant_gemm"` 先反量化出 dense `x_hat` 再用 torch GEMM，当前更快但 transient 显存更高。这是显存/近似训练模式，要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。
-- 为保证训练梯度精度，默认 `dA` 仍使用 dense `dY @ B`；BF16 下复用 fused dX 产生的 packed `dY @ B` 会给 `dA` 带来约 `3.36e-3` rel_l2，不作为默认梯度来源。
-- FP16 下提供 `reuse_fused_dy_up_for_d_lora_down=True` 实验选项，复用 packed `dY @ B` 可通过 correctness，`dA` rel_l2 约 `3.35e-5`；性能收益较小且有噪声，4096/rank32 短测中单步约 `0.968x-1.018x`，梯度累积 per micro-step 约 `1.016x-1.036x`。
+- 为保证训练梯度精度，默认 `dA` 仍使用 dense `dY @ B`。`reuse_fused_dy_up_for_d_lora_down=True` 是 opt-in：FP16 复用 decoded packed `dY @ B`，`dA` rel_l2 约 `3.35e-5`；BF16 复用 dual quantize 的 dense `dy_up` 输出，`dA` rel_l2 为 `0`。
+- 4096/rank32 BF16 短测中，reuse 相对 cached-pack 单步 `1.014x`，reuse+overlap 相对 reuse 单步 `1.032x`，backward estimate 相对 dense `2.086x`。FP16 两次短测中，单步相对 cached-pack 约 `0.968x-1.018x`，梯度累积 per micro-step 约 `1.016x-1.036x`。
 - `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`；实现上用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM。
 - `overlap_lora_grad_min_rows=4096` 是默认 auto gate：小于该 flattened row 数时自动回落到 sequential cached fused-dX 路径，避免 2048 形状上多 stream 调度变慢；设为 `0` 可强制 always-overlap 做消融。
-- BF16 exact overlap 不复用 packed 近似 `dY @ B`，`dA` 仍走 dense `dY @ B`。Correctness：`validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad --overlap-lora-grad-min-rows 0` 通过，`dX` rel_l2 `1.55e-4`，`dA` rel_l2 `0`。
+- BF16 exact overlap 默认不复用 packed 近似 `dY @ B`，`dA` 仍走 dense `dY @ B`。Correctness：`validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad --overlap-lora-grad-min-rows 0` 通过，`dX` rel_l2 `1.55e-4`，`dA` rel_l2 `0`。如果同时打开 `reuse_fused_dy_up_for_d_lora_down=True` 且不使用 frozen residual，BF16 使用 dual dense `dy_up`，强制 overlap correctness 同样通过，`dA` rel_l2 `0`。
 - BF16 FP4 activation-cache `dA` 已接入 `NunchakuFP4LoRALinear`：`validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fp4-activation-cache-d-lora-down` 通过；`--fp4-activation-cache-d-lora-down-backend fused/dequant_gemm` 两条路径均通过。`dA` 对齐 FP4-cache reference，FP4-cache reference 相对 exact saved-x `dA` rel_l2 约 `9.7e-2`。
 - BF16 frozen residual exact overlap 已支持：task LoRA dX 走 fused epilogue，frozen residual dX 保持 dense side stream；`validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad` 通过，forward/dX/LoRA A/B/bias grad rel_l2 全为 `0`。
 - `residual_svd_method="svd_lowrank"` 已接入单层和模型级接口：`validate_native_fp4_lora_training.py --frozen-residual-init residual_svd --init zero --residual-svd-method svd_lowrank ...` 和 `validate_native_fp4_lora_modeling.py --frozen-residual-init residual_svd --init zero --residual-svd-method svd_lowrank ...` 均通过。
 - trainable `init="residual_svd"` 使用 dense LoRA dX 时 correctness 通过；若同时打开 `fuse_lora_dx=True`，BF16 下较大的 residual factors 会把 fused LoRA dX 近似误差放大到约 `2e-3`，因此推荐把 residual_svd 作为 frozen residual branch，task LoRA 仍 zero-init。
 - 4096/rank32 BF16 短测，`benchmark_native_fp4_lora_training.py --warmup 10 --iters 30 --grad-accum-steps 4`：cached-pack `0.9314 ms`，exact overlap `0.8830 ms`；gradient accumulation per micro-step `0.9594 -> 0.8956 ms`。单步 `1.055x` vs cached-pack，grad accumulation `1.071x` vs cached-pack。
 - FP16 reuse+overlap 路径同时打开 `reuse_fused_dy_up_for_d_lora_down=True`，复用 decoded packed `dY @ B`。Correctness：`dX` rel_l2 `1.81e-5`，`dA` rel_l2 `3.56e-5`；4096/rank32 短测中单步 `1.008x` vs reuse，grad accumulation `1.037x` vs reuse。
-- reuse-based overlap 仍不支持 frozen residual branch；dual-branch 默认使用 exact overlap。
+- reuse-based overlap 仍不支持 frozen residual branch；高层 `fp4_lora_finetune_config` 遇到 reuse + frozen residual 会自动关闭 overlap，保留顺序 dense residual dX。
 - 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
 
 初始化消融，RTX 5090 BF16，`benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --warmup 5 --iters 10`：
@@ -445,7 +445,7 @@ RTX 5090 短测，`validate_native_fp4_lora_pack.py --dtype bf16/fp16 --warmup 2
 
 P1：optimizer post-step eager refresh 接口已落地；后续需要在多层真实模型里继续测量它对 step latency 抖动和梯度累积的收益。
 
-P2：继续研究 BF16 下 packed `dY @ B` 复用的精度问题；当前仅 FP16 opt-in，BF16 必须继续用 dense `dY @ B` 保护 `dA`。
+P2：BF16 下 packed `dY @ B` decode 精度问题已有可用绕法：`reuse_fused_dy_up_for_d_lora_down=True` 在 BF16 使用 dual quantize 输出 dense `dy_up`，`dA` 与手写 BF16 matmul 对齐为 `rel_l2=0`；FP16 仍可用 decoded packed 路径作为小误差 opt-in。后续只需继续评估真实训练 loop 里的收益和是否值得默认开启。
 
 P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。`benchmark_fp4_lora_lowrank_grad.py` 已给出基线：rank32 下复用已有 `dy_up` 可让低秩梯度 pair 快约 `1.37x`，但单独双 stream overlap 会退化。因此下一版 kernel 不应只做 stream overlap，而应尝试把 `dy_up=dY@B` 与 `dA=dy_up^T@X` 的中间量复用/压缩，或做 CUTLASS grouped/specialized small-N GEMM 对照。
 

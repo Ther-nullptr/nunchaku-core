@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["accuracy", "balanced", "throughput", "memory_saving"], default="balanced")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--adam-eps", type=float, default=1e-4)
+    p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
@@ -88,6 +89,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     manual_override = replace(base_cfg, rank=args.override_rank)
@@ -127,6 +129,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
@@ -194,9 +197,18 @@ def main() -> None:
             result.config.fp4_activation_cache_d_lora_down_backend
             == args.fp4_activation_cache_d_lora_down_backend
         ),
+        "result_config_reuse_flag_matches": (
+            result.config.reuse_fused_dy_up_for_d_lora_down
+            == args.reuse_fused_dy_up_for_d_lora_down
+        ),
         "all_replaced_backend_matches": all(
             fp4_modules[name].fp4_activation_cache_d_lora_down_backend
             == args.fp4_activation_cache_d_lora_down_backend
+            for name in expected_replaced
+        ),
+        "all_replaced_reuse_flag_matches": all(
+            fp4_modules[name].reuse_fused_dy_up_for_d_lora_down
+            == args.reuse_fused_dy_up_for_d_lora_down
             for name in expected_replaced
         ),
         "lm_head_not_replaced": not isinstance(prepared.lm_head, NunchakuFP4LoRALinear),
@@ -240,6 +252,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "mode": args.mode,
+            "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "replaced": result.replaced_modules,

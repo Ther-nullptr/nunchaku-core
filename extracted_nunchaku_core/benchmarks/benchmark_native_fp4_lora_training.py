@@ -188,7 +188,7 @@ def main() -> None:
     dy = torch.randn(args.m, args.out_features, device="cuda", dtype=dtype)
     weight = torch.randn(args.out_features, args.in_features, device="cuda", dtype=dtype)
     bias = torch.randn(args.out_features, device="cuda", dtype=dtype)
-    can_reuse_fused_dy_up = dtype == torch.float16 and lowrank_dtype == torch.float16
+    can_reuse_fused_dy_up = dtype == lowrank_dtype and dtype in (torch.float16, torch.bfloat16)
 
     fp4_cached = NunchakuFP4LoRALinear(
         weight=weight,

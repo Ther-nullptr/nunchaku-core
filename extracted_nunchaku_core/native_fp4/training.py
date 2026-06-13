@@ -21,6 +21,7 @@ from .operators import (
     pack_lowrank_weight,
     pad_tensor,
     quantize_fp4_act_with_lora,
+    quantize_fp4_act_with_lora_dual,
 )
 
 LoRAInitMode = Literal["zero", "gaussian", "residual_svd"]
@@ -430,12 +431,22 @@ def _fused_lora_dx(
     else:
         lora_down_bwd_packed, lora_up_bwd_packed = packed_lora_dx
     packed_rank = lora_down_bwd_packed.shape[1]
-    qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
-        dy2d,
-        lora_down_packed=lora_down_bwd_packed,
-        smooth=fp4_backward_op.smooth_bwd,
-        pad_size=256,
-    )
+    dense_dy_up = None
+    if return_dy_up and lowrank_dtype == torch.bfloat16:
+        qdy, ascales, packed_dy_up, dense_dy_up = quantize_fp4_act_with_lora_dual(
+            dy2d,
+            lora_down_packed=lora_down_bwd_packed,
+            smooth=fp4_backward_op.smooth_bwd,
+            pad_size=256,
+            dense_dtype=lowrank_dtype,
+        )
+    else:
+        qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
+            dy2d,
+            lora_down_packed=lora_down_bwd_packed,
+            smooth=fp4_backward_op.smooth_bwd,
+            pad_size=256,
+        )
     qweight_bwd = fp4_backward_op.repack_qweight_for_backward()
     dx_pad = fp4_backward_op.backward_prequantized(
         qdy,
@@ -449,7 +460,10 @@ def _fused_lora_dx(
     if not return_dy_up:
         return dx
 
-    dy_up = decode_lora_act(packed_dy_up, lowrank_dtype)[: dy2d_src.shape[0], : lora_down.shape[0]]
+    if dense_dy_up is None:
+        dy_up = decode_lora_act(packed_dy_up, lowrank_dtype)[: dy2d_src.shape[0], : lora_down.shape[0]]
+    else:
+        dy_up = dense_dy_up[: dy2d_src.shape[0], : lora_down.shape[0]].to(lowrank_dtype)
     return dx, dy_up
 
 
@@ -601,18 +615,31 @@ def _fused_lora_backward_overlap_reuse(
         d_lora_up = torch.matmul(dy2d_src.to(lowrank_dtype).t(), lora_act.to(lowrank_dtype))
         d_lora_up = d_lora_up.mul(float(scaling)).to(lora_up.dtype)
 
-    qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
-        dy2d,
-        lora_down_packed=lora_down_bwd_packed,
-        smooth=fp4_backward_op.smooth_bwd,
-        pad_size=256,
-    )
+    dense_dy_up = None
+    if lowrank_dtype == torch.bfloat16:
+        qdy, ascales, packed_dy_up, dense_dy_up = quantize_fp4_act_with_lora_dual(
+            dy2d,
+            lora_down_packed=lora_down_bwd_packed,
+            smooth=fp4_backward_op.smooth_bwd,
+            pad_size=256,
+            dense_dtype=lowrank_dtype,
+        )
+    else:
+        qdy, ascales, packed_dy_up = quantize_fp4_act_with_lora(
+            dy2d,
+            lora_down_packed=lora_down_bwd_packed,
+            smooth=fp4_backward_op.smooth_bwd,
+            pad_size=256,
+        )
     quant_done.record(current_stream)
 
     with torch.cuda.stream(down_stream):
         down_stream.wait_event(quant_done)
-        dense_dy_up = decode_lora_act(packed_dy_up, lowrank_dtype)[: dy2d_src.shape[0], : lora_down.shape[0]]
-        d_lora_down = torch.matmul(dense_dy_up.t(), x2d.to(lowrank_dtype))
+        if dense_dy_up is None:
+            dy_up_for_down = decode_lora_act(packed_dy_up, lowrank_dtype)[: dy2d_src.shape[0], : lora_down.shape[0]]
+        else:
+            dy_up_for_down = dense_dy_up[: dy2d_src.shape[0], : lora_down.shape[0]].to(lowrank_dtype)
+        d_lora_down = torch.matmul(dy_up_for_down.t(), x2d.to(lowrank_dtype))
         d_lora_down = d_lora_down.mul(float(scaling)).to(lora_down.dtype)
 
     with torch.cuda.stream(dx_stream):
@@ -715,8 +742,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("fuse_frozen_residual_dx is currently only validated for FP16 weight and LoRA")
         if reuse_fused_dy_up_for_d_lora_down and not fuse_lora_dx:
             raise ValueError("reuse_fused_dy_up_for_d_lora_down requires fuse_lora_dx=True")
-        if reuse_fused_dy_up_for_d_lora_down and (weight.dtype != torch.float16 or lowrank_dtype != torch.float16):
-            raise ValueError("reuse_fused_dy_up_for_d_lora_down is currently only validated for FP16 weight and LoRA")
+        if reuse_fused_dy_up_for_d_lora_down and weight.dtype != lowrank_dtype:
+            raise ValueError("reuse_fused_dy_up_for_d_lora_down requires weight dtype to match lowrank_dtype")
         if overlap_lora_grad and not fuse_lora_dx:
             raise ValueError("overlap_lora_grad requires fuse_lora_dx=True")
         if overlap_lora_grad and not cache_fused_lora_dx:

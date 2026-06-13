@@ -431,6 +431,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 FP16-only 实验选项：复用 fused dX quantize kernel 产生的 packed `dY @ B`，decode 后用于 `dA = (dY @ B).T @ X`，避免额外 dense `dY @ B` matmul。
 - `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`，用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM；exact overlap 支持 frozen residual branch，但 residual dX 保持 dense 计算。
+- `overlap_lora_grad_min_rows=4096` 是默认 auto gate：小于该 flattened row 数时自动回落到 sequential cached fused-dX 路径，避免 2048 形状上多 stream 调度变慢；传 `--overlap-lora-grad-min-rows 0` 可强制 always-overlap 做消融。
 - BF16 下 `overlap_lora_grad=True` 仍保留 dense `dY @ B` 计算 `dA`，不复用 packed 近似中间量；`fuse_frozen_residual_dx=True` 仍不用于 BF16。
 - FP16 下如果同时打开 `reuse_fused_dy_up_for_d_lora_down=True`，`overlap_lora_grad=True` 会复用 decoded packed `dY @ B`，这是更快但有小量 `dA` 误差的实验路径。
 - reuse-based overlap 目前不支持 frozen residual branch；如果需要 dual-branch 训练，使用默认 exact overlap。
@@ -470,7 +471,8 @@ python benchmarks/validate_native_fp4_lora_training.py \
   --lowrank-dtype bf16 \
   --fuse-lora-dx \
   --cache-fused-lora-dx \
-  --overlap-lora-grad
+  --overlap-lora-grad \
+  --overlap-lora-grad-min-rows 0
 ```
 
 RTX 5090 correctness：`dX` rel_l2 `1.55e-4`，`d_lora_down` rel_l2 `0`。
@@ -479,10 +481,10 @@ RTX 5090 correctness：`dX` rel_l2 `1.55e-4`，`d_lora_down` rel_l2 `0`。
 
 | path | train step ms | backward estimate ms | grad accum per micro-step ms | speedup vs dense step |
 | --- | ---: | ---: | ---: | ---: |
-| cached-pack | 0.9419 | 0.6090 | 0.9597 | 2.150x |
-| exact overlap | 0.8948 | 0.5619 | 0.8952 | 2.263x |
+| cached-pack | 0.9314 | 0.5980 | 0.9594 | 2.168x |
+| exact overlap | 0.8830 | 0.5496 | 0.8956 | 2.287x |
 
-当前结论：BF16 exact overlap 不降低 LoRA 梯度精度，单步相对 cached-pack 快 `1.053x`，4-step gradient accumulation 中快 `1.072x`。
+当前结论：BF16 exact overlap 不降低 LoRA 梯度精度。默认 `overlap_lora_grad_min_rows=4096` 下，2048 形状自动回落、避免 forced overlap 退化；4096 形状单步相对 cached-pack 快 `1.055x`，4-step gradient accumulation 中快 `1.071x`。
 
 FP16 overlap 消融：
 
@@ -614,6 +616,8 @@ cfg = FP4LoRAConfig(
     # FP16-only experimental: fuse frozen residual dX into the same epilogue.
     fuse_frozen_residual_dx=False,
     cache_fused_lora_dx=True,
+    overlap_lora_grad=True,
+    overlap_lora_grad_min_rows=4096,
 )
 
 sensitive_overrides = {
@@ -831,21 +835,22 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
 
 | path | dtype | train step ms | note |
 | --- | --- | ---: | --- |
-| task LoRA only, fused dX | bf16 | 0.2544 | task-only reference |
-| dual branch, residual dense dX | bf16 | 0.3130 | `1.230x` overhead vs task-only；BF16 fused residual dX 暂不启用 |
-| dual branch, residual exact overlap | bf16 | 0.4706 | `0.665x` vs dense residual；2048 小形状多 stream 开销大于收益 |
-| task LoRA only, fused dX | fp16 | 0.3064 | task-only reference |
-| dual branch, residual dense dX | fp16 | 0.4121 | `1.345x` overhead vs task-only |
-| dual branch, residual exact overlap | fp16 | 0.5163 | `0.798x` vs dense residual；correctness path，不建议此形状默认 |
-| dual branch, residual fused dX | fp16 | 0.2854 | `1.444x` vs residual dense dX，`dX` rel_l2 `3.80e-4` |
+| task LoRA only, fused dX | bf16 | 0.2997 | task-only reference |
+| dual branch, residual dense dX | bf16 | 0.3077 | `1.027x` overhead vs task-only；BF16 fused residual dX 暂不启用 |
+| dual branch, residual exact overlap auto | bf16 | 0.3086 | `0.997x` vs dense residual；默认门槛回落，不再退化 |
+| dual branch, residual forced overlap | bf16 | 0.4699 | `0.666x` vs dense residual；`--overlap-lora-grad-min-rows 0` 消融 |
+| task LoRA only, fused dX | fp16 | 0.2712 | task-only reference |
+| dual branch, residual dense dX | fp16 | 0.3128 | `1.153x` overhead vs task-only |
+| dual branch, residual exact overlap auto | fp16 | 0.3115 | `1.004x` vs dense residual；默认门槛回落 |
+| dual branch, residual fused dX | fp16 | 0.3130 | `0.999x` vs residual dense dX，`dX` rel_l2 `3.80e-4` |
 
 RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30`：
 
 | path | dtype | train step ms | note |
 | --- | --- | ---: | --- |
-| task LoRA only, fused dX | bf16 | 0.9596 | task-only reference |
-| dual branch, residual dense dX | bf16 | 1.1957 | `1.246x` overhead vs task-only |
-| dual branch, residual exact overlap | bf16 | 1.1107 | `1.077x` vs dense residual，`dX` rel_l2 `1.67e-6` |
+| task LoRA only, fused dX | bf16 | 0.9590 | task-only reference |
+| dual branch, residual dense dX | bf16 | 1.1883 | `1.239x` overhead vs task-only |
+| dual branch, residual exact overlap auto | bf16 | 1.0961 | `1.084x` vs dense residual，`dX` rel_l2 `9.08e-7` |
 
 `fuse_lowrank_forward=True` 消融，RTX 5090 同形状 `warmup=10,iters=30`：
 

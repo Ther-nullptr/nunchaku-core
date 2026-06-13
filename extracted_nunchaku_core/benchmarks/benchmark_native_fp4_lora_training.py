@@ -160,6 +160,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--grad-accum-steps", type=int, default=4)
+    p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -246,6 +247,7 @@ def main() -> None:
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
         overlap_lora_grad=True,
+        overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
     )
     fp4_cached_fused_dx_cached_pack_reuse_dy_up = None
     fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap = None
@@ -276,6 +278,7 @@ def main() -> None:
             cache_fused_lora_dx=True,
             reuse_fused_dy_up_for_d_lora_down=True,
             overlap_lora_grad=True,
+            overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         )
     dense = DenseLoRALinear(
         weight=weight,
@@ -425,6 +428,7 @@ def main() -> None:
             "train_bias": args.train_bias,
             "grad_accum_steps": args.grad_accum_steps,
             "can_reuse_fused_dy_up": can_reuse_fused_dy_up,
+            "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
         },
         "latency_ms": {
             "dense_forward_inference": dense_forward_inference_ms,

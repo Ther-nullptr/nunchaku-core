@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frozen-residual-rank", type=int, default=32)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
     p.add_argument("--fuse-lowrank-forward", action="store_true")
+    p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--seed", type=int, default=0)
@@ -137,6 +138,7 @@ def main() -> None:
         fuse_frozen_residual_dx=False,
         cache_fused_lora_dx=True,
         overlap_lora_grad=True,
+        overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
     )
     fused_residual_dx = None
     if dtype == torch.float16:
@@ -236,6 +238,7 @@ def main() -> None:
             "lowrank_dtype": args.dtype,
             "fuse_lowrank_forward": args.fuse_lowrank_forward,
             "overlap_residual_dx_available": True,
+            "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fused_residual_dx_available": fused_residual_dx is not None,
         },
         "latency_ms": {

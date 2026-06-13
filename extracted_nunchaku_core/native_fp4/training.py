@@ -23,6 +23,7 @@ from .operators import (
 
 LoRAInitMode = Literal["zero", "gaussian", "residual_svd"]
 FrozenResidualInitMode = Literal["none", "residual_svd"]
+DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS = 4096
 
 
 class _FP4LoRALinearFunction(torch.autograd.Function):
@@ -46,6 +47,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         fuse_frozen_residual_dx: bool,
         reuse_fused_dy_up_for_d_lora_down: bool,
         overlap_lora_grad: bool,
+        overlap_lora_grad_min_rows: int,
         packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         if x.shape[-1] != fp4_forward_op.in_features:
@@ -99,6 +101,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.fuse_frozen_residual_dx = bool(fuse_frozen_residual_dx)
         ctx.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
         ctx.overlap_lora_grad = bool(overlap_lora_grad)
+        ctx.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
         ctx.packed_lora_dx = packed_lora_dx
         ctx.has_frozen_residual = bool(has_frozen_residual)
         ctx.has_bias = bias is not None
@@ -114,7 +117,8 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         x2d = x.reshape(-1, ctx.in_features)
         dy2d = dy.reshape(-1, ctx.out_features)
 
-        if ctx.overlap_lora_grad:
+        should_overlap_lora_grad = ctx.overlap_lora_grad and x2d.shape[0] >= ctx.overlap_lora_grad_min_rows
+        if should_overlap_lora_grad:
             if ctx.cache_lora_act:
                 lora_act = saved_lora_act
             else:
@@ -164,6 +168,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 None,
                 None,
                 d_bias,
+                None,
                 None,
                 None,
                 None,
@@ -236,6 +241,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             None,
             None,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -570,6 +576,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         cache_fused_lora_dx: bool = False,
         reuse_fused_dy_up_for_d_lora_down: bool = False,
         overlap_lora_grad: bool = False,
+        overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     ):
         super().__init__()
         if not weight.is_cuda:
@@ -614,6 +621,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             )
         if overlap_lora_grad and fuse_frozen_residual_dx:
             raise ValueError("exact overlap_lora_grad expects frozen residual dX to stay dense")
+        if overlap_lora_grad_min_rows < 0:
+            raise ValueError("overlap_lora_grad_min_rows must be non-negative")
 
         self.out_features, self.in_features = weight.shape
         self.rank = max(16, ceil_divide(rank, 16) * 16)
@@ -632,6 +641,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.cache_fused_lora_dx = bool(cache_fused_lora_dx)
         self.reuse_fused_dy_up_for_d_lora_down = bool(reuse_fused_dy_up_for_d_lora_down)
         self.overlap_lora_grad = bool(overlap_lora_grad)
+        self.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
         self.init_mode = init
         self.frozen_residual_init = frozen_residual_init
 
@@ -704,6 +714,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         cache_fused_lora_dx: bool = False,
         reuse_fused_dy_up_for_d_lora_down: bool = False,
         overlap_lora_grad: bool = False,
+        overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
         frozen_residual_rank: int = 0,
         frozen_residual_init: FrozenResidualInitMode = "none",
     ) -> "NunchakuFP4LoRALinear":
@@ -725,6 +736,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             cache_fused_lora_dx=cache_fused_lora_dx,
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad=overlap_lora_grad,
+            overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
         )
 
     def clear_fused_lora_dx_cache(self) -> None:
@@ -864,6 +876,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.fuse_frozen_residual_dx,
             self.reuse_fused_dy_up_for_d_lora_down,
             self.overlap_lora_grad,
+            self.overlap_lora_grad_min_rows,
             self._get_fused_lora_dx_cache(),
         )
 
@@ -895,5 +908,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"fuse_frozen_residual_dx={self.fuse_frozen_residual_dx}, "
             f"cache_fused_lora_dx={self.cache_fused_lora_dx}, "
             f"reuse_fused_dy_up_for_d_lora_down={self.reuse_fused_dy_up_for_d_lora_down}, "
-            f"overlap_lora_grad={self.overlap_lora_grad}"
+            f"overlap_lora_grad={self.overlap_lora_grad}, "
+            f"overlap_lora_grad_min_rows={self.overlap_lora_grad_min_rows}"
         )

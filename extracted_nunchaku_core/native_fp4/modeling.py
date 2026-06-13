@@ -28,6 +28,7 @@ class FP4LoRAConfig:
     cache_fused_lora_dx: bool = False
     reuse_fused_dy_up_for_d_lora_down: bool = False
     overlap_lora_grad: bool = False
+    overlap_lora_grad_min_rows: int = 4096
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:
@@ -167,6 +168,7 @@ def convert_linear_to_fp4_lora(
                         cache_fused_lora_dx=child_cfg.cache_fused_lora_dx,
                         reuse_fused_dy_up_for_d_lora_down=child_cfg.reuse_fused_dy_up_for_d_lora_down,
                         overlap_lora_grad=child_cfg.overlap_lora_grad,
+                        overlap_lora_grad_min_rows=child_cfg.overlap_lora_grad_min_rows,
                     )
                     setattr(parent, child_name, fp4_lora)
                     replaced.append(full_name)

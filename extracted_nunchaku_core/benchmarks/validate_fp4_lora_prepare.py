@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["accuracy", "balanced", "throughput", "memory_saving"], default="balanced")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--adam-eps", type=float, default=1e-4)
+    p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -86,6 +87,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     manual_override = replace(base_cfg, rank=args.override_rank)
     outlier_report = {
@@ -101,7 +103,11 @@ def main() -> None:
 
     result = prepare_fp4_lora_finetuning(
         model,
-        config=base_cfg,
+        mode=args.mode,
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
         config_overrides={"layers.1.down_proj": manual_override},
@@ -156,6 +162,15 @@ def main() -> None:
         "result_model_is_input_model": result.model is model,
         "replaced_expected_modules": set(result.replaced_modules) == expected_replaced,
         "all_replaced_are_fp4_lora": all(isinstance(fp4_modules[name], NunchakuFP4LoRALinear) for name in expected_replaced),
+        "result_config_backend_matches": (
+            result.config.fp4_activation_cache_d_lora_down_backend
+            == args.fp4_activation_cache_d_lora_down_backend
+        ),
+        "all_replaced_backend_matches": all(
+            fp4_modules[name].fp4_activation_cache_d_lora_down_backend
+            == args.fp4_activation_cache_d_lora_down_backend
+            for name in expected_replaced
+        ),
         "lm_head_not_replaced": not isinstance(prepared.lm_head, NunchakuFP4LoRALinear),
         "manual_override_wins_over_outlier_report": (
             fp4_modules["layers.1.down_proj"].requested_rank == args.override_rank
@@ -186,6 +201,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "mode": args.mode,
+            "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "replaced": result.replaced_modules,
         "trainable": result.trainable_names,

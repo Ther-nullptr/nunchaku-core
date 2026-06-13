@@ -713,6 +713,7 @@ RTX 5090 验证结果：
 ```bash
 python benchmarks/validate_fp4_lora_prepare.py
 python benchmarks/validate_fp4_lora_prepare.py --dtype fp16 --lowrank-dtype fp16 --mode throughput --batch 4 --hidden 128
+python benchmarks/validate_fp4_lora_prepare.py --mode memory_saving --batch 4 --hidden 128 --fp4-activation-cache-d-lora-down-backend dequant_gemm
 ```
 
 验证批量替换、冻结参数、cache refresh/clear 和 backward：
@@ -1046,6 +1047,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
+python benchmarks/validate_native_fp4_lora_modeling.py --batch 4 --hidden 128 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fp4-activation-cache-d-lora-down --fp4-activation-cache-d-lora-down-backend dequant_gemm
 python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/validate_fp4_lora_prepare.py
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10

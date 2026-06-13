@@ -695,6 +695,22 @@ python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/validate_fp4_lora_training_policies.py --dtype fp16 --lowrank-dtype fp16 --modes throughput --steps 2
 ```
 
+模型级性能/显存消融使用高层 `prepare_fp4_lora_finetuning` 入口，而不是手写替换：
+
+```bash
+python benchmarks/benchmark_fp4_lora_prepare_policies.py \
+  --batch 8 \
+  --hidden 256 \
+  --layers 2 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 3 \
+  --iters 5
+```
+
+输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`initial_forward_vs_dense` 和相对 `balanced` 的 train-step speedup。
+
 RTX 5090 验证结果：
 
 - BF16 `accuracy/balanced/throughput/memory_saving`：全部通过，LoRA A/B 更新、frozen residual 不变、optimizer cache hook 按需运行。
@@ -1050,6 +1066,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 4 --hidden 128 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fp4-activation-cache-d-lora-down --fp4-activation-cache-d-lora-down-backend dequant_gemm
 python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/validate_fp4_lora_prepare.py
+python benchmarks/benchmark_fp4_lora_prepare_policies.py --batch 8 --hidden 256 --layers 2 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
@@ -1173,6 +1190,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - `accuracy/balanced/throughput/memory_saving` 四种 FP4 LoRA 微调预设的 forward/backward/optimizer step 验证
 - `latest_fp4_lora_prepare_validation.json`
   - 高层 `prepare_fp4_lora_finetuning` 接口的模型替换、冻结、optimizer 参数组和 cache hook 验证
+- `latest_fp4_lora_prepare_policies.json`
+  - 高层 `prepare_fp4_lora_finetuning` preset 的模型级 train step、optimizer/cache hook、peak memory 和 forward 误差消融
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`

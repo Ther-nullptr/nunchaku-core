@@ -154,6 +154,8 @@ model = prepared.model
 
 `prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、LoRA-only 冻结、optimizer 参数组、cache hook 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。
 
+`benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存和初始 forward 误差消融。
+
 Adapter checkpoint 示例：
 
 ```python

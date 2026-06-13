@@ -24,12 +24,13 @@ from .modeling import (
     register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
 )
-from .training import FrozenResidualInitMode, NunchakuFP4LoRALinear
+from .training import FrozenResidualInitMode, NunchakuFP4LoRALinear, ResidualSVDMethod
 
 __all__ = [
     "FP4LoRAConfig",
     "FP4LoRACacheRefreshHook",
     "FrozenResidualInitMode",
+    "ResidualSVDMethod",
     "NunchakuFP4GemmOp",
     "NunchakuFP4LowRankOp",
     "NunchakuFP4LowRankUnfusedOp",

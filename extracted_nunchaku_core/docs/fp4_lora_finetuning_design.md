@@ -209,6 +209,9 @@ optimizer 边界：
 - `frozen_residual_rank/frozen_residual_init`：
   - `0/"none"`：只使用 trainable task LoRA。
   - `rank/"residual_svd"`：额外构造 frozen residual branch，推荐与 `init="zero"` 搭配，避免训练破坏量化补偿。
+- `residual_svd_method`：
+  - `full_svd`：默认，初始化误差最低。
+  - `svd_lowrank`：使用 `torch.svd_lowrank`，通过 `residual_svd_lowrank_oversample/niter` 控制随机低秩 SVD；适合大模型批量转换。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
 - `activation_checkpoint`：逐 `NunchakuFP4LoRALinear` 的局部 checkpoint。它只省该算子内部 saved tensors；要显著降低多层输入 activation，应该在 transformer block/segment 外层做 checkpoint。
 - `fuse_lowrank_forward`：dual-branch opt-in 实验选项，把 task LoRA forward 与 frozen residual forward 合成一次拼接 low-rank GEMM；减少 launch/GEMM 次数，但会改变浮点归约顺序。验证脚本 strict 检查当前调度，并额外报告相对“两支分开计算”公式的 rel_l2；默认关闭。
@@ -284,10 +287,22 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - BF16 exact overlap 不复用 packed 近似 `dY @ B`，`dA` 仍走 dense `dY @ B`。Correctness：`validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad --overlap-lora-grad-min-rows 0` 通过，`dX` rel_l2 `1.55e-4`，`dA` rel_l2 `0`。
 - BF16 FP4 activation-cache `dA` 已接入 `NunchakuFP4LoRALinear`：`validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fp4-activation-cache-d-lora-down` 通过；`dA` 对齐 FP4-cache reference，FP4-cache reference 相对 exact saved-x `dA` rel_l2 约 `9.7e-2`。
 - BF16 frozen residual exact overlap 已支持：task LoRA dX 走 fused epilogue，frozen residual dX 保持 dense side stream；`validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad` 通过，forward/dX/LoRA A/B/bias grad rel_l2 全为 `0`。
+- `residual_svd_method="svd_lowrank"` 已接入单层和模型级接口：`validate_native_fp4_lora_training.py --frozen-residual-init residual_svd --init zero --residual-svd-method svd_lowrank ...` 和 `validate_native_fp4_lora_modeling.py --frozen-residual-init residual_svd --init zero --residual-svd-method svd_lowrank ...` 均通过。
+- trainable `init="residual_svd"` 使用 dense LoRA dX 时 correctness 通过；若同时打开 `fuse_lora_dx=True`，BF16 下较大的 residual factors 会把 fused LoRA dX 近似误差放大到约 `2e-3`，因此推荐把 residual_svd 作为 frozen residual branch，task LoRA 仍 zero-init。
 - 4096/rank32 BF16 短测，`benchmark_native_fp4_lora_training.py --warmup 10 --iters 30 --grad-accum-steps 4`：cached-pack `0.9314 ms`，exact overlap `0.8830 ms`；gradient accumulation per micro-step `0.9594 -> 0.8956 ms`。单步 `1.055x` vs cached-pack，grad accumulation `1.071x` vs cached-pack。
 - FP16 reuse+overlap 路径同时打开 `reuse_fused_dy_up_for_d_lora_down=True`，复用 decoded packed `dY @ B`。Correctness：`dX` rel_l2 `1.81e-5`，`dA` rel_l2 `3.56e-5`；4096/rank32 短测中单步 `1.008x` vs reuse，grad accumulation `1.037x` vs reuse。
 - reuse-based overlap 仍不支持 frozen residual branch；dual-branch 默认使用 exact overlap。
 - 保存 forward `lora_act` 对大形状有小幅收益，约 `3%-4%`；是否默认缓存要结合训练显存预算决定。
+
+初始化消融，RTX 5090 BF16，`benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --warmup 5 --iters 10`：
+
+| policy | residual SVD method | forward rel_l2 vs dense | error reduction vs zero | construct s | train step ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FP4 + zero LoRA | none | 1.4377 | 1.00x | 0.0834 | 0.4203 |
+| trainable residual_svd LoRA | full_svd | 1.3943 | 1.031x | 0.1628 | 0.3021 |
+| frozen residual_svd + zero LoRA | full_svd | 1.3943 | 1.031x | 0.1547 | 0.3190 |
+| trainable residual_svd LoRA | svd_lowrank | 1.4013 | 1.026x | 0.0720 | 0.2654 |
+| frozen residual_svd + zero LoRA | svd_lowrank | 1.4013 | 1.026x | 0.0042 | 0.3188 |
 
 ## 后续优化路线
 

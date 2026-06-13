@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .training import FrozenResidualInitMode, LoRAInitMode, NunchakuFP4LoRALinear
+from .training import FrozenResidualInitMode, LoRAInitMode, NunchakuFP4LoRALinear, ResidualSVDMethod
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,9 @@ class FP4LoRAConfig:
     init: LoRAInitMode = "zero"
     frozen_residual_rank: int = 0
     frozen_residual_init: FrozenResidualInitMode = "none"
+    residual_svd_method: ResidualSVDMethod = "full_svd"
+    residual_svd_lowrank_oversample: int = 8
+    residual_svd_lowrank_niter: int = 2
     train_bias: bool = False
     cache_lora_act: bool = True
     activation_checkpoint: bool = False
@@ -160,6 +163,9 @@ def convert_linear_to_fp4_lora(
                         init=child_cfg.init,
                         frozen_residual_rank=child_cfg.frozen_residual_rank,
                         frozen_residual_init=child_cfg.frozen_residual_init,
+                        residual_svd_method=child_cfg.residual_svd_method,
+                        residual_svd_lowrank_oversample=child_cfg.residual_svd_lowrank_oversample,
+                        residual_svd_lowrank_niter=child_cfg.residual_svd_lowrank_niter,
                         train_bias=child_cfg.train_bias,
                         cache_lora_act=child_cfg.cache_lora_act,
                         activation_checkpoint=child_cfg.activation_checkpoint,

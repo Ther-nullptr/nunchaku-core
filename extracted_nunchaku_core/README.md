@@ -624,6 +624,8 @@ cfg = FP4LoRAConfig(
     init="zero",
     frozen_residual_rank=32,
     frozen_residual_init="residual_svd",
+    # full_svd 精度最高；大模型批量转换可改为 svd_lowrank 降低初始化开销。
+    residual_svd_method="svd_lowrank",
     # Optional: fuse task LoRA + frozen residual forward low-rank GEMMs.
     fuse_lowrank_forward=False,
     fuse_lora_dx=True,
@@ -714,6 +716,46 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 - dual-branch 路径：`frozen_residual_*` 是 frozen buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
 - `fuse_lowrank_forward=True` 可用于测试 forward 低秩分支合并收益；它只改变 low-rank forward 的调度和归约顺序，不改变默认数学公式。
 - FP16 下可打开 `fuse_frozen_residual_dx=True`，把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 下该路径目前误差偏大，默认关闭。
+
+### 10.5.1 residual_svd 初始化消融
+
+比较 `zero`、trainable `residual_svd`、以及推荐的 frozen `residual_svd + zero task LoRA` 初始化策略：
+
+```bash
+python benchmarks/benchmark_fp4_lora_initialization.py \
+  --m 2048 \
+  --in-features 2048 \
+  --out-features 2048 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+输出：
+
+- `results/latest_fp4_lora_initialization.json`
+- `policies.*.forward_vs_dense`
+- `policies.*.construct_s`
+- `derived.*_error_reduction_vs_zero`
+- `derived.frozen_lowrank_construct_speedup_vs_full`
+
+RTX 5090 BF16 `2048^2, rank32, weight_std=0.02` 短测：
+
+| policy | residual SVD method | forward rel_l2 vs dense | error reduction vs zero | construct s | train step ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| FP4 + zero LoRA | none | 1.4377 | 1.00x | 0.0834 | 0.4203 |
+| trainable residual_svd LoRA | full_svd | 1.3943 | 1.031x | 0.1628 | 0.3021 |
+| frozen residual_svd + zero LoRA | full_svd | 1.3943 | 1.031x | 0.1547 | 0.3190 |
+| trainable residual_svd LoRA | svd_lowrank | 1.4013 | 1.026x | 0.0720 | 0.2654 |
+| frozen residual_svd + zero LoRA | svd_lowrank | 1.4013 | 1.026x | 0.0042 | 0.3188 |
+
+结论：
+
+- `residual_svd` 初始化能降低初始 FP4 量化误差；随机权重短测中收益约 `2.6%-3.1%` rel_l2，真实 outlier 层需要结合 sensitivity scan 单独评估。
+- `svd_lowrank` 保留了大部分误差收益，同时显著降低 frozen residual 构造开销；适合大模型批量替换时先用作默认。
+- trainable `init="residual_svd"` 如果搭配 `fuse_lora_dx=True`，BF16 下较大的 residual factors 会放大 fused LoRA dX 近似误差；需要精确梯度时用 dense LoRA dX，或采用推荐的 `frozen_residual_init="residual_svd" + init="zero"`。
 
 ## 10.6 FP4 LoRA activation / grad outlier 诊断
 
@@ -922,6 +964,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --frozen-residual-rank 32 --frozen-residual-init residual_svd --init zero --dtype fp16 --lowrank-dtype fp16 --fuse-lora-dx --fuse-frozen-residual-dx --cache-fused-lora-dx
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
+python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --intermediate-activation silu --warmup 5 --iters 10
@@ -989,7 +1032,7 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
 - `native_fp4.fp4_activation_cache_lora_down_grad`
   - 直接从 native FP4 activation cache 计算 LoRA `dA` 的 fused CUDA 原型；rank<=32 使用 `kVec=3,rVec=16` fast path，rank>32 回落 `kVec=2,rVec=16`；用于显存/近似训练消融，当前不建议默认开启
 - `native_fp4.FP4LoRAConfig`
-  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`activation_checkpoint`、`fp4_activation_cache_d_lora_down` 和 FP16-only `fuse_frozen_residual_dx`
+  - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`fp4_activation_cache_d_lora_down` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.fp4_lora_config_overrides_from_outlier_report`
@@ -1039,6 +1082,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - dual-branch FP16 fused residual dX benchmark
 - `latest_native_fp4_lora_modeling_validation.json`
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
+- `latest_fp4_lora_initialization.json`
+  - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_activation_grad_outliers.json`
   - FP4 LoRA activation / grad-output outlier 诊断和 rank/smooth 建议
 - `latest_fp4_lora_outlier_override_overhead.json`

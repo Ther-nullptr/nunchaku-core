@@ -24,6 +24,7 @@ from .operators import (
 
 LoRAInitMode = Literal["zero", "gaussian", "residual_svd"]
 FrozenResidualInitMode = Literal["none", "residual_svd"]
+ResidualSVDMethod = Literal["full_svd", "svd_lowrank"]
 DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS = 4096
 
 
@@ -641,6 +642,9 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
         fp4_activation_cache_d_lora_down: bool = False,
+        residual_svd_method: ResidualSVDMethod = "full_svd",
+        residual_svd_lowrank_oversample: int = 8,
+        residual_svd_lowrank_niter: int = 2,
     ):
         super().__init__()
         if not weight.is_cuda:
@@ -659,6 +663,12 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("init must be one of: zero, gaussian, residual_svd")
         if frozen_residual_init not in ("none", "residual_svd"):
             raise ValueError("frozen_residual_init must be one of: none, residual_svd")
+        if residual_svd_method not in ("full_svd", "svd_lowrank"):
+            raise ValueError("residual_svd_method must be one of: full_svd, svd_lowrank")
+        if residual_svd_lowrank_oversample < 0:
+            raise ValueError("residual_svd_lowrank_oversample must be non-negative")
+        if residual_svd_lowrank_niter < 0:
+            raise ValueError("residual_svd_lowrank_niter must be non-negative")
         if frozen_residual_rank < 0:
             raise ValueError("frozen_residual_rank must be non-negative")
         if frozen_residual_init == "residual_svd" and frozen_residual_rank <= 0:
@@ -715,6 +725,9 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.fp4_activation_cache_d_lora_down = bool(fp4_activation_cache_d_lora_down)
         self.init_mode = init
         self.frozen_residual_init = frozen_residual_init
+        self.residual_svd_method = residual_svd_method
+        self.residual_svd_lowrank_oversample = int(residual_svd_lowrank_oversample)
+        self.residual_svd_lowrank_niter = int(residual_svd_lowrank_niter)
 
         self.fp4_forward = NunchakuFP4GemmOp(weight=weight, bias=None, dummy_rank=self.rank)
         self.fp4_backward = NunchakuFP4BackwardDXOp(weight=weight, dummy_rank=self.rank)
@@ -789,6 +802,9 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         fp4_activation_cache_d_lora_down: bool = False,
         frozen_residual_rank: int = 0,
         frozen_residual_init: FrozenResidualInitMode = "none",
+        residual_svd_method: ResidualSVDMethod = "full_svd",
+        residual_svd_lowrank_oversample: int = 8,
+        residual_svd_lowrank_niter: int = 2,
     ) -> "NunchakuFP4LoRALinear":
         return cls(
             weight=linear.weight.detach(),
@@ -810,6 +826,9 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             overlap_lora_grad=overlap_lora_grad,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
             fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+            residual_svd_method=residual_svd_method,
+            residual_svd_lowrank_oversample=residual_svd_lowrank_oversample,
+            residual_svd_lowrank_niter=residual_svd_lowrank_niter,
         )
 
     def clear_fused_lora_dx_cache(self) -> None:
@@ -902,7 +921,13 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             dtype=weight.dtype,
         )
         residual = (weight_pad - weight_hat).float()
-        u, s, vh = torch.linalg.svd(residual, full_matrices=False)
+        if self.residual_svd_method == "full_svd":
+            u, s, vh = torch.linalg.svd(residual, full_matrices=False)
+        else:
+            q = min(rank + self.residual_svd_lowrank_oversample, min(residual.shape))
+            q = max(rank, q)
+            u, s, v = torch.svd_lowrank(residual, q=q, niter=self.residual_svd_lowrank_niter)
+            vh = v.transpose(0, 1).contiguous()
         eff_rank = min(rank, s.numel())
         safe_scale = scale if abs(scale) > 1e-12 else 1.0
 
@@ -976,6 +1001,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"frozen_residual_rank={self.frozen_residual_rank}, "
             f"lowrank_dtype={self.lowrank_dtype}, init={self.init_mode}, "
             f"frozen_residual_init={self.frozen_residual_init}, "
+            f"residual_svd_method={self.residual_svd_method}, "
             f"cache_lora_act={self.cache_lora_act}, activation_checkpoint={self.activation_checkpoint}, "
             f"fuse_lowrank_forward={self.fuse_lowrank_forward}, "
             f"fuse_lora_dx={self.fuse_lora_dx}, "

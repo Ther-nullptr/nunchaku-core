@@ -37,6 +37,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
+    p.add_argument("--residual-svd-method", choices=["full_svd", "svd_lowrank"], default="full_svd")
+    p.add_argument("--residual-svd-lowrank-oversample", type=int, default=8)
+    p.add_argument("--residual-svd-lowrank-niter", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-cache-lora-act", action="store_true")
     p.add_argument("--activation-checkpoint", action="store_true")
@@ -74,6 +77,9 @@ def main() -> None:
         init=args.init,
         frozen_residual_rank=args.frozen_residual_rank,
         frozen_residual_init=args.frozen_residual_init,
+        residual_svd_method=args.residual_svd_method,
+        residual_svd_lowrank_oversample=args.residual_svd_lowrank_oversample,
+        residual_svd_lowrank_niter=args.residual_svd_lowrank_niter,
         train_bias=True,
         cache_lora_act=not args.no_cache_lora_act,
         activation_checkpoint=args.activation_checkpoint,
@@ -220,6 +226,9 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "init": args.init,
+            "residual_svd_method": args.residual_svd_method,
+            "residual_svd_lowrank_oversample": args.residual_svd_lowrank_oversample,
+            "residual_svd_lowrank_niter": args.residual_svd_lowrank_niter,
             "cache_lora_act": not args.no_cache_lora_act,
             "activation_checkpoint": args.activation_checkpoint,
             "fuse_lowrank_forward": args.fuse_lowrank_forward,

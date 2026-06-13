@@ -958,13 +958,15 @@ RTX 5090 BF16 短测：
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2048^2, rank32 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0249 | 0.0676 | 0.1281 | 2.86e-3 |
 | 4096^2, rank32 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.68e-2 | 0.0363 | 0.2023 | 0.3460 | 7.84e-5 |
+| 2048^2, rank64 | 8.00 MiB | 2.25 MiB | 3.56x | 9.78e-2 | 9.82e-2 | 0.0276 | 0.0677 | 0.3206 | 3.38e-5 |
+| 4096^2, rank64 | 32.00 MiB | 9.00 MiB | 3.56x | 9.78e-2 | 9.79e-2 | 0.0539 | 0.2201 | 0.9876 | 8.02e-5 |
 
 当前结论：
 
 - `qact + ascales` 的缓存体积是 BF16/FP16 `x` 的约 `28.1%`，理论显存节省明确。
 - 但 `dA` 直接用 FP4-dequant `x_hat` 会引入约 `1e-1` rel_l2 的 LoRA A 梯度误差，不适合作为默认精度路径。
 - naive `dequant -> dense x_hat -> GEMM` 需要在 backward 重新物化 dense `x_hat`，4096 形状比直接用 saved BF16 `x` 慢约 `5.1x`。
-- 已加入 `fp4_activation_cache_lora_down_grad` fused CUDA 原型，避免 dense `x_hat` 中间张量；rank<=32 当前使用 `kVec=3,rVec=16`，rank>32 仍回落 `kVec=2,rVec=16`。本轮 tile sweep 中 `kVec=3,rVec=16` 对 2048 基本持平，对 4096 fused `dA` 从约 `0.391ms` 降到 `0.346ms`，约 `1.13x`；候选记录见 [docs/fp4_kernel_research_notes.md](/home/wyj24/projects/nunchaku/extracted_nunchaku_core/docs/fp4_kernel_research_notes.md)。
+- 已加入 `fp4_activation_cache_lora_down_grad` fused CUDA 原型，避免 dense `x_hat` 中间张量；rank<=32 使用 `kVec=3,rVec=16`，rank<=64 使用 `kVec=3,rVec=32,threads=128`，rank>64 回落 `kVec=2,rVec=16`。tile sweep 中 rank32 的 4096 fused `dA` 从约 `0.391ms` 降到 `0.346ms`，约 `1.13x`；rank64 的 4096 fused `dA` 从约 `1.50ms` 降到 `0.99ms`，约 `1.52x`；候选记录见 [docs/fp4_kernel_research_notes.md](/home/wyj24/projects/nunchaku/extracted_nunchaku_core/docs/fp4_kernel_research_notes.md)。
 - 这个 fused 原型仍慢于 `dequant + GEMM`，4096 形状约 `0.58x`，说明后续要继续优化 decode staging/reduction 或改成 tensor-core 友好的分块，而不是直接把该原型设为默认性能路径。
 - 精度上 fused 原型对齐的是 `dequant(qact, ascales)` 近似路径，不解决 FP4 activation cache 本身带来的约 `1e-1` `dA` 误差。因此它仍应作为显存模式或近似训练消融，而非默认精度路径。
 
@@ -1091,7 +1093,7 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
 - `native_fp4.dequantize_fp4_activation`
   - 反解 native `qact/ascales` activation layout；`return_scales=False` 时走 CUDA fast path，供 FP4 activation cache 消融和后续 fused `dA` kernel 使用
 - `native_fp4.fp4_activation_cache_lora_down_grad`
-  - 直接从 native FP4 activation cache 计算 LoRA `dA` 的 fused CUDA 原型；rank<=32 使用 `kVec=3,rVec=16` fast path，rank>32 回落 `kVec=2,rVec=16`；用于显存/近似训练消融，当前不建议默认开启
+  - 直接从 native FP4 activation cache 计算 LoRA `dA` 的 fused CUDA 原型；rank<=32 使用 `kVec=3,rVec=16` fast path，rank<=64 使用 `kVec=3,rVec=32,threads=128` fast path，rank>64 回落 `kVec=2,rVec=16`；用于显存/近似训练消融，当前不建议默认开启
 - `native_fp4.FP4LoRAConfig`
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`fp4_activation_cache_d_lora_down` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`

@@ -134,7 +134,7 @@ __device__ __forceinline__ float load_dequantized_fp4_activation(
     return decode_fp4(code) * decode_e4m3fn(ascales[scale_index]);
 }
 
-template <typename scalar_t, int kVec, int rVec>
+template <typename scalar_t, int kVec, int rVec, int kThreads>
 __global__ void fp4_activation_cache_lora_down_grad_tiled_kernel(
     const uint8_t* __restrict__ qact,
     const uint8_t* __restrict__ ascales,
@@ -144,6 +144,7 @@ __global__ void fp4_activation_cache_lora_down_grad_tiled_kernel(
     int cols,
     int rank,
     int k_tiles) {
+    static_assert(kThreads == 128 || kThreads == 256);
     const int col_base = blockIdx.x * kVec;
     const int rank_base = blockIdx.y * rVec;
     const int tid = threadIdx.x;
@@ -182,7 +183,7 @@ __global__ void fp4_activation_cache_lora_down_grad_tiled_kernel(
         }
     }
 
-    __shared__ float smem[256 * kVec * rVec];
+    __shared__ float smem[kThreads * kVec * rVec];
 #pragma unroll
     for (int r = 0; r < rVec; ++r) {
 #pragma unroll
@@ -282,7 +283,6 @@ void fp4_activation_cache_lora_down_grad_cuda(
     TORCH_CHECK(output.size(0) == rank, "output rows must match dy_up rank");
     TORCH_CHECK(ascales.numel() == padded_rows * padded_cols / kFP4GroupSize, "ascales numel mismatch");
 
-    constexpr int threads = 256;
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (rank <= 32) {
@@ -290,6 +290,7 @@ void fp4_activation_cache_lora_down_grad_cuda(
         // without changing rank tiling and stays within the 48KB static smem cap.
         constexpr int kVec = 3;
         constexpr int rVec = 16;
+        constexpr int kThreads = 256;
         const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::kHalf,
@@ -297,8 +298,32 @@ void fp4_activation_cache_lora_down_grad_cuda(
             output.scalar_type(),
             "fp4_activation_cache_lora_down_grad_cuda_rank32",
             [&] {
-                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec>
-                    <<<blocks, threads, 0, stream>>>(
+                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec, kThreads>
+                    <<<blocks, kThreads, 0, stream>>>(
+                        qact.data_ptr<uint8_t>(),
+                        reinterpret_cast<const uint8_t*>(ascales.data_ptr()),
+                        dy_up.data_ptr<scalar_t>(),
+                        output.data_ptr<scalar_t>(),
+                        rows,
+                        cols,
+                        rank,
+                        static_cast<int>(padded_cols / kWarpK));
+            });
+    } else if (rank <= 64) {
+        // Rank-64 is common for sensitive projections. Use a wider rank tile and
+        // fewer threads so the reduction still fits under the 48KB static smem cap.
+        constexpr int kVec = 3;
+        constexpr int rVec = 32;
+        constexpr int kThreads = 128;
+        const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf,
+            at::kBFloat16,
+            output.scalar_type(),
+            "fp4_activation_cache_lora_down_grad_cuda_rank64",
+            [&] {
+                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec, kThreads>
+                    <<<blocks, kThreads, 0, stream>>>(
                         qact.data_ptr<uint8_t>(),
                         reinterpret_cast<const uint8_t*>(ascales.data_ptr()),
                         dy_up.data_ptr<scalar_t>(),
@@ -311,6 +336,7 @@ void fp4_activation_cache_lora_down_grad_cuda(
     } else {
         constexpr int kVec = 2;
         constexpr int rVec = 16;
+        constexpr int kThreads = 256;
         const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::kHalf,
@@ -318,8 +344,8 @@ void fp4_activation_cache_lora_down_grad_cuda(
             output.scalar_type(),
             "fp4_activation_cache_lora_down_grad_cuda",
             [&] {
-                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec>
-                    <<<blocks, threads, 0, stream>>>(
+                fp4_activation_cache_lora_down_grad_tiled_kernel<scalar_t, kVec, rVec, kThreads>
+                    <<<blocks, kThreads, 0, stream>>>(
                         qact.data_ptr<uint8_t>(),
                         reinterpret_cast<const uint8_t*>(ascales.data_ptr()),
                         dy_up.data_ptr<scalar_t>(),

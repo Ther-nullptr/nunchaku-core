@@ -24,9 +24,9 @@
 
 ## 本轮候选记录
 
-目标：优化 `fp4_activation_cache_lora_down_grad` 的 rank32 常见 LoRA 形状，降低 `fp4_activation_cache_d_lora_down=True` 显存模式的 backward 开销。
+目标：优化 `fp4_activation_cache_lora_down_grad` 的 rank32/rank64 常见 LoRA 形状，降低 `fp4_activation_cache_d_lora_down=True` 显存模式的 backward 开销。
 
-RTX 5090，BF16，`benchmark_fp4_lora_activation_cache_policy.py --warmup 5 --iters 10`：
+Rank32，RTX 5090，BF16，`benchmark_fp4_lora_activation_cache_policy.py --warmup 5 --iters 10`：
 
 | candidate | 2048 fused dA ms | 4096 fused dA ms | status | reason |
 | --- | ---: | ---: | --- | --- |
@@ -44,8 +44,33 @@ Stabler 30-iter promoted result:
 
 结论：`kVec=3,rVec=16` 对 2048 基本持平，对 4096 相比旧 `kVec=2,rVec=16` 约 `1.13x`。这仍慢于 `dequant -> GEMM`，但能减少 dense `x_hat` 物化，是显存压力模式的局部改进。
 
+Rank64，RTX 5090，BF16：
+
+| candidate | 2048 fused dA ms | 4096 fused dA ms | status | reason |
+| --- | ---: | ---: | --- | --- |
+| baseline `kVec=2,rVec=16,threads=256` | 0.4176 | 1.5043 | replaced | repeats activation decode across four rank tiles |
+| `kVec=2,rVec=32,threads=128` | 0.3943 | 1.3416 | rejected | reduces rank tiles but keeps the same column tile count |
+| `kVec=3,rVec=32,threads=128` | 0.3206 | 0.9876 | promoted | reduces both rank and column tile counts while staying within 48KB static smem |
+
+Correctness gate:
+
+```bash
+conda run -n triton python benchmarks/validate_native_fp4_lora_training.py \
+  --m 257 \
+  --in-features 512 \
+  --out-features 768 \
+  --rank 64 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --fuse-lora-dx \
+  --cache-fused-lora-dx \
+  --fp4-activation-cache-d-lora-down
+```
+
+该验证 `all_passed=true`，`lora_down_grad_vs_manual rel_l2=0`，FP4-cache `dA` 相对 exact saved-x `dA` 的 rel_l2 约 `9.68e-2`，符合该显存模式的近似边界。
+
 ## 下一步
 
 - 若继续追求性能，需要把 `dA` 改写成更接近 tensor-core GEMM 的形式，例如分块 dequant 到 shared/register 后做 rank tile MMA，或者显式分离 `qact` dequant staging 与 rank GEMM reduction。
-- 对 rank32 以外的 LoRA rank 需要继续做 tile sweep；当前 rank > 32 保持旧 `kVec=2,rVec=16`，避免无证据推广。
+- 对 rank64 以外的更高 LoRA rank 仍需继续做 tile sweep；当前 rank > 64 保持旧 `kVec=2,rVec=16`，避免无证据推广。
 - `dA` 精度瓶颈来自 FP4 activation cache 本身，kernel tile 只能优化速度，不能消除约 `1e-1` 的 exact saved-x `dA` 误差。

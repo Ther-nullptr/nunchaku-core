@@ -203,7 +203,11 @@ def main() -> None:
             "fp4_cache_fused_d_lora_down": (
                 "cuda_rank_tiled_kvec3_rvec16_rank_le_32"
                 if rank <= 32
-                else "cuda_rank_tiled_kvec2_rvec16"
+                else (
+                    "cuda_rank_tiled_kvec3_rvec32_threads128_rank_le_64"
+                    if rank <= 64
+                    else "cuda_rank_tiled_kvec2_rvec16"
+                )
             ),
         },
         "latency_ms": {

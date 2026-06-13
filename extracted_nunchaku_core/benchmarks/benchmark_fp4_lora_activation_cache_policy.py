@@ -204,8 +204,8 @@ def main() -> None:
                 "cuda_rank_tiled_kvec3_rvec16_rank_le_32"
                 if rank <= 32
                 else (
-                    "cuda_rank_tiled_kvec3_rvec32_threads128_rank_le_128"
-                    if rank <= 128
+                    "cuda_rank_tiled_kvec3_rvec32_threads128_rank_le_256"
+                    if rank <= 256
                     else "cuda_rank_tiled_kvec2_rvec16"
                 )
             ),

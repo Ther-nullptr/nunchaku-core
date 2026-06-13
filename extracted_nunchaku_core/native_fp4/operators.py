@@ -153,6 +153,41 @@ def quantize_fp4_act_with_lora_dual(
     return qout, oscales, lora_act_out, lora_act_dense
 
 
+def fp4_activation_cache_lora_down_grad(
+    qact: torch.Tensor,
+    ascales: torch.Tensor,
+    dy_up: torch.Tensor,
+    in_features: int | None = None,
+) -> torch.Tensor:
+    if qact.dim() != 2:
+        raise ValueError(f"Expected qact to be 2D, got shape={tuple(qact.shape)}")
+    if ascales.dim() != 2:
+        raise ValueError(f"Expected ascales to be 2D, got shape={tuple(ascales.shape)}")
+    if dy_up.dim() != 2:
+        raise ValueError(f"Expected dy_up to be 2D, got shape={tuple(dy_up.shape)}")
+    if qact.dtype != torch.uint8:
+        raise ValueError(f"qact must be uint8, got {qact.dtype}")
+    if ascales.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"ascales must be float8_e4m3fn, got {ascales.dtype}")
+    if dy_up.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("dy_up dtype must be float16, bfloat16, or float32")
+    if not qact.is_cuda or not ascales.is_cuda or not dy_up.is_cuda:
+        raise ValueError("qact, ascales, and dy_up must be CUDA tensors")
+
+    cols = qact.shape[1] * 2 if in_features is None else int(in_features)
+    if cols <= 0 or cols > qact.shape[1] * 2:
+        raise ValueError(f"in_features must be in (0, {qact.shape[1] * 2}], got {cols}")
+
+    output = torch.empty(dy_up.shape[1], cols, dtype=dy_up.dtype, device=dy_up.device)
+    _OPS.fp4_activation_cache_lora_down_grad(
+        qact.contiguous(),
+        ascales.contiguous(),
+        dy_up.contiguous(),
+        output,
+    )
+    return output
+
+
 class NunchakuFP4GemmOp(torch.nn.Module):
     """Native nunchaku FP4 GEMM operator (main branch only)."""
 

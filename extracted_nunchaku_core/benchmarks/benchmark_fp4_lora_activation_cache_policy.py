@@ -11,7 +11,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from native_fp4 import dequantize_fp4_activation  # noqa: E402
+from native_fp4 import dequantize_fp4_activation, fp4_activation_cache_lora_down_grad  # noqa: E402
 from native_fp4.operators import (  # noqa: E402
     ceil_divide,
     decode_lora_act,
@@ -122,6 +122,12 @@ def main() -> None:
 
     d_lora_down_ref = dy_up.t() @ x_lr
     d_lora_down_fp4_cache = dy_up.t() @ x_hat
+    d_lora_down_fp4_cache_fused = fp4_activation_cache_lora_down_grad(
+        qact,
+        ascales,
+        dy_up,
+        in_features=in_features,
+    )
     lora_act_ref = x_lr @ lora_down_lr.t()
     lora_act_decoded = decode_lora_act(packed_lora_act, lowrank_dtype)[:m, :rank].contiguous()
     d_lora_up_ref = dy_lr.t() @ lora_act_ref
@@ -149,6 +155,10 @@ def main() -> None:
         grad = dy_up.t() @ out[:m, :in_features].contiguous()
         _ = grad.float().sum()
 
+    def fp4_cache_fused_d_lora_down_fn() -> None:
+        grad = fp4_activation_cache_lora_down_grad(qact, ascales, dy_up, in_features=in_features)
+        _ = grad.float().sum()
+
     def dy_up_fn() -> None:
         out = dy_lr @ lora_up_lr
         _ = out.float().sum()
@@ -157,6 +167,7 @@ def main() -> None:
     dequant_only_ms = time_cuda(dequant_only_fn, args.warmup, args.iters)
     bf16_d_lora_down_ms = time_cuda(bf16_d_lora_down_fn, args.warmup, args.iters)
     fp4_cache_d_lora_down_ms = time_cuda(fp4_cache_d_lora_down_fn, args.warmup, args.iters)
+    fp4_cache_fused_d_lora_down_ms = time_cuda(fp4_cache_fused_d_lora_down_fn, args.warmup, args.iters)
     dy_up_ms = time_cuda(dy_up_fn, args.warmup, args.iters)
 
     bf16_x_cache_bytes = m * in_features * dtype_bytes(dtype)
@@ -194,16 +205,28 @@ def main() -> None:
             "bf16_or_fp16_saved_x_d_lora_down": bf16_d_lora_down_ms,
             "fp4_cache_dequant_only": dequant_only_ms,
             "fp4_cache_dequant_plus_d_lora_down": fp4_cache_d_lora_down_ms,
+            "fp4_cache_fused_d_lora_down": fp4_cache_fused_d_lora_down_ms,
         },
         "speedups": {
             "fp4_cache_dequant_plus_d_lora_down_vs_saved_x_d_lora_down": (
                 bf16_d_lora_down_ms / fp4_cache_d_lora_down_ms
+            ),
+            "fp4_cache_fused_d_lora_down_vs_saved_x_d_lora_down": (
+                bf16_d_lora_down_ms / fp4_cache_fused_d_lora_down_ms
+            ),
+            "fp4_cache_fused_d_lora_down_vs_dequant_plus_d_lora_down": (
+                fp4_cache_d_lora_down_ms / fp4_cache_fused_d_lora_down_ms
             ),
             "fp4_cache_dequant_only_over_saved_x_d_lora_down": dequant_only_ms / bf16_d_lora_down_ms,
         },
         "errors": {
             "x_hat_vs_x": tensor_error(x_hat, x_lr),
             "d_lora_down_fp4_cache_vs_saved_x": tensor_error(d_lora_down_fp4_cache, d_lora_down_ref),
+            "d_lora_down_fp4_cache_fused_vs_saved_x": tensor_error(d_lora_down_fp4_cache_fused, d_lora_down_ref),
+            "d_lora_down_fp4_cache_fused_vs_dequant_gemm": tensor_error(
+                d_lora_down_fp4_cache_fused,
+                d_lora_down_fp4_cache,
+            ),
             "lora_act_decoded_vs_dense": tensor_error(lora_act_decoded, lora_act_ref),
             "d_lora_up_decoded_vs_dense": tensor_error(d_lora_up_decoded, d_lora_up_ref),
         },

@@ -47,12 +47,27 @@ def _name_excluded(full_name: str, child_name: str, patterns: tuple[str, ...]) -
     return _name_matches(full_name, child_name, patterns)
 
 
+def _select_config(
+    base_config: FP4LoRAConfig,
+    full_name: str,
+    child_name: str,
+    overrides: Mapping[str, FP4LoRAConfig] | None,
+) -> FP4LoRAConfig:
+    if not overrides:
+        return base_config
+    for pattern, override in overrides.items():
+        if _name_matches(full_name, child_name, (pattern,)):
+            return override
+    return base_config
+
+
 def convert_linear_to_fp4_lora(
     module: torch.nn.Module,
     config: FP4LoRAConfig | None = None,
     *,
     target_modules: Iterable[str] | None = None,
     exclude_modules: Iterable[str] | None = None,
+    config_overrides: Mapping[str, FP4LoRAConfig] | None = None,
     inplace: bool = True,
 ) -> tuple[torch.nn.Module, list[str]]:
     """Replace selected CUDA Linear modules with NunchakuFP4LoRALinear.
@@ -60,6 +75,8 @@ def convert_linear_to_fp4_lora(
     Matching uses the full module path, the child name, or a full-path suffix.
     For example, target_modules=("q_proj", "down_proj") matches
     "layers.0.self_attn.q_proj" and "layers.0.mlp.down_proj".
+    ``config_overrides`` uses the same matching rules and the first matching
+    override wins, which makes sensitive-layer policies deterministic.
     """
 
     cfg = FP4LoRAConfig() if config is None else config
@@ -73,24 +90,25 @@ def convert_linear_to_fp4_lora(
             full_name = f"{prefix}.{child_name}" if prefix else child_name
             if isinstance(child, torch.nn.Linear):
                 if _name_matches(full_name, child_name, targets) and not _name_excluded(full_name, child_name, excludes):
+                    child_cfg = _select_config(cfg, full_name, child_name, config_overrides)
                     if not child.weight.is_cuda:
                         raise ValueError(f"Linear module {full_name!r} must be on CUDA before FP4 LoRA conversion")
                     if child.weight.dtype not in (torch.float16, torch.bfloat16):
                         raise ValueError(f"Linear module {full_name!r} weight must be float16 or bfloat16")
                     fp4_lora = NunchakuFP4LoRALinear.from_linear(
                         child,
-                        rank=cfg.rank,
-                        lora_alpha=cfg.lora_alpha,
-                        lowrank_dtype=cfg.lowrank_dtype,
-                        init=cfg.init,
-                        frozen_residual_rank=cfg.frozen_residual_rank,
-                        frozen_residual_init=cfg.frozen_residual_init,
-                        train_bias=cfg.train_bias,
-                        cache_lora_act=cfg.cache_lora_act,
-                        fuse_lora_dx=cfg.fuse_lora_dx,
-                        fuse_frozen_residual_dx=cfg.fuse_frozen_residual_dx,
-                        cache_fused_lora_dx=cfg.cache_fused_lora_dx,
-                        reuse_fused_dy_up_for_d_lora_down=cfg.reuse_fused_dy_up_for_d_lora_down,
+                        rank=child_cfg.rank,
+                        lora_alpha=child_cfg.lora_alpha,
+                        lowrank_dtype=child_cfg.lowrank_dtype,
+                        init=child_cfg.init,
+                        frozen_residual_rank=child_cfg.frozen_residual_rank,
+                        frozen_residual_init=child_cfg.frozen_residual_init,
+                        train_bias=child_cfg.train_bias,
+                        cache_lora_act=child_cfg.cache_lora_act,
+                        fuse_lora_dx=child_cfg.fuse_lora_dx,
+                        fuse_frozen_residual_dx=child_cfg.fuse_frozen_residual_dx,
+                        cache_fused_lora_dx=child_cfg.cache_fused_lora_dx,
+                        reuse_fused_dy_up_for_d_lora_down=child_cfg.reuse_fused_dy_up_for_d_lora_down,
                     )
                     setattr(parent, child_name, fp4_lora)
                     replaced.append(full_name)

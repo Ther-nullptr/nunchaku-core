@@ -99,6 +99,8 @@ y = op(x)
 模型级替换示例：
 
 ```python
+from dataclasses import replace
+
 from native_fp4 import FP4LoRAConfig, convert_linear_to_fp4_lora
 
 cfg = FP4LoRAConfig(
@@ -111,11 +113,18 @@ cfg = FP4LoRAConfig(
     cache_fused_lora_dx=True,
 )
 
+sensitive_overrides = {
+    # 同一模型内不同 projection 可用不同 LoRA/residual 策略。
+    # 典型用途：down_proj 或 activation outlier 明显的完整模块路径。
+    "layers.1.mlp.down_proj": replace(cfg, rank=64, fuse_frozen_residual_dx=False),
+}
+
 model, replaced = convert_linear_to_fp4_lora(
     model.cuda().to(torch.bfloat16),
     cfg,
-    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"),
+    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
+    config_overrides=sensitive_overrides,
 )
 ```
 
@@ -156,6 +165,7 @@ optimizer 边界：
 - `target_modules=None`：替换所有 `torch.nn.Linear`。
 - `target_modules=("q_proj",)`：匹配完整路径、子模块名或完整路径后缀。
 - `exclude_modules` 使用同样的匹配规则，优先排除。
+- `config_overrides` 使用同样匹配规则，第一条匹配生效；用于对敏感层单独提高 rank、切换 init、关闭实验 fusion 或改 residual branch。
 
 参数：
 
@@ -173,7 +183,7 @@ optimizer 边界：
   - `rank/"residual_svd"`：额外构造 frozen residual branch，推荐与 `init="zero"` 搭配，避免训练破坏量化补偿。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
-- `target_modules/exclude_modules`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA。
+- `target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
 
 ## 当前 backward 边界
 

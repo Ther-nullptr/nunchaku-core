@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 
 import torch
 
@@ -90,11 +91,15 @@ def main() -> None:
         fuse_frozen_residual_dx=args.fuse_frozen_residual_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
     )
+    override_rank = 16 if args.rank != 16 else 32
+    override_cfg = replace(cfg, rank=override_rank, init="zero")
+    config_overrides = {"layers.1.down_proj": override_cfg}
     model, replaced = convert_linear_to_fp4_lora(
         model,
         cfg,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
+        config_overrides=config_overrides,
     )
     trainable = freeze_non_fp4_lora_parameters(model)
     refreshed = refresh_fused_lora_dx_caches(model)
@@ -157,11 +162,13 @@ def main() -> None:
         cfg,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
+        config_overrides=config_overrides,
     )
     pre_load_refreshed = refresh_fused_lora_dx_caches(model2)
     missing, unexpected = load_fp4_lora_state_dict(model2, adapter_state, strict=True)
     loaded_state = fp4_lora_state_dict(model2)
     loaded_matches = all(torch.equal(adapter_state[key], loaded_state[key]) for key in expected_adapter_keys)
+    fp4_modules2 = dict(iter_fp4_lora_modules(model2))
     caches_cleared_after_load = all(
         child._cached_lora_down_bwd_packed is None and child._cached_lora_up_bwd_packed is None
         for _, child in iter_fp4_lora_modules(model2)
@@ -179,6 +186,14 @@ def main() -> None:
         "second_model_replaced_expected_modules": set(replaced2) == expected_replaced,
         "lm_head_not_replaced": not isinstance(model.lm_head, NunchakuFP4LoRALinear),
         "all_replaced_are_fp4_lora": all(isinstance(fp4_modules[name], NunchakuFP4LoRALinear) for name in expected_replaced),
+        "config_override_rank_applied": fp4_modules["layers.1.down_proj"].requested_rank == override_rank,
+        "config_override_init_applied": fp4_modules["layers.1.down_proj"].init_mode == "zero",
+        "base_configs_preserved": all(
+            fp4_modules[name].requested_rank == args.rank and fp4_modules[name].init_mode == args.init
+            for name in expected_replaced
+            if name != "layers.1.down_proj"
+        ),
+        "second_model_config_override_rank_applied": fp4_modules2["layers.1.down_proj"].requested_rank == override_rank,
         "only_lora_trainable": trainable_named == set(trainable),
         "trainable_grads_present": set(trainable).issubset(grad_named),
         "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
@@ -216,6 +231,12 @@ def main() -> None:
             "fuse_lora_dx": args.fuse_lora_dx,
             "fuse_frozen_residual_dx": args.fuse_frozen_residual_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
+        },
+        "config_overrides": {
+            "layers.1.down_proj": {
+                "rank": override_rank,
+                "init": "zero",
+            }
         },
         "replaced": replaced,
         "trainable": trainable,

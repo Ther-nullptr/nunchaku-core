@@ -512,6 +512,8 @@ RTX 5090 短测，默认 shapes：
 真实模型微调不应该手工逐层替换。`native_fp4.modeling` 提供了模型级工具：
 
 ```python
+from dataclasses import replace
+
 from native_fp4 import (
     FP4LoRAConfig,
     convert_linear_to_fp4_lora,
@@ -536,11 +538,18 @@ cfg = FP4LoRAConfig(
     cache_fused_lora_dx=True,
 )
 
+sensitive_overrides = {
+    # 完整路径、子模块名和完整路径后缀都可匹配；第一条匹配生效。
+    # 用于 down_proj/outlier 层等敏感模块：可单独加 rank、改 init 或关闭实验 fusion。
+    "layers.1.mlp.down_proj": replace(cfg, rank=64, fuse_frozen_residual_dx=False),
+}
+
 model, replaced = convert_linear_to_fp4_lora(
     model,
     cfg,
-    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"),
+    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
+    config_overrides=sensitive_overrides,
 )
 trainable = freeze_non_fp4_lora_parameters(model)
 refresh_fused_lora_dx_caches(model)
@@ -554,6 +563,7 @@ load_fp4_lora_state_dict(model, adapter_state)
 ```
 
 如果只想跑单分支 task LoRA，把 `frozen_residual_rank=0` 且 `frozen_residual_init="none"`。
+如果已经通过 sensitivity scan 发现某些完整模块路径不适合 FP4，可用 `exclude_modules` 保持 BF16；如果只是需要更强补偿能力，优先用 `config_overrides` 对这些模块单独提高 rank 或调整 residual/task LoRA 策略。
 
 验证批量替换、冻结参数、cache refresh/clear 和 backward：
 
@@ -588,6 +598,7 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 
 - `results/latest_native_fp4_lora_modeling_validation.json`
 - BF16 fused cached 路径：替换 4 个目标 Linear，`lm_head` 保持 dense，只有 LoRA A/B 可训练，optimizer 参数组、post-step cache refresh hook、LoRA-only state_dict strict load 和 backward 均通过。
+- `config_overrides` 路径：验证 `layers.1.down_proj` 可独立覆盖 rank/init，第二个模型 strict load 同样按该策略构造。
 - dual-branch 路径：`frozen_residual_*` 是 frozen buffer，不进入 optimizer 参数组，也不进入 LoRA-only adapter checkpoint。
 - FP16 下可打开 `fuse_frozen_residual_dx=True`，把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 下该路径目前误差偏大，默认关闭。
 

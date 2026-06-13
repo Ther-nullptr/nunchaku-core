@@ -659,6 +659,30 @@ config_overrides = fp4_lora_config_overrides_from_outlier_report(
 )
 ```
 
+## 10.7 Outlier-driven overrides 开销 benchmark
+
+提高敏感模块 rank 会增加 LoRA 分支计算。用下面脚本量化 base config 和 outlier-driven overrides 的 train-step 开销：
+
+```bash
+python benchmarks/benchmark_fp4_lora_outlier_overrides.py \
+  --batch 4 \
+  --hidden 128 \
+  --layers 2 \
+  --rank 32 \
+  --override-rank 64 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 3 \
+  --iters 5
+```
+
+输出：
+
+- `results/latest_fp4_lora_outlier_override_overhead.json`
+- `latency_ms.base_train_step`
+- `latency_ms.override_train_step`
+- `overhead.override_over_base`
+
 ## 11. 建议的完整实验顺序
 
 直接按下面执行即可：
@@ -678,6 +702,7 @@ python benchmarks/validate_native_fp4_lora_training.py --m 129 --in-features 512
 python benchmarks/validate_native_fp4_lora_pack.py --dtype bf16 --warmup 20 --iters 100
 python benchmarks/validate_native_fp4_lora_modeling.py --batch 8 --hidden 256 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
+python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype bf16 --warmup 10 --iters 30
 python benchmarks/benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --frozen-residual-rank 32 --dtype fp16 --warmup 10 --iters 30
@@ -763,6 +788,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 2048 --in-features 20
   - 模型级 Linear 替换、参数冻结和 cache 管理验证
 - `latest_fp4_lora_activation_grad_outliers.json`
   - FP4 LoRA activation / grad-output outlier 诊断和 rank/smooth 建议
+- `latest_fp4_lora_outlier_override_overhead.json`
+  - outlier-driven `config_overrides` 相对 base config 的 train-step 开销
 
 另外还会生成带时间戳的快照 JSON，方便保留历史实验结果。
 

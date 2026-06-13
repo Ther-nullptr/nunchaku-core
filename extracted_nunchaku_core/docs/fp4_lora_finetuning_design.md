@@ -387,6 +387,23 @@ config_overrides = fp4_lora_config_overrides_from_outlier_report(
 )
 ```
 
+测 rank bump 策略的训练开销：
+
+```bash
+python benchmarks/benchmark_fp4_lora_outlier_overrides.py \
+  --batch 4 \
+  --hidden 128 \
+  --layers 2 \
+  --rank 32 \
+  --override-rank 64 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 3 \
+  --iters 5
+```
+
+关注 `latency_ms.base_train_step`、`latency_ms.override_train_step` 和 `overhead.override_over_base`。
+
 ## 验证命令
 
 ```bash

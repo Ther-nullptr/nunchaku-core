@@ -349,6 +349,19 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training_breakdo
   --iters 10
 ```
 
+新增 low-rank grad 子图 benchmark：
+
+```bash
+conda run -n triton python benchmarks/benchmark_fp4_lora_lowrank_grad.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --ranks 16,32,64,128 \
+  --dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
 RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 | dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
@@ -356,9 +369,17 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | BF16 | 0.6195 | 0.2152 | 0.0761 | 12.3% | 0.0388 |
 | FP16 | 0.6467 | 0.2275 | 0.0396 | 6.1% | 0.0128 |
 
+低秩梯度子图短测，`M=N=K=4096, rank=32`：
+
+| dtype | sequential dA+dB ms | reuse existing dy_up ms | reuse speedup | two-stream overlap ms | overlap vs sequential |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 0.0855 | 0.0623 | 1.37x | 0.0928 | 0.92x |
+| FP16 | 0.0536 | 0.0390 | 1.37x | 0.0748 | 0.72x |
+
 直接结论：
 
 - `dA/dB` 目前不是最大瓶颈；低秩梯度专用 kernel 的收益上限有限。
+- 单独给 `dA/dB` 加 CUDA stream overlap 在 5090 上反而变慢；后续低秩梯度 kernel 应优先围绕复用/消除 `dy_up` 中间量设计。
 - 更值得优先看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
 - LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
 
@@ -405,7 +426,7 @@ P1：optimizer post-step eager refresh 接口已落地；后续需要在多层�
 
 P2：继续研究 BF16 下 packed `dY @ B` 复用的精度问题；当前仅 FP16 opt-in，BF16 必须继续用 dense `dY @ B` 保护 `dA`。
 
-P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。
+P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。`benchmark_fp4_lora_lowrank_grad.py` 已给出基线：rank32 下复用已有 `dy_up` 可让低秩梯度 pair 快约 `1.37x`，但单独双 stream overlap 会退化。因此下一版 kernel 不应只做 stream overlap，而应尝试把 `dy_up=dY@B` 与 `dA=dy_up^T@X` 的中间量复用/压缩，或做 CUTLASS grouped/specialized small-N GEMM 对照。
 
 P4：加入 activation cache policy：
 

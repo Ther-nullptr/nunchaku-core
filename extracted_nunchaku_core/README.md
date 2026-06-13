@@ -548,12 +548,36 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py \
 
 - `results/latest_native_fp4_lora_training_breakdown.json`
 
+如果要单独判断 `dA/dB` 低秩梯度子图是否值得写专用 kernel，跑：
+
+```bash
+python benchmarks/benchmark_fp4_lora_lowrank_grad.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --ranks 16,32,64,128 \
+  --dtype bf16 \
+  --warmup 5 \
+  --iters 10
+```
+
+结果会写到：
+
+- `results/latest_fp4_lora_lowrank_grad.json`
+
 RTX 5090 短测，`M=N=K=4096, rank=32`：
 
 | dtype | backward estimate ms | fused dX cached-pack ms | dense LoRA grad pair ms | LoRA grad share | LoRA pack refresh ms |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16 | 0.6195 | 0.2152 | 0.0761 | 12.3% | 0.0388 |
 | FP16 | 0.6467 | 0.2275 | 0.0396 | 6.1% | 0.0128 |
+
+低秩梯度子图短测，`M=N=K=4096, rank=32`：
+
+| dtype | sequential dA+dB ms | reuse existing dy_up ms | reuse speedup | two-stream overlap ms | overlap vs sequential |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 0.0855 | 0.0623 | 1.37x | 0.0928 | 0.92x |
+| FP16 | 0.0536 | 0.0390 | 1.37x | 0.0748 | 0.72x |
 
 本轮 repack micro-optimization 后，RTX 5090 同形状 BF16 短测：
 
@@ -569,6 +593,7 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 结论：
 
 - `dA/dB` 目前不是最大瓶颈；先写专用低秩梯度 kernel 的收益上限有限。
+- 单独给 `dA/dB` 加 CUDA stream overlap 在 5090 上反而变慢；后续低秩梯度 kernel 要优先围绕复用/消除 `dy_up` 中间量设计。
 - 下一步更应该看 FP4 dX 主路径，包括 `dY` quantize、backbone repack、fused dX epilogue 的调度和重叠。
 - LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
 
@@ -1188,6 +1213,8 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
   - FP4 LoRA training wrapper correctness
 - `latest_native_fp4_lora_training.json`
   - FP4 LoRA training benchmark
+- `latest_fp4_lora_lowrank_grad.json`
+  - FP4 LoRA 低秩梯度子图 benchmark，拆分 `dy_up/dA/dB`、复用 `dy_up` 和双 stream overlap
 - `latest_native_fp4_lora_dual_branch_bf16.json`
   - dual-branch BF16 residual dense dX benchmark
 - `latest_native_fp4_lora_dual_branch_fp16.json`

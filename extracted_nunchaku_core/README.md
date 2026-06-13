@@ -709,7 +709,7 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
   --iters 5
 ```
 
-输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`initial_forward_vs_dense` 和相对 `balanced` 的 train-step speedup。
+输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
 
 RTX 5090 验证结果：
 
@@ -1191,7 +1191,7 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
 - `latest_fp4_lora_prepare_validation.json`
   - 高层 `prepare_fp4_lora_finetuning` 接口的模型替换、冻结、optimizer 参数组和 cache hook 验证
 - `latest_fp4_lora_prepare_policies.json`
-  - 高层 `prepare_fp4_lora_finetuning` preset 的模型级 train step、optimizer/cache hook、peak memory 和 forward 误差消融
+  - 高层 `prepare_fp4_lora_finetuning` preset 相对 dense LoRA baseline 的模型级 train step、optimizer/cache hook、peak memory 和 forward 误差消融
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`

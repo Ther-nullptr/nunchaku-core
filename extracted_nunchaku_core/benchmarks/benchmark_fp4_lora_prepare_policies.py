@@ -19,6 +19,8 @@ from native_fp4 import FP4LoRAConfig, iter_fp4_lora_modules, prepare_fp4_lora_fi
 
 
 MODES = ("accuracy", "balanced", "throughput", "memory_saving")
+TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+EXCLUDE_MODULES = ("lm_head",)
 
 
 class TinyTransformerBlock(torch.nn.Module):
@@ -50,12 +52,98 @@ class TinyTransformer(torch.nn.Module):
         return self.lm_head(x)
 
 
+class DenseLoRALinear(torch.nn.Module):
+    def __init__(
+        self,
+        linear: torch.nn.Linear,
+        *,
+        rank: int,
+        lora_alpha: float | None,
+        lowrank_dtype: torch.dtype,
+        train_bias: bool,
+    ):
+        super().__init__()
+        self.out_features, self.in_features = linear.weight.shape
+        self.rank = max(16, ((int(rank) + 15) // 16) * 16)
+        self.requested_rank = int(rank)
+        self.lora_alpha = float(self.rank if lora_alpha is None else lora_alpha)
+        self.scaling = self.lora_alpha / float(self.rank)
+        self.lowrank_dtype = lowrank_dtype
+        self.register_buffer("weight", linear.weight.detach().contiguous(), persistent=True)
+        if linear.bias is None:
+            self.register_parameter("bias", None)
+        elif train_bias:
+            self.bias = torch.nn.Parameter(linear.bias.detach().contiguous())
+        else:
+            self.register_buffer("bias", linear.bias.detach().contiguous(), persistent=True)
+        self.lora_down = torch.nn.Parameter(
+            torch.empty(self.rank, self.in_features, device=linear.weight.device, dtype=lowrank_dtype)
+        )
+        self.lora_up = torch.nn.Parameter(
+            torch.empty(self.out_features, self.rank, device=linear.weight.device, dtype=lowrank_dtype)
+        )
+        self.reset_lora_parameters()
+
+    def reset_lora_parameters(self) -> None:
+        torch.nn.init.kaiming_uniform_(self.lora_down, a=5**0.5)
+        torch.nn.init.zeros_(self.lora_up)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.linear(x, self.weight, self.bias)
+        x2d = x.reshape(-1, self.in_features).to(self.lowrank_dtype)
+        lora_act = torch.matmul(x2d, self.lora_down.t())
+        lora_out = torch.matmul(lora_act, self.lora_up.t()).mul(self.scaling)
+        return y + lora_out.to(y.dtype).reshape(*x.shape[:-1], self.out_features)
+
+
 def dtype_from_name(name: str) -> torch.dtype:
     if name == "fp16":
         return torch.float16
     if name == "bf16":
         return torch.bfloat16
     raise ValueError(f"Unsupported dtype: {name}")
+
+
+def name_matches(full_name: str, child_name: str, patterns: tuple[str, ...]) -> bool:
+    return any(full_name == pattern or child_name == pattern or full_name.endswith(f".{pattern}") for pattern in patterns)
+
+
+def convert_linear_to_dense_lora(
+    module: torch.nn.Module,
+    *,
+    rank: int,
+    lora_alpha: float | None,
+    lowrank_dtype: torch.dtype,
+    train_bias: bool,
+    target_modules: tuple[str, ...] = TARGET_MODULES,
+    exclude_modules: tuple[str, ...] = EXCLUDE_MODULES,
+) -> list[str]:
+    replaced: list[str] = []
+
+    def visit(parent: torch.nn.Module, prefix: str) -> None:
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, torch.nn.Linear):
+                is_target = name_matches(full_name, child_name, target_modules)
+                is_excluded = name_matches(full_name, child_name, exclude_modules)
+                if is_target and not is_excluded:
+                    setattr(
+                        parent,
+                        child_name,
+                        DenseLoRALinear(
+                            child,
+                            rank=rank,
+                            lora_alpha=lora_alpha,
+                            lowrank_dtype=lowrank_dtype,
+                            train_bias=train_bias,
+                        ),
+                    )
+                    replaced.append(full_name)
+                    continue
+            visit(child, full_name)
+
+    visit(module, "")
+    return replaced
 
 
 def jsonable_config(cfg: FP4LoRAConfig) -> dict[str, Any]:
@@ -252,6 +340,86 @@ def run_record(
     }
 
 
+def run_dense_lora_baseline(
+    *,
+    args: argparse.Namespace,
+    dense_state: dict[str, torch.Tensor],
+    dense_y_ref: torch.Tensor,
+    dtype: torch.dtype,
+    lowrank_dtype: torch.dtype,
+) -> dict[str, Any]:
+    torch.manual_seed(args.seed)
+    model = TinyTransformer(args.hidden, args.layers, dtype=dtype).cuda()
+    model.load_state_dict(dense_state)
+    model.train()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    replaced = convert_linear_to_dense_lora(
+        model,
+        rank=args.rank,
+        lora_alpha=None,
+        lowrank_dtype=lowrank_dtype,
+        train_bias=args.train_bias,
+    )
+    params = [param for param in model.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr, eps=args.adam_eps, weight_decay=args.lora_weight_decay)
+    x, target = make_inputs(args, dtype)
+
+    with torch.no_grad():
+        initial_y = model(x.detach())
+    initial_error = tensor_error(initial_y, dense_y_ref)
+
+    def fn() -> None:
+        train_step(model, x, target, optimizer)
+
+    latency_ms = time_cuda(fn, warmup=args.warmup, iters=args.iters)
+    peak_delta, peak_baseline, peak = measure_peak_delta(fn)
+    y, loss = train_step(model, x, target, optimizer)
+    torch.cuda.synchronize()
+
+    trainable_param_count = int(sum(param.numel() for param in params))
+    trainable_names = {name for name, param in model.named_parameters() if param.requires_grad}
+    grads_finite = all(param.grad is not None and bool(torch.isfinite(param.grad).all()) for param in params)
+    checks = {
+        "replaced_count_matches": len(replaced) == args.layers * 7,
+        "trainable_param_count_positive": trainable_param_count > 0,
+        "only_lora_or_trainable_bias_trainable": all(
+            name.endswith("lora_down")
+            or name.endswith("lora_up")
+            or (args.train_bias and name.endswith("bias") and "lm_head" not in name)
+            for name in trainable_names
+        ),
+        "loss_finite": bool(torch.isfinite(loss)),
+        "output_finite": bool(torch.isfinite(y).all()),
+        "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
+        "trainable_grads_finite": grads_finite,
+        "latency_positive": latency_ms > 0.0,
+        "peak_delta_nonnegative": peak_delta >= 0,
+    }
+    return {
+        "record": "dense_lora",
+        "replaced_count": len(replaced),
+        "trainable_param_count": trainable_param_count,
+        "trainable_names": sorted(trainable_names),
+        "latency_ms": {
+            "train_step_with_optimizer": latency_ms,
+        },
+        "throughput": {
+            "steps_per_second": 1000.0 / latency_ms,
+            "samples_per_second": args.batch * 1000.0 / latency_ms,
+        },
+        "peak_memory_bytes": {
+            "train_step_delta": peak_delta,
+            "baseline": peak_baseline,
+            "peak": peak,
+        },
+        "initial_forward_vs_dense": initial_error,
+        "final_loss": float(loss.detach().item()),
+        "checks": checks,
+        "all_passed": bool(all(checks.values())),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark model-level FP4 LoRA prepare() policy presets.")
     p.add_argument("--batch", type=int, default=8)
@@ -301,6 +469,13 @@ def main() -> None:
     del dense_ref, x_ref
     torch.cuda.empty_cache()
 
+    dense_lora = run_dense_lora_baseline(
+        args=args,
+        dense_state=dense_state,
+        dense_y_ref=dense_y_ref,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+    )
     records = [
         run_record(
             args=args,
@@ -324,6 +499,16 @@ def main() -> None:
             "baseline_record": baseline_name,
             "train_step_speedup": baseline_latency / record["latency_ms"]["train_step_with_optimizer"],
         }
+        dense_latency = dense_lora["latency_ms"]["train_step_with_optimizer"]
+        dense_peak_delta = dense_lora["peak_memory_bytes"]["train_step_delta"]
+        record["relative_to_dense_lora"] = {
+            "train_step_speedup": dense_latency / record["latency_ms"]["train_step_with_optimizer"],
+            "peak_delta_ratio": (
+                None
+                if dense_peak_delta <= 0
+                else record["peak_memory_bytes"]["train_step_delta"] / dense_peak_delta
+            ),
+        }
 
     payload = {
         "experiment": "fp4_lora_prepare_policy_benchmark",
@@ -344,8 +529,9 @@ def main() -> None:
             "warmup": args.warmup,
             "iters": args.iters,
         },
+        "dense_lora_baseline": dense_lora,
         "records": {record["record"]: record for record in records},
-        "all_passed": bool(all(record["all_passed"] for record in records)),
+        "all_passed": bool(dense_lora["all_passed"] and all(record["all_passed"] for record in records)),
     }
 
     os.makedirs(args.results_dir, exist_ok=True)

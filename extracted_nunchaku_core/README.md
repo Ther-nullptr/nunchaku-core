@@ -548,6 +548,7 @@ python benchmarks/benchmark_native_fp4_lora_training_breakdown.py \
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16 \
+  --backward-weight-policy repack \
   --warmup 5 \
   --iters 10
 ```
@@ -597,6 +598,8 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16 | 0.6195 | 0.2152 | 0.0761 | 12.3% | 0.0388 |
 | FP16 | 0.6467 | 0.2275 | 0.0396 | 6.1% | 0.0128 |
+
+追加 `--backward-weight-policy cache` 时，breakdown 会同时报告 `latency_ms.backward_qweight_policy_access`、`latency_ms.refresh_backward_qweight_cache` 和 `backward_weight_cache_bytes.cached_backward_qweight_vs_dense_weight`，用于区分 transient repack、cache hit 和 cache 预热成本。
 
 低秩梯度子图短测，`M=N=K=4096, rank=32`：
 

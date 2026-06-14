@@ -349,6 +349,7 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training_breakdo
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16 \
+  --backward-weight-policy repack \
   --warmup 5 \
   --iters 10
 ```
@@ -406,6 +407,7 @@ FP4 dX pipeline 短测，`M=N=K=4096, rank=32`：
 - `dA/dB` 目前不是最大瓶颈；低秩梯度专用 kernel 的收益上限有限。
 - 单独给 `dA/dB` 加 CUDA stream overlap 在 5090 上反而变慢；后续低秩梯度 kernel 应优先围绕复用/消除 `dy_up` 中间量设计。
 - FP4 dX 主路径中 prequantized GEMM 占比最大，`dY` quantize 和 transient repack 各约 20%。预存 `W^T` 的 cached-qweight 消融上界只有约 `1.33x-1.34x`，且会带来第二份 backbone 内存，不作为默认方案。
+- `benchmark_native_fp4_lora_training_breakdown.py --backward-weight-policy cache` 会保留强制 transient `repack_backbone` 指标，并额外报告 `backward_qweight_policy_access`、`refresh_backward_qweight_cache` 和常驻 qweight 字节，用于判断 cache hit 与预热成本。
 - LoRA pack refresh 已经换成 native CUDA layout pack；相对旧 PyTorch `pad + permute + contiguous` 路径，4096/rank32 短测约减少一半。
 
 ### Native FP4 backward repack micro-optimization

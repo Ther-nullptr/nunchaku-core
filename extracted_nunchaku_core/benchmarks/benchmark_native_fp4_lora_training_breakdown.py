@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--seed", type=int, default=0)
@@ -72,6 +73,7 @@ def main() -> None:
         cache_lora_act=True,
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
+        backward_weight_policy=args.backward_weight_policy,
     )
 
     x2d = x.detach().reshape(-1, op.in_features)
@@ -83,6 +85,8 @@ def main() -> None:
     lora_act = torch.matmul(x_lr, down_lr.t()).contiguous()
     dy_up = torch.matmul(dy_lr, up_lr).contiguous()
     op.refresh_fused_lora_dx_cache()
+    if args.backward_weight_policy == "cache":
+        op.refresh_backward_weight_cache()
     packed_lora_dx = op._get_fused_lora_dx_cache()
 
     def forward_train_graph_fn() -> torch.Tensor:
@@ -93,7 +97,14 @@ def main() -> None:
         op.refresh_fused_lora_dx_cache()
 
     def repack_backbone_fn() -> torch.Tensor:
+        return op.fp4_backward._repack_qweight_for_backward()
+
+    def backward_qweight_policy_access_fn() -> torch.Tensor:
         return op.fp4_backward.repack_qweight_for_backward()
+
+    def refresh_backward_qweight_cache_fn() -> torch.Tensor | None:
+        op.clear_backward_weight_cache()
+        return op.refresh_backward_weight_cache()
 
     def fp4_dx_main_fn() -> torch.Tensor:
         return op.fp4_backward(dy)
@@ -146,10 +157,16 @@ def main() -> None:
         loss = (y.float() * dy.float()).sum()
         loss.backward()
 
+    refresh_backward_qweight_cache_ms = None
+    if args.backward_weight_policy == "cache":
+        refresh_backward_qweight_cache_ms = time_cuda(refresh_backward_qweight_cache_fn, args.warmup, args.iters)
+
     latency = {
         "forward_train_graph": time_cuda(forward_train_graph_fn, args.warmup, args.iters),
         "refresh_lora_dx_pack": time_cuda(refresh_lora_pack_fn, args.warmup, args.iters),
         "repack_backbone": time_cuda(repack_backbone_fn, args.warmup, args.iters),
+        "backward_qweight_policy_access": time_cuda(backward_qweight_policy_access_fn, args.warmup, args.iters),
+        "refresh_backward_qweight_cache": refresh_backward_qweight_cache_ms,
         "fp4_dx_main": time_cuda(fp4_dx_main_fn, args.warmup, args.iters),
         "fused_dx_dynamic_pack": time_cuda(fused_dx_dynamic_pack_fn, args.warmup, args.iters),
         "fused_dx_cached_pack": time_cuda(fused_dx_cached_pack_fn, args.warmup, args.iters),
@@ -162,6 +179,9 @@ def main() -> None:
     }
 
     backward = latency["full_backward_cached_pack"] - latency["forward_train_graph"]
+    cached_qweight = op.fp4_backward._cached_qweight_bwd
+    cached_backward_qweight_bytes = 0 if cached_qweight is None else cached_qweight.numel() * cached_qweight.element_size()
+    dense_weight_bytes = weight.numel() * weight.element_size()
     payload = {
         "shape": {
             "m": args.m,
@@ -171,10 +191,19 @@ def main() -> None:
             "effective_rank": op.rank,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
+            "backward_weight_policy": args.backward_weight_policy,
+        },
+        "backward_weight_cache_bytes": {
+            "cached_backward_qweight": int(cached_backward_qweight_bytes),
+            "dense_weight": int(dense_weight_bytes),
+            "cached_backward_qweight_vs_dense_weight": cached_backward_qweight_bytes / dense_weight_bytes,
         },
         "latency_ms": latency,
         "derived": {
             "full_backward_minus_forward": backward,
+            "backward_qweight_policy_access_over_repack": (
+                latency["backward_qweight_policy_access"] / latency["repack_backbone"]
+            ),
             "cached_pack_over_dynamic_pack": latency["fused_dx_dynamic_pack"] / latency["fused_dx_cached_pack"],
             "lora_pack_over_cached_fused_dx": latency["refresh_lora_dx_pack"] / latency["fused_dx_cached_pack"],
             "dy_up_over_backward": latency["dy_up"] / backward,

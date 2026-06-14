@@ -161,7 +161,7 @@ model = prepared.model
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则；`memory_saving + fp4_activation_cache_d_lora_down_backend="dequant_gemm"` 也通过。验证脚本也覆盖 `backward_weight_policy="cache"`，确认 compressed backward qweight cache 预热后仍常驻。
 
-`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；task-only native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、初始 forward 误差和相对 dense LoRA speedup 消融。
 
@@ -237,7 +237,7 @@ optimizer 边界：
   - `svd_lowrank`：使用 `torch.svd_lowrank`，通过 `residual_svd_lowrank_oversample/niter` 控制随机低秩 SVD；适合大模型批量转换。
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
 - `activation_checkpoint`：逐 `NunchakuFP4LoRALinear` 的局部 checkpoint。它只省该算子内部 saved tensors；要显著降低多层输入 activation，应该在 transformer block/segment 外层做 checkpoint。
-- `fuse_lowrank_forward`：opt-in forward 消融选项。无 frozen residual 且 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable LoRA forward 并入 FP4 主分支；有 frozen residual 时仍走已有 task/residual 拼接 low-rank GEMM。该路径会改变低秩分支的累加/量化侧调度，验证脚本用 `native_fused_forward` 标记并用 `5e-4` rel_l2 tolerance 报告相对精确 `x @ A.T @ B.T` 的差异；默认关闭。
+- `fuse_lowrank_forward`：opt-in forward 消融选项。当 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable task LoRA forward 并入 FP4 主分支；有 frozen residual 时，residual 仍作为 dense side branch 追加。该路径会改变低秩分支的累加/量化侧调度，验证脚本用 `native_fused_forward` 标记并用 `5e-4` rel_l2 tolerance 报告相对当前 BF16/FP16 调度公式的差异；默认关闭。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
 - `target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
 
@@ -529,12 +529,12 @@ RTX 5090 BF16 短测：
 
 P5：dual-branch residual/task LoRA 初始化已落地。FP16 下 `fuse_frozen_residual_dx=True` 可以把 frozen residual dX 与 task LoRA dX 一并打包进 fused epilogue；BF16 下该 packed residual dX 路径误差偏大，默认仍保留 residual dense dX。BF16 exact overlap 支持 dual-branch，但 residual dX 保持 dense side stream。
 
-P5.1：`fuse_lowrank_forward=True` 已作为 opt-in forward 消融路径加入。当前有两条实现：
+P5.1：`fuse_lowrank_forward=True` 已作为 opt-in forward 消融路径加入。当前实现：
 
-- task-only LoRA：无 frozen residual 且 `lowrank_dtype == weight dtype` 时，直接复用 Nunchaku 原生 `quantize_w4a4_act_fuse_lora` 生成 packed LoRA activation，再用 `gemm_w4a4` low-rank epilogue 输出 `FP4(W0) + scale * LoRA(x)`。这是真正的 native FP4+BF16/FP16 branch fusion。
-- dual-branch residual：有 frozen residual 时，仍使用 PyTorch 侧把 task LoRA 和 frozen residual 拼成一次 low-rank GEMM；该路径主要用于评估 dual-branch forward 合并上限。
+- task LoRA branch：当 `lowrank_dtype == weight dtype` 时，直接复用 Nunchaku 原生 `quantize_w4a4_act_fuse_lora` 生成 packed LoRA activation，再用 `gemm_w4a4` low-rank epilogue 输出 `FP4(W0) + scale * LoRA(x)`。
+- frozen residual branch：如果存在 frozen residual，仍保持 dense side branch，在 native `FP4+task LoRA` 输出后追加；不把 frozen residual 打进同一个 forward epilogue。
 
-由于 native task-only 路径在量化 kernel 内生成 LoRA activation，累加顺序和精确 `x @ A.T @ B.T` 不同，验证脚本用 `native_fused_forward` 标记该路径，并以 `5e-4` rel_l2 tolerance 报告相对精确公式的误差。
+由于 native 路径在量化 kernel 内生成 task LoRA activation，累加顺序和精确 `x @ A.T @ B.T` 不同，验证脚本用 `native_fused_forward` 标记该路径，并以 `5e-4` rel_l2 tolerance 报告相对当前 BF16/FP16 调度公式的误差。
 
 RTX 5090 短测，`benchmark_native_fp4_lora_training.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10 --grad-accum-steps 4`：
 
@@ -567,18 +567,16 @@ RTX 5090 短测，`benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-featur
 | dual branch, residual dense dX | bf16 | 1.1883 | `1.239x` overhead vs task-only |
 | dual branch, residual exact overlap auto | bf16 | 1.0961 | `1.084x` vs dense residual，`dX` rel_l2 `9.08e-7` |
 
-`fuse_lowrank_forward=True` 消融，RTX 5090 同形状 `warmup=10,iters=30`：
+`fuse_lowrank_forward=True` 消融，RTX 5090 同形状 `warmup=5,iters=10`：
 
 | path | dtype | train step ms | result |
 | --- | --- | ---: | --- |
-| dual branch, residual dense dX | bf16 | 0.3122 | default reference |
-| dual branch, residual dense dX + fused lowrank forward | bf16 | 0.3092 | `1.010x` vs default dual，接近噪声 |
-| dual branch, residual dense dX | fp16 | 0.2999 | default reference |
-| dual branch, residual dense dX + fused lowrank forward | fp16 | 0.3400 | slower，`0.882x` vs default dual |
-| dual branch, residual fused dX | fp16 | 0.2791 | default fused dX reference |
-| dual branch, residual fused dX + fused lowrank forward | fp16 | 0.2797 | essentially tied，`0.998x` vs default fused dX |
+| dual branch, residual dense dX | bf16 | 1.2076 | default reference |
+| dual branch, residual dense dX + native task forward | bf16 | 1.1048 | `1.093x` vs default dual |
+| dual branch, residual exact overlap auto | bf16 | 1.1005 | default overlap reference |
+| dual branch, residual exact overlap auto + native task forward | bf16 | 1.0122 | `1.087x` vs default overlap |
 
-因此当前仍不把 `fuse_lowrank_forward` 设为默认。task-only native path 对 forward 有明确收益，但它相对精确 LoRA formula 有约 `1e-4` 级别 rel_l2 差异；dual-branch residual path 的 train step 收益仍接近噪声。实际训练 step 的主要瓶颈仍偏向 dX 主路径、LoRA 参数梯度和 residual dX 融合。
+因此当前仍不把 `fuse_lowrank_forward` 设为 balanced 默认，但 throughput preset 会打开它。native task forward 对 forward 和 4096 dual-branch train step 都有明确收益；代价是额外一份 packed LoRA forward cache，以及 task LoRA activation/`dB` 约 `1e-4` 级 rel_l2 差异。实际训练 step 的主要剩余瓶颈仍偏向 dX 主路径、LoRA 参数梯度和 residual dX 融合。
 
 P6：加入 outlier-aware FP4 训练策略：
 

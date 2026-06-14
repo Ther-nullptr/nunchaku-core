@@ -183,7 +183,6 @@ def main() -> None:
         for name in expected_replaced
         if (
             fp4_modules[name].fuse_lowrank_forward
-            and not fp4_modules[name].has_frozen_residual
             and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
         )
     )
@@ -205,7 +204,6 @@ def main() -> None:
     optimizer_hook_caches_current = all(
         (
             not child.fuse_lowrank_forward
-            or child.has_frozen_residual
             or child.lowrank_dtype != child.fp4_forward.compute_dtype
             or (
                 child._cached_lora_down_fwd_version == child.lora_down._version

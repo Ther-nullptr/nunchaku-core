@@ -192,7 +192,6 @@ def main() -> None:
         for name in expected_replaced
         if (
             fp4_modules[name].fuse_lowrank_forward
-            and not fp4_modules[name].has_frozen_residual
             and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
         )
     )

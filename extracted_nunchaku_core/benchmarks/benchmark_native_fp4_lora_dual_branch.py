@@ -264,13 +264,14 @@ def main() -> None:
         "checks": {},
     }
     overlap_errors = errors["overlap_residual_dx"]
+    lora_up_grad_tol = 5e-4 if args.fuse_lowrank_forward else 1e-6
     payload["checks"].update(
         {
             "overlap_forward_rel_l2_lt_tol": overlap_errors["forward"]["rel_l2"]
             < (5e-4 if args.fuse_lowrank_forward else 1e-6),
             "overlap_dx_rel_l2_lt_5e-4": overlap_errors["dx"]["rel_l2"] < 5e-4,
             "overlap_lora_down_grad_rel_l2_lt_1e-6": overlap_errors["lora_down_grad"]["rel_l2"] < 1e-6,
-            "overlap_lora_up_grad_rel_l2_lt_1e-6": overlap_errors["lora_up_grad"]["rel_l2"] < 1e-6,
+            "overlap_lora_up_grad_rel_l2_lt_tol": overlap_errors["lora_up_grad"]["rel_l2"] < lora_up_grad_tol,
         }
     )
     if fused_residual_dx is None:
@@ -283,7 +284,7 @@ def main() -> None:
                 < (5e-4 if args.fuse_lowrank_forward else 1e-6),
                 "fused_dx_rel_l2_lt_5e-4": fused_errors["dx"]["rel_l2"] < 5e-4,
                 "fused_lora_down_grad_rel_l2_lt_1e-6": fused_errors["lora_down_grad"]["rel_l2"] < 1e-6,
-                "fused_lora_up_grad_rel_l2_lt_1e-6": fused_errors["lora_up_grad"]["rel_l2"] < 1e-6,
+                "fused_lora_up_grad_rel_l2_lt_tol": fused_errors["lora_up_grad"]["rel_l2"] < lora_up_grad_tol,
             }
         )
     payload["all_passed"] = bool(all(payload["checks"].values()))

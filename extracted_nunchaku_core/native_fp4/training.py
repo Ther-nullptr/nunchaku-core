@@ -92,7 +92,6 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         use_native_lora_forward = bool(
             fuse_lowrank_forward
             and packed_lora_forward is not None
-            and not has_frozen_residual
             and x2d.dtype == fp4_forward_op.compute_dtype
             and lowrank_dtype == fp4_forward_op.compute_dtype
         )
@@ -131,6 +130,10 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 *x.shape[:-1],
                 fp4_forward_op.out_features,
             )
+            if has_frozen_residual:
+                residual_act = torch.matmul(x_lr, frozen_residual_down.to(lowrank_dtype).t())
+                residual_out = torch.matmul(residual_act, frozen_residual_up.to(lowrank_dtype).t())
+                y = y + residual_out.mul(float(frozen_residual_scaling)).to(y.dtype).reshape_as(y)
         elif use_fp4_act_cache:
             x2d_for_fp4 = x2d
             if fp4_forward_op.k_pad != fp4_forward_op.in_features:
@@ -992,9 +995,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self._cached_frozen_residual_scaling = None
 
     def refresh_fused_lora_forward_cache(self) -> None:
-        if self.has_frozen_residual:
-            self.clear_fused_lora_forward_cache()
-            return
         if self.lowrank_dtype != self.fp4_forward.compute_dtype:
             self.clear_fused_lora_forward_cache()
             return
@@ -1011,8 +1011,6 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
 
     def _get_fused_lora_forward_cache(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         if not self.fuse_lowrank_forward:
-            return None
-        if self.has_frozen_residual:
             return None
         if self.lowrank_dtype != self.fp4_forward.compute_dtype:
             return None

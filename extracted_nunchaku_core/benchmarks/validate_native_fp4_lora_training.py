@@ -134,6 +134,8 @@ def main() -> None:
         y_lora = torch.matmul(lora_act, up_lr.t()).mul(op.scaling).to(dtype)
         lowrank_out = y_lora
         separate_lowrank_out = y_lora if args.fuse_lowrank_forward else None
+        native_fused_forward = bool(args.fuse_lowrank_forward and dtype == lowrank_dtype)
+        sequential_y_ref = None
 
         dy_up = torch.matmul(dy_lr, up_lr)
         dx_ref = op.fp4_backward(dy) + torch.matmul(dy_up, down_lr).mul(op.scaling).reshape_as(x).to(dtype)
@@ -143,7 +145,11 @@ def main() -> None:
             residual_act = torch.matmul(x_lr, residual_down_lr.t())
             y_residual = torch.matmul(residual_act, residual_up_lr.t()).mul(op.frozen_residual_scaling)
             separate_lowrank_out = y_lora + y_residual.to(dtype)
-            if args.fuse_lowrank_forward:
+            if native_fused_forward:
+                sequential_y_ref = y_main + y_lora.reshape_as(y_main)
+                sequential_y_ref = sequential_y_ref + y_residual.to(dtype).reshape_as(y_main)
+                lowrank_out = y_lora
+            elif args.fuse_lowrank_forward:
                 combined_down = torch.cat((down_lr, residual_down_lr), dim=0)
                 combined_up = torch.cat(
                     (
@@ -160,10 +166,14 @@ def main() -> None:
             dy_residual_up = torch.matmul(dy_lr, residual_up_lr)
             dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(op.frozen_residual_scaling)
             dx_ref = dx_ref + dx_residual.reshape_as(x).to(dtype)
-        y_ref = y_main + lowrank_out.reshape_as(y_main)
+        y_ref = sequential_y_ref if sequential_y_ref is not None else y_main + lowrank_out.reshape_as(y_main)
         separate_y_ref = None
         if separate_lowrank_out is not None:
-            separate_y_ref = y_main + separate_lowrank_out.reshape_as(y_main)
+            separate_y_ref = (
+                sequential_y_ref
+                if sequential_y_ref is not None
+                else y_main + separate_lowrank_out.reshape_as(y_main)
+            )
         y_ref = y_ref + op.bias.detach().to(dtype)
         if separate_y_ref is not None:
             separate_y_ref = separate_y_ref + op.bias.detach().to(dtype)
@@ -200,11 +210,6 @@ def main() -> None:
         errors["lora_down_grad_fp4_cache_vs_exact_manual"] = tensor_error(d_down_ref, d_down_exact_ref)
     if args.fuse_lowrank_forward and separate_y_ref is not None:
         errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
-    native_fused_forward = bool(
-        args.fuse_lowrank_forward
-        and not op.has_frozen_residual
-        and dtype == lowrank_dtype
-    )
     grad_tol = 5e-4 if args.fuse_lora_dx else 1e-6
     forward_tol = 5e-4 if native_fused_forward else 1e-6
     lora_up_grad_tol = 5e-4 if native_fused_forward and not args.no_cache_lora_act else 1e-6

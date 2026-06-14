@@ -233,7 +233,13 @@ def main() -> None:
         errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
     dx_tol = 5e-3 if args.fuse_frozen_residual_dx and dtype == torch.bfloat16 else 5e-4
     grad_tol = 5e-4 if args.fuse_lora_dx else 1e-6
-    forward_tol = 5e-4 if native_fused_forward else 1e-6
+    forward_tol = (
+        5e-3
+        if native_fused_forward and op.has_frozen_residual and dtype == torch.bfloat16
+        else 5e-4
+        if native_fused_forward
+        else 1e-6
+    )
     lora_up_grad_tol = 5e-4 if native_fused_forward and not args.no_cache_lora_act else 1e-6
     checks = {
         "forward_rel_l2_lt_tol": errors["forward_vs_manual"]["rel_l2"] < forward_tol,
@@ -257,8 +263,8 @@ def main() -> None:
         "backward_weight_cache_state_matches": backward_weight_cache_check,
     }
     if "forward_vs_separate_lowrank_manual" in errors:
-        checks["fused_forward_separate_formula_rel_l2_lt_5e-4"] = (
-            errors["forward_vs_separate_lowrank_manual"]["rel_l2"] < 5e-4
+        checks["fused_forward_separate_formula_rel_l2_lt_tol"] = (
+            errors["forward_vs_separate_lowrank_manual"]["rel_l2"] < forward_tol
         )
 
     payload = {
@@ -299,7 +305,7 @@ def main() -> None:
         "tolerances": {
             "forward_rel_l2": forward_tol,
             "dx_rel_l2": dx_tol,
-            "fused_forward_separate_formula_rel_l2": 5e-4,
+            "fused_forward_separate_formula_rel_l2": forward_tol,
             "lora_up_grad_rel_l2": lora_up_grad_tol,
             "lora_down_grad_rel_l2": grad_tol,
         },

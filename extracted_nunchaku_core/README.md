@@ -1161,6 +1161,62 @@ config_overrides = fp4_lora_config_overrides_from_outlier_report(
 )
 ```
 
+真实 LLaMA/WikiText-2 上的 activation 和 backward `dY` outlier 诊断使用：
+
+```bash
+python benchmarks/analyze_hf_llama_activation_grad_outliers.py \
+  --batch-size 1 \
+  --seq-len 128 \
+  --steps 1 \
+  --dtype bf16 \
+  --replace-name-substrings down_proj
+```
+
+快速 smoke 可以只扫第 0 层 `q_proj`：
+
+```bash
+python benchmarks/analyze_hf_llama_activation_grad_outliers.py \
+  --batch-size 1 \
+  --seq-len 16 \
+  --steps 1 \
+  --dataset-max-docs 16 \
+  --replace-layer-start 0 \
+  --replace-layer-end 1 \
+  --replace-name-substrings q_proj
+```
+
+输出 `results/latest_hf_llama_activation_grad_outliers.json`。重点字段：
+
+- `module_records.*.activation.channel_absmax_max_over_median`
+- `module_records.*.grad_output.channel_absmax_max_over_median`
+- `module_records.*.activation.block_absmax_over_mean_abs_max`
+- `summary.rank_bump_candidates`
+- `summary.keep_dense_candidates`
+
+这个 JSON 的 `summary.rank_bump_candidates` 与 `prepare_fp4_lora_finetuning(..., outlier_report=...)` 兼容，可直接驱动 per-module rank bump：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --batch-size 1 \
+  --seq-len 64 \
+  --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
+  --warmup 1 \
+  --iters 3
+```
+
+也可以继续叠加 inference sensitivity scan：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --sensitivity-report results/llama_module_fp4_sensitivity_YYYYMMDD_HHMMSS.json \
+  --sensitivity-rank-bump-ratio 1.05 \
+  --sensitivity-exclude-ratio 10.0
+```
+
+注意：真实 outlier 诊断脚本冻结模型参数，并通过 embedding output require-grad 捕获 backward `grad_output`，不会计算 7B backbone 的参数梯度；但它仍会做完整 backward graph，`seq_len/steps` 不要一开始设太大。
+
 ## 10.7 Outlier-driven overrides 开销 benchmark
 
 提高敏感模块 rank 会增加 LoRA 分支计算。用下面脚本量化 base config 和 outlier-driven overrides 的 train-step 开销：
@@ -1355,6 +1411,7 @@ python benchmarks/benchmark_fp4_lora_backward_weight_policy.py --m 4096 --in-fea
 python benchmarks/benchmark_fp4_lora_initialization.py --m 2048 --in-features 2048 --out-features 2048 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10
 python benchmarks/validate_fp4_lora_finetune_convergence.py
 python benchmarks/analyze_fp4_lora_activation_grad_outliers.py --batch 4 --hidden 128 --layers 2 --steps 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --inject-outliers --outlier-channel 0 --outlier-scale 16
+python benchmarks/analyze_hf_llama_activation_grad_outliers.py --batch-size 1 --seq-len 16 --steps 1 --dataset-max-docs 16 --replace-layer-start 0 --replace-layer-end 1 --replace-name-substrings q_proj
 python benchmarks/benchmark_fp4_lora_outlier_overrides.py --batch 4 --hidden 128 --layers 2 --rank 32 --override-rank 64 --dtype bf16 --lowrank-dtype bf16 --warmup 3 --iters 5
 python benchmarks/benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hidden 1024 --layers 4 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --intermediate-activation silu --warmup 5 --iters 10
 python benchmarks/benchmark_fp4_lora_activation_cache_policy.py --m 4096 --in-features 4096 --out-features 4096 --rank 32 --dtype bf16 --lowrank-dtype bf16 --warmup 10 --iters 30
@@ -1515,6 +1572,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - frozen FP4 backbone + frozen residual_svd + zero-init task LoRA 的单层微调 loss 收敛验证
 - `latest_fp4_lora_activation_grad_outliers.json`
   - FP4 LoRA activation / grad-output outlier 诊断和 rank/smooth 建议
+- `latest_hf_llama_activation_grad_outliers.json`
+  - 真实 HF/LLaMA + WikiText-2 上 Linear 输入 activation 和 backward `dY` outlier 诊断，可直接作为 `outlier_report`
 - `latest_fp4_lora_outlier_override_overhead.json`
   - outlier-driven `config_overrides` 相对 base config 的 train-step 开销
 - `latest_fp4_lora_activation_checkpoint.json`

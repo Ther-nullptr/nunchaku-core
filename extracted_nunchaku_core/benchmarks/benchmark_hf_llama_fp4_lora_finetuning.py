@@ -134,6 +134,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     parser.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     parser.add_argument("--no-zero-lora-up-fast-path", action="store_true")
+    parser.add_argument("--outlier-report", type=str, default=None)
+    parser.add_argument("--outlier-rank-field", type=str, default="suggested_rank")
+    parser.add_argument("--outlier-rank-multiple", type=int, default=16)
+    parser.add_argument("--outlier-min-rank", type=int, default=None)
+    parser.add_argument("--outlier-max-rank", type=int, default=None)
+    parser.add_argument("--sensitivity-report", type=str, default=None)
+    parser.add_argument("--sensitivity-ratio-field", type=str, default="perplexity_ratio_vs_fp16")
+    parser.add_argument("--sensitivity-rank-bump-ratio", type=float, default=1.05)
+    parser.add_argument("--sensitivity-exclude-ratio", type=float, default=None)
+    parser.add_argument("--sensitivity-rank-scale", type=float, default=2.0)
+    parser.add_argument("--sensitivity-rank-multiple", type=int, default=16)
+    parser.add_argument("--sensitivity-min-rank", type=int, default=None)
+    parser.add_argument("--sensitivity-max-rank", type=int, default=None)
     parser.add_argument("--attn-implementation", type=str, default=None)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=0)
@@ -625,6 +638,19 @@ def run_fp4_variant(
         zero_lora_up_fast_path=not args.no_zero_lora_up_fast_path,
         target_modules=tuple(selected_names),
         exclude_modules=effective_exclude_modules(args),
+        outlier_report=args.outlier_report,
+        outlier_rank_field=args.outlier_rank_field,
+        outlier_rank_multiple=args.outlier_rank_multiple,
+        outlier_min_rank=args.outlier_min_rank,
+        outlier_max_rank=args.outlier_max_rank,
+        sensitivity_report=args.sensitivity_report,
+        sensitivity_ratio_field=args.sensitivity_ratio_field,
+        sensitivity_rank_bump_ratio=args.sensitivity_rank_bump_ratio,
+        sensitivity_exclude_ratio=args.sensitivity_exclude_ratio,
+        sensitivity_rank_scale=args.sensitivity_rank_scale,
+        sensitivity_rank_multiple=args.sensitivity_rank_multiple,
+        sensitivity_min_rank=args.sensitivity_min_rank,
+        sensitivity_max_rank=args.sensitivity_max_rank,
         lr=args.lr,
         lora_weight_decay=args.lora_weight_decay,
         bias_weight_decay=args.bias_weight_decay,
@@ -811,6 +837,19 @@ def main() -> None:
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": not args.no_zero_lora_up_fast_path,
+            "outlier_report": args.outlier_report,
+            "outlier_rank_field": args.outlier_rank_field,
+            "outlier_rank_multiple": args.outlier_rank_multiple,
+            "outlier_min_rank": args.outlier_min_rank,
+            "outlier_max_rank": args.outlier_max_rank,
+            "sensitivity_report": args.sensitivity_report,
+            "sensitivity_ratio_field": args.sensitivity_ratio_field,
+            "sensitivity_rank_bump_ratio": args.sensitivity_rank_bump_ratio,
+            "sensitivity_exclude_ratio": args.sensitivity_exclude_ratio,
+            "sensitivity_rank_scale": args.sensitivity_rank_scale,
+            "sensitivity_rank_multiple": args.sensitivity_rank_multiple,
+            "sensitivity_min_rank": args.sensitivity_min_rank,
+            "sensitivity_max_rank": args.sensitivity_max_rank,
         },
         "records": {},
         "all_passed": False,

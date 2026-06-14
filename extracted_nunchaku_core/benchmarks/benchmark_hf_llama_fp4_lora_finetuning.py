@@ -141,6 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outlier-max-rank", type=int, default=None)
     parser.add_argument("--outlier-keep-dense", action="store_true")
     parser.add_argument("--outlier-keep-dense-candidates-key", type=str, default="keep_dense_candidates")
+    parser.add_argument("--outlier-bump-frozen-residual", action="store_true")
+    parser.add_argument("--outlier-frozen-residual-rank-field", type=str, default=None)
     parser.add_argument("--sensitivity-report", type=str, default=None)
     parser.add_argument("--sensitivity-ratio-field", type=str, default="perplexity_ratio_vs_fp16")
     parser.add_argument("--sensitivity-rank-bump-ratio", type=float, default=1.05)
@@ -647,6 +649,8 @@ def run_fp4_variant(
         outlier_max_rank=args.outlier_max_rank,
         outlier_exclude_keep_dense=args.outlier_keep_dense,
         outlier_keep_dense_candidates_key=args.outlier_keep_dense_candidates_key,
+        outlier_bump_frozen_residual=args.outlier_bump_frozen_residual,
+        outlier_frozen_residual_rank_field=args.outlier_frozen_residual_rank_field,
         sensitivity_report=args.sensitivity_report,
         sensitivity_ratio_field=args.sensitivity_ratio_field,
         sensitivity_rank_bump_ratio=args.sensitivity_rank_bump_ratio,
@@ -710,6 +714,20 @@ def run_fp4_variant(
         "excluded_selected_modules": excluded_selected_modules,
         "replaced_modules": result.replaced_modules,
         "replaced_count": len(result.replaced_modules),
+        "fp4_module_configs": {
+            name: {
+                "requested_rank": int(child.requested_rank),
+                "effective_rank": int(child.rank),
+                "requested_frozen_residual_rank": int(child.requested_frozen_residual_rank),
+                "effective_frozen_residual_rank": int(child.frozen_residual_rank),
+                "frozen_residual_init": child.frozen_residual_init,
+                "has_frozen_residual": bool(child.has_frozen_residual),
+                "fuse_lowrank_forward": bool(child.fuse_lowrank_forward),
+                "fuse_lora_dx": bool(child.fuse_lora_dx),
+                "cache_fused_lora_dx": bool(child.cache_fused_lora_dx),
+            }
+            for name, child in sorted(fp4_modules.items())
+        },
         "trainable_names": result.trainable_names,
         "trainable_param_count": result.trainable_param_count,
         "conversion_seconds": conversion_seconds,
@@ -853,6 +871,8 @@ def main() -> None:
             "outlier_max_rank": args.outlier_max_rank,
             "outlier_keep_dense": args.outlier_keep_dense,
             "outlier_keep_dense_candidates_key": args.outlier_keep_dense_candidates_key,
+            "outlier_bump_frozen_residual": args.outlier_bump_frozen_residual,
+            "outlier_frozen_residual_rank_field": args.outlier_frozen_residual_rank_field,
             "sensitivity_report": args.sensitivity_report,
             "sensitivity_ratio_field": args.sensitivity_ratio_field,
             "sensitivity_rank_bump_ratio": args.sensitivity_rank_bump_ratio,

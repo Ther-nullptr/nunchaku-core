@@ -300,6 +300,8 @@ def fp4_lora_config_overrides_from_outlier_report(
     max_rank: int | None = None,
     force_init: LoRAInitMode | None = None,
     disable_fuse_frozen_residual_dx: bool = False,
+    bump_frozen_residual: bool = False,
+    frozen_residual_rank_field: str | None = None,
 ) -> dict[str, FP4LoRAConfig]:
     """Build per-module FP4 LoRA overrides from an outlier diagnostic report.
 
@@ -319,6 +321,8 @@ def fp4_lora_config_overrides_from_outlier_report(
         force_init=force_init,
         disable_fuse_frozen_residual_dx=disable_fuse_frozen_residual_dx,
         exclude_keep_dense=False,
+        bump_frozen_residual=bump_frozen_residual,
+        frozen_residual_rank_field=frozen_residual_rank_field,
     )
     return policy.config_overrides
 
@@ -335,6 +339,8 @@ def fp4_lora_outlier_policy_from_report(
     disable_fuse_frozen_residual_dx: bool = False,
     exclude_keep_dense: bool = False,
     keep_dense_candidates_key: str = "keep_dense_candidates",
+    bump_frozen_residual: bool = False,
+    frozen_residual_rank_field: str | None = None,
 ) -> FP4LoRAOutlierPolicy:
     """Convert activation/grad-output outlier diagnostics into a fine-tuning policy.
 
@@ -365,11 +371,28 @@ def fp4_lora_outlier_policy_from_report(
         if max_rank is not None:
             rank = min(rank, int(max_rank))
         rank = max(base_config.rank, _ceil_to_multiple(rank, rank_multiple))
+        frozen_residual_rank = base_config.frozen_residual_rank
+        frozen_residual_init = base_config.frozen_residual_init
+        if bump_frozen_residual:
+            residual_field = rank_field if frozen_residual_rank_field is None else frozen_residual_rank_field
+            frozen_residual_rank = int(item.get(residual_field, rank))
+            if min_rank is not None:
+                frozen_residual_rank = max(frozen_residual_rank, int(min_rank))
+            if max_rank is not None:
+                frozen_residual_rank = min(frozen_residual_rank, int(max_rank))
+            frozen_residual_rank = max(
+                base_config.frozen_residual_rank,
+                _ceil_to_multiple(frozen_residual_rank, rank_multiple),
+            )
+            if frozen_residual_rank > 0:
+                frozen_residual_init = "residual_svd"
         for alias in _module_name_aliases(str(module_name)):
             overrides[alias] = replace(
                 base_config,
                 rank=rank,
                 init=base_config.init if force_init is None else force_init,
+                frozen_residual_rank=frozen_residual_rank,
+                frozen_residual_init=frozen_residual_init,
                 fuse_frozen_residual_dx=False
                 if disable_fuse_frozen_residual_dx
                 else base_config.fuse_frozen_residual_dx,
@@ -1097,6 +1120,8 @@ def prepare_fp4_lora_finetuning(
     outlier_max_rank: int | None = None,
     outlier_exclude_keep_dense: bool = False,
     outlier_keep_dense_candidates_key: str = "keep_dense_candidates",
+    outlier_bump_frozen_residual: bool = False,
+    outlier_frozen_residual_rank_field: str | None = None,
     sensitivity_report: Mapping[str, Any] | str | None = None,
     sensitivity_ratio_field: str = "perplexity_ratio_vs_fp16",
     sensitivity_rank_bump_ratio: float | None = 1.05,
@@ -1172,6 +1197,8 @@ def prepare_fp4_lora_finetuning(
             disable_fuse_frozen_residual_dx=True,
             exclude_keep_dense=outlier_exclude_keep_dense,
             keep_dense_candidates_key=outlier_keep_dense_candidates_key,
+            bump_frozen_residual=outlier_bump_frozen_residual,
+            frozen_residual_rank_field=outlier_frozen_residual_rank_field,
         )
         for key, value in outlier_policy.config_overrides.items():
             merged_overrides.setdefault(key, value)

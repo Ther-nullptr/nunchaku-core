@@ -201,6 +201,28 @@ def main() -> None:
         "layers.0.down_proj",
         "layers.1.q_proj",
     }
+    outlier_residual_model = TinyModel(args.hidden, dtype).cuda()
+    outlier_residual_result = prepare_fp4_lora_finetuning(
+        outlier_residual_model,
+        mode=args.mode,
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        use_frozen_residual=not args.no_frozen_residual,
+        backward_weight_policy=args.backward_weight_policy,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+        outlier_report=outlier_report,
+        outlier_bump_frozen_residual=True,
+        lr=args.lr,
+    )
+    outlier_residual_modules = dict(iter_fp4_lora_modules(outlier_residual_result.model))
+    expected_outlier_residual_rank = max(
+        base_cfg.frozen_residual_rank,
+        ((args.auto_rank + 15) // 16) * 16,
+    )
     prepared = result.model
     fp4_modules = dict(iter_fp4_lora_modules(prepared))
     expected_replaced = {
@@ -333,6 +355,20 @@ def main() -> None:
             outlier_exclude_no_manual_result.exclude_modules
             == ("lm_head", "layers.0.q_proj", "layers.1.down_proj")
         ),
+        "outlier_bump_frozen_residual_rank_applied": (
+            outlier_residual_modules["layers.1.down_proj"].requested_frozen_residual_rank
+            == expected_outlier_residual_rank
+            and outlier_residual_modules["layers.1.down_proj"].frozen_residual_rank
+            == expected_outlier_residual_rank
+        ),
+        "outlier_bump_frozen_residual_init_applied": (
+            outlier_residual_modules["layers.1.down_proj"].frozen_residual_init == "residual_svd"
+            and outlier_residual_modules["layers.1.down_proj"].has_frozen_residual
+        ),
+        "outlier_bump_frozen_residual_does_not_change_non_candidate_rank": (
+            outlier_residual_modules["layers.0.q_proj"].requested_frozen_residual_rank
+            == base_cfg.frozen_residual_rank
+        ),
         "trainable_names_match_lora_params": set(result.trainable_names) == set(named_lora_params),
         "all_non_lora_frozen": all_non_lora_frozen,
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
@@ -403,6 +439,7 @@ def main() -> None:
         "outlier_keep_dense_exclude_modules": outlier_exclude_result.exclude_modules,
         "outlier_keep_dense_no_manual_replaced": outlier_exclude_no_manual_result.replaced_modules,
         "outlier_keep_dense_no_manual_exclude_modules": outlier_exclude_no_manual_result.exclude_modules,
+        "outlier_bump_frozen_residual_replaced": outlier_residual_result.replaced_modules,
         "trainable": result.trainable_names,
         "trainable_param_count": result.trainable_param_count,
         "refreshed_forward_cache_count": result.refreshed_forward_cache_count,

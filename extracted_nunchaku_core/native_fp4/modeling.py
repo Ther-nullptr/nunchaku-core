@@ -300,6 +300,7 @@ def fp4_lora_config_overrides_from_outlier_report(
     max_rank: int | None = None,
     force_init: LoRAInitMode | None = None,
     disable_fuse_frozen_residual_dx: bool = False,
+    bump_task_rank: bool = True,
     bump_frozen_residual: bool = False,
     frozen_residual_rank_field: str | None = None,
 ) -> dict[str, FP4LoRAConfig]:
@@ -321,6 +322,7 @@ def fp4_lora_config_overrides_from_outlier_report(
         force_init=force_init,
         disable_fuse_frozen_residual_dx=disable_fuse_frozen_residual_dx,
         exclude_keep_dense=False,
+        bump_task_rank=bump_task_rank,
         bump_frozen_residual=bump_frozen_residual,
         frozen_residual_rank_field=frozen_residual_rank_field,
     )
@@ -339,6 +341,7 @@ def fp4_lora_outlier_policy_from_report(
     disable_fuse_frozen_residual_dx: bool = False,
     exclude_keep_dense: bool = False,
     keep_dense_candidates_key: str = "keep_dense_candidates",
+    bump_task_rank: bool = True,
     bump_frozen_residual: bool = False,
     frozen_residual_rank_field: str | None = None,
 ) -> FP4LoRAOutlierPolicy:
@@ -347,6 +350,8 @@ def fp4_lora_outlier_policy_from_report(
     ``summary.rank_bump_candidates`` produces per-module rank overrides.
     When ``exclude_keep_dense=True``, ``summary.keep_dense_candidates`` also
     becomes ``exclude_modules`` so severe outlier modules stay BF16/FP16.
+    Set ``bump_task_rank=False`` with ``bump_frozen_residual=True`` to isolate
+    SVDQuant residual-capacity ablations from trainable LoRA-capacity changes.
     """
 
     if rank_multiple <= 0:
@@ -365,12 +370,15 @@ def fp4_lora_outlier_policy_from_report(
         module_name = item.get("module")
         if not module_name:
             continue
-        rank = int(item.get(rank_field, base_config.rank))
-        if min_rank is not None:
-            rank = max(rank, int(min_rank))
-        if max_rank is not None:
-            rank = min(rank, int(max_rank))
-        rank = max(base_config.rank, _ceil_to_multiple(rank, rank_multiple))
+        if bump_task_rank:
+            rank = int(item.get(rank_field, base_config.rank))
+            if min_rank is not None:
+                rank = max(rank, int(min_rank))
+            if max_rank is not None:
+                rank = min(rank, int(max_rank))
+            rank = max(base_config.rank, _ceil_to_multiple(rank, rank_multiple))
+        else:
+            rank = base_config.rank
         frozen_residual_rank = base_config.frozen_residual_rank
         frozen_residual_init = base_config.frozen_residual_init
         if bump_frozen_residual:
@@ -1120,6 +1128,7 @@ def prepare_fp4_lora_finetuning(
     outlier_max_rank: int | None = None,
     outlier_exclude_keep_dense: bool = False,
     outlier_keep_dense_candidates_key: str = "keep_dense_candidates",
+    outlier_bump_task_rank: bool = True,
     outlier_bump_frozen_residual: bool = False,
     outlier_frozen_residual_rank_field: str | None = None,
     sensitivity_report: Mapping[str, Any] | str | None = None,
@@ -1197,6 +1206,7 @@ def prepare_fp4_lora_finetuning(
             disable_fuse_frozen_residual_dx=True,
             exclude_keep_dense=outlier_exclude_keep_dense,
             keep_dense_candidates_key=outlier_keep_dense_candidates_key,
+            bump_task_rank=outlier_bump_task_rank,
             bump_frozen_residual=outlier_bump_frozen_residual,
             frozen_residual_rank_field=outlier_frozen_residual_rank_field,
         )

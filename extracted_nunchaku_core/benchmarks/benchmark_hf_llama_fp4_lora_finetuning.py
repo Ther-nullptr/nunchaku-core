@@ -141,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outlier-max-rank", type=int, default=None)
     parser.add_argument("--outlier-keep-dense", action="store_true")
     parser.add_argument("--outlier-keep-dense-candidates-key", type=str, default="keep_dense_candidates")
+    parser.add_argument("--outlier-no-task-rank-bump", action="store_true")
     parser.add_argument("--outlier-bump-frozen-residual", action="store_true")
     parser.add_argument("--outlier-frozen-residual-rank-field", type=str, default=None)
     parser.add_argument("--sensitivity-report", type=str, default=None)
@@ -649,6 +650,7 @@ def run_fp4_variant(
         outlier_max_rank=args.outlier_max_rank,
         outlier_exclude_keep_dense=args.outlier_keep_dense,
         outlier_keep_dense_candidates_key=args.outlier_keep_dense_candidates_key,
+        outlier_bump_task_rank=not args.outlier_no_task_rank_bump,
         outlier_bump_frozen_residual=args.outlier_bump_frozen_residual,
         outlier_frozen_residual_rank_field=args.outlier_frozen_residual_rank_field,
         sensitivity_report=args.sensitivity_report,
@@ -871,6 +873,7 @@ def main() -> None:
             "outlier_max_rank": args.outlier_max_rank,
             "outlier_keep_dense": args.outlier_keep_dense,
             "outlier_keep_dense_candidates_key": args.outlier_keep_dense_candidates_key,
+            "outlier_bump_task_rank": not args.outlier_no_task_rank_bump,
             "outlier_bump_frozen_residual": args.outlier_bump_frozen_residual,
             "outlier_frozen_residual_rank_field": args.outlier_frozen_residual_rank_field,
             "sensitivity_report": args.sensitivity_report,

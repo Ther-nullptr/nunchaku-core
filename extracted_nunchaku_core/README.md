@@ -1221,6 +1221,20 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --iters 3
 ```
 
+如果要做更干净的消融，只提高 frozen residual rank、不提高 trainable task LoRA rank，追加 `--outlier-no-task-rank-bump`：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --batch-size 1 \
+  --seq-len 64 \
+  --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
+  --outlier-bump-frozen-residual \
+  --outlier-no-task-rank-bump \
+  --warmup 1 \
+  --iters 3
+```
+
 如果 outlier 已经严重到 residual/rank bump 不值得继续尝试，可以追加 `--outlier-keep-dense`。这会消费 `summary.keep_dense_candidates`，把这些模块加入 `exclude_modules`，保留 BF16/FP16 Linear；手写 `config_overrides` 仍然优先，不会被自动 keep-dense 覆盖：
 
 ```bash

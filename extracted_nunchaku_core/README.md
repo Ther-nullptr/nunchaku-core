@@ -892,6 +892,81 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
 
 输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`cache_summary.total_cache_bytes`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
 
+真实 LLaMA/WikiText-2 训练 step benchmark 使用：
+
+- [benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py](/home/wyj24/projects/nunchaku/extracted_nunchaku_core/benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py)
+
+它会加载 HF causal LM，读取 WikiText-2 token stream，然后在同一批 tokens 上比较 dense BF16/FP16 LoRA baseline 与 FP4 LoRA preset 的 `forward + backward + optimizer.step()`。默认模型目录是：
+
+- `/home/wyj24/projects/nunchaku/extracted_nunchaku_core/models/Llama-2-7b-hf`
+
+快速 smoke：只替换第 0 层 `q_proj`，用于确认真实模型路径能跑通：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --batch-size 1 \
+  --seq-len 16 \
+  --replace-layer-start 0 \
+  --replace-layer-end 1 \
+  --replace-name-substrings q_proj \
+  --dataset-max-docs 16 \
+  --warmup 0 \
+  --iters 1 \
+  --prime-steps 1 \
+  --no-frozen-residual
+```
+
+更接近真实微调的测法：替换所有 attention/MLP projection，保留 frozen residual_svd 量化补偿，并比较 `balanced/throughput/memory_saving`：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced fp4_throughput fp4_memory_saving \
+  --batch-size 1 \
+  --seq-len 128 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --warmup 2 \
+  --iters 5 \
+  --prime-steps 1
+```
+
+如果只想继续查敏感模块，可以用同一个脚本缩小替换范围：
+
+```bash
+# 只替换所有 down_proj
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --replace-name-substrings down_proj \
+  --batch-size 1 \
+  --seq-len 64 \
+  --warmup 1 \
+  --iters 3
+
+# 只替换第 1 层的 q/k/v/o/gate/up/down
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --replace-layer-start 1 \
+  --replace-layer-end 2 \
+  --batch-size 1 \
+  --seq-len 64 \
+  --warmup 1 \
+  --iters 3
+```
+
+输出 `results/latest_hf_llama_fp4_lora_finetuning.json`。重点字段：
+
+- `records.dense_lora.latency_ms.train_step_with_optimizer`
+- `records.fp4_balanced.latency_ms.train_step_with_optimizer`
+- `records.fp4_balanced.relative_to_dense_lora.train_step_speedup`
+- `records.fp4_balanced.peak_memory_bytes.train_step_delta`
+- `records.fp4_balanced.cache_summary.total_cache_bytes`
+- `records.fp4_balanced.initial_logits_vs_dense_lora`
+- `records.*.selected_modules`
+
+注意：如果 `--warmup 0 --prime-steps 0`，FP4 zero-init `lora_up` 的首步 fast path 会进入被计时区。默认 `--prime-steps 1` 会先消耗首步，使训练 step 更接近 steady-state。
+
 如果要测试第二份 compressed backward qweight 的上限收益，追加 `--backward-weight-policy cache`。默认仍是 `repack`，避免常驻第二份 backbone；cache 策略会在 `prepare_fp4_lora_finetuning(..., refresh_caches=True)` 时预热，并在结果中报告 `refreshed_backward_weight_count`。
 
 如果要把 BF16/FP16 `dy_up` 复用纳入模型级消融，追加 `--include-reuse-policies`：
@@ -1432,6 +1507,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 高层 `prepare_fp4_lora_finetuning` 接口的模型替换、冻结、optimizer 参数组和 cache hook 验证
 - `latest_fp4_lora_prepare_policies.json`
   - 高层 `prepare_fp4_lora_finetuning` preset 相对 dense LoRA baseline 的模型级 train step、optimizer/cache hook、peak memory 和 forward 误差消融
+- `latest_hf_llama_fp4_lora_finetuning.json`
+  - 真实 HF/LLaMA + WikiText-2 上 dense LoRA 与 FP4 LoRA preset 的 train step、初始 logits 误差、峰值显存和实际替换模块
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`

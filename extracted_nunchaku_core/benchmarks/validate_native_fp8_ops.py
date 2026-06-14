@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--in-features", type=int, default=4096)
     p.add_argument("--out-features", type=int, default=4096)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--backend", choices=["auto", "torch", "deep_gemm"], default="auto")
+    p.add_argument("--deep-gemm-path", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -52,13 +54,17 @@ def main() -> None:
     w = torch.randn(args.out_features, args.in_features, device="cuda", dtype=dtype)
     b = torch.randn(args.out_features, device="cuda", dtype=dtype)
 
-    op = NunchakuFP8GemmOp(weight=w, bias=b)
+    op = NunchakuFP8GemmOp(weight=w, bias=b, backend=args.backend, deep_gemm_path=args.deep_gemm_path)
 
     y = op(x)
     y_ref = (x.float() @ w.float().t() + b.float()).to(dtype)
 
-    qx, sx = op.quantize_input(x)
-    y_manual = op.forward_prequantized(qx, sx)
+    if op.last_backend == "deep_gemm":
+        qx, sx = op.quantize_input_deep_gemm(x)
+        y_manual = op.forward_prequantized_deep_gemm(qx, sx)
+    else:
+        qx, sx = op.quantize_input(x)
+        y_manual = op.forward_prequantized(qx, sx)
 
     wrapper_vs_manual = tensor_error(y, y_manual)
     fp8_vs_fp16 = tensor_error(y, y_ref)
@@ -68,6 +74,7 @@ def main() -> None:
         "fp8_rel_l2_lt_0p08": fp8_vs_fp16["rel_l2"] < 0.08,
         "fp8_mae_lt_2p5": fp8_vs_fp16["mae"] < 2.5,
         "all_finite": bool(torch.isfinite(y).all().item()),
+        "forced_deep_gemm_ran": args.backend != "deep_gemm" or op.last_backend == "deep_gemm",
     }
 
     payload = {
@@ -77,6 +84,7 @@ def main() -> None:
             "out_features": args.out_features,
             "dtype": args.dtype,
         },
+        "backend": op.backend_info(),
         "errors": {
             "wrapper_vs_manual": wrapper_vs_manual,
             "fp8_vs_fp16": fp8_vs_fp16,

@@ -24,7 +24,7 @@
 - `native_fp4/`
   - Python 封装，主要实验接口都在这里
 - `native_fp8/`
-  - 最小 FP8 GEMM Python 封装，后端使用 CUDA/cuBLASLt 的 `torch._scaled_mm`
+  - FP8 GEMM Python 封装，默认使用 PyTorch `torch._scaled_mm`，也可以探测并尝试 DeepGEMM 后端
 - `benchmarks/`
   - benchmark 和 validation 脚本
 - `results/`
@@ -81,10 +81,16 @@ pip install -e .
 - `nunchaku_core._int4_cuda`
 - `nunchaku_core._fp4_native_cuda`
 
-`native_fp8/` 不依赖新的自定义 `.so`，只要求当前 PyTorch 版本支持：
+`native_fp8/` 的默认后端不依赖新的自定义 `.so`，只要求当前 PyTorch 版本支持：
 
 - `torch.float8_e4m3fn`
 - `torch._scaled_mm`
+
+DeepGEMM 后端是可选路径：
+
+- 设置 `NUNCHAKU_DEEPGEMM_PATH=/home/wyj24/projects/DeepGEMM`，或者在脚本里传 `--deep-gemm-path /home/wyj24/projects/DeepGEMM`
+- DeepGEMM JIT 还需要 `CUDA_HOME/bin/cuobjdump`
+- 在当前 RTX 5090 / SM120 环境下，DeepGEMM 的 SM100 kernel 可能因为 `tcgen05.*` 指令不被 `sm_120a` 目标接受而编译失败；`--backend auto` 会记录错误并回退到 PyTorch FP8
 
 ## 5. 最小导入检查
 
@@ -98,12 +104,13 @@ python -c "from native_fp4 import NunchakuFP4GemmOp, NunchakuFP4LowRankOp, Nunch
 
 ## 5.1 Native FP8 最小验证
 
-FP8 当前是最小可用版本：
+FP8 当前提供两个后端：
 
 - 数据格式：`float8_e4m3fn`
 - 输出类型：跟权重一致（`fp16` 或 `bf16`）
-- 后端：`torch._scaled_mm`
-- 当前量化方式：`per-tensor scale`
+- `torch` 后端：`torch._scaled_mm`，per-tensor scale
+- `deep_gemm` 后端：DeepGEMM 风格 A per-token scale + B 128x128 block scale，当前仅用于 BF16 输出
+- `auto` 后端：优先尝试 DeepGEMM，失败时回退到 `torch`
 
 先做 correctness：
 
@@ -112,7 +119,21 @@ python benchmarks/validate_native_fp8_ops.py \
   --m 333 \
   --in-features 4096 \
   --out-features 4096 \
-  --dtype bf16
+  --dtype bf16 \
+  --backend auto
+```
+
+如果想显式探测本地 DeepGEMM：
+
+```bash
+NUNCHAKU_DEEPGEMM_PATH=/home/wyj24/projects/DeepGEMM \
+python benchmarks/validate_native_fp8_ops.py \
+  --m 333 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --dtype bf16 \
+  --backend auto \
+  --deep-gemm-path /home/wyj24/projects/DeepGEMM
 ```
 
 结果会写到：
@@ -122,6 +143,7 @@ python benchmarks/validate_native_fp8_ops.py \
 重点字段：
 
 - `all_passed`
+- `backend`
 - `wrapper_vs_manual`
 - `fp8_vs_fp16`
 
@@ -133,6 +155,7 @@ python benchmarks/benchmark_native_fp8.py \
   --in-features 4096 \
   --out-features 4096 \
   --dtype fp16 \
+  --backend torch \
   --warmup 20 \
   --iters 50
 ```
@@ -147,11 +170,13 @@ python benchmarks/benchmark_native_fp8.py \
 - `fp8_gemm_prequantized_ms`
 - `fp8_gemm_speedup_vs_fp16`
 - `fp8_gemm_prequantized_speedup_vs_fp16`
+- `backend`
 
 说明：
 
 - `fp8_gemm_ms`：在线量化 + FP8 GEMM 的端到端时间
 - `fp8_gemm_prequantized_ms`：只测 FP8 GEMM 本体，不含输入量化
+- `backend.last_backend`：实际执行的后端，判断 DeepGEMM 是否真的跑起来时看这个字段
 
 ## 6. 先做 correctness，再做 benchmark
 

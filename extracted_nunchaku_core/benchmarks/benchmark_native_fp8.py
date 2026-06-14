@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
+    parser.add_argument("--backend", choices=["auto", "torch", "deep_gemm"], default="auto")
+    parser.add_argument("--deep-gemm-path", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--results-dir", type=str, default="results")
     return parser.parse_args()
@@ -59,8 +61,7 @@ def main() -> None:
     w = torch.randn(args.out_features, args.in_features, device="cuda", dtype=dtype)
     b = torch.randn(args.out_features, device="cuda", dtype=dtype)
 
-    fp8_gemm = NunchakuFP8GemmOp(weight=w, bias=b)
-    qx, scale_x = fp8_gemm.quantize_input(x)
+    fp8_gemm = NunchakuFP8GemmOp(weight=w, bias=b, backend=args.backend, deep_gemm_path=args.deep_gemm_path)
 
     def fp16_fn() -> torch.Tensor:
         return torch.matmul(x, w.t()) + b
@@ -68,12 +69,23 @@ def main() -> None:
     def fp8_fn() -> torch.Tensor:
         return fp8_gemm(x)
 
-    def fp8_prequantized_fn() -> torch.Tensor:
-        return fp8_gemm.forward_prequantized(qx, scale_x)
-
     with torch.no_grad():
         y_ref = fp16_fn().float()
         y_fp8 = fp8_fn().float()
+
+    if fp8_gemm.last_backend == "deep_gemm":
+        qx, scale_x = fp8_gemm.quantize_input_deep_gemm(x)
+
+        def fp8_prequantized_fn() -> torch.Tensor:
+            return fp8_gemm.forward_prequantized_deep_gemm(qx, scale_x)
+
+    else:
+        qx, scale_x = fp8_gemm.quantize_input(x)
+
+        def fp8_prequantized_fn() -> torch.Tensor:
+            return fp8_gemm.forward_prequantized(qx, scale_x)
+
+    with torch.no_grad():
         y_fp8_preq = fp8_prequantized_fn().float()
 
     fp16_ms = time_cuda(fp16_fn, warmup=args.warmup, iters=args.iters)
@@ -85,6 +97,7 @@ def main() -> None:
         "in_features": args.in_features,
         "out_features": args.out_features,
         "dtype": args.dtype,
+        "backend": fp8_gemm.backend_info(),
         "fp16_ms": fp16_ms,
         "fp8_gemm_ms": fp8_ms,
         "fp8_gemm_prequantized_ms": fp8_preq_ms,

@@ -133,7 +133,7 @@ def main() -> None:
         lora_act = torch.matmul(x_lr, down_lr.t())
         y_lora = torch.matmul(lora_act, up_lr.t()).mul(op.scaling).to(dtype)
         lowrank_out = y_lora
-        separate_lowrank_out = None
+        separate_lowrank_out = y_lora if args.fuse_lowrank_forward else None
 
         dy_up = torch.matmul(dy_lr, up_lr)
         dx_ref = op.fp4_backward(dy) + torch.matmul(dy_up, down_lr).mul(op.scaling).reshape_as(x).to(dtype)
@@ -200,12 +200,18 @@ def main() -> None:
         errors["lora_down_grad_fp4_cache_vs_exact_manual"] = tensor_error(d_down_ref, d_down_exact_ref)
     if args.fuse_lowrank_forward and separate_y_ref is not None:
         errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
+    native_fused_forward = bool(
+        args.fuse_lowrank_forward
+        and not op.has_frozen_residual
+        and dtype == lowrank_dtype
+    )
     grad_tol = 5e-4 if args.fuse_lora_dx else 1e-6
-    forward_tol = 1e-6
+    forward_tol = 5e-4 if native_fused_forward else 1e-6
+    lora_up_grad_tol = 5e-4 if native_fused_forward and not args.no_cache_lora_act else 1e-6
     checks = {
-        "forward_rel_l2_lt_1e-6": errors["forward_vs_manual"]["rel_l2"] < forward_tol,
+        "forward_rel_l2_lt_tol": errors["forward_vs_manual"]["rel_l2"] < forward_tol,
         "dx_rel_l2_lt_5e-4": errors["dx_vs_manual"]["rel_l2"] < 5e-4,
-        "lora_up_grad_rel_l2_lt_1e-6": errors["lora_up_grad_vs_manual"]["rel_l2"] < 1e-6,
+        "lora_up_grad_rel_l2_lt_tol": errors["lora_up_grad_vs_manual"]["rel_l2"] < lora_up_grad_tol,
         "lora_down_grad_rel_l2_lt_tol": errors["lora_down_grad_vs_manual"]["rel_l2"] < grad_tol,
         "bias_grad_rel_l2_lt_1e-6": errors["bias_grad_vs_manual"]["rel_l2"] < 1e-6,
         "all_finite": bool(
@@ -256,10 +262,12 @@ def main() -> None:
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
+            "native_fused_forward": native_fused_forward,
         },
         "tolerances": {
             "forward_rel_l2": forward_tol,
             "fused_forward_separate_formula_rel_l2": 5e-4,
+            "lora_up_grad_rel_l2": lora_up_grad_tol,
             "lora_down_grad_rel_l2": grad_tol,
         },
         "errors": errors,

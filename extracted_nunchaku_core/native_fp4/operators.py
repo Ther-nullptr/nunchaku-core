@@ -281,6 +281,49 @@ class NunchakuFP4GemmOp(torch.nn.Module):
         )
         return out
 
+    def forward_prequantized_with_lora(
+        self,
+        qact: torch.Tensor,
+        ascales: torch.Tensor,
+        lora_act: torch.Tensor,
+        lora_up: torch.Tensor,
+        lora_scales: list[float],
+    ) -> torch.Tensor:
+        out = torch.empty(qact.shape[0], self.n_pad, dtype=self.compute_dtype, device=qact.device)
+
+        _OPS.gemm_w4a4(
+            qact,
+            self.qweight,
+            out,
+            None,
+            ascales,
+            self.wscales,
+            None,
+            None,
+            lora_act,
+            lora_up,
+            None,
+            None,
+            None,
+            None,
+            None,
+            self.bias_pad,
+            None,
+            None,
+            None,
+            False,
+            lora_scales,
+            False,
+            True,
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.in_features:
             raise ValueError(f"Expected input last dim = {self.in_features}, got {x.shape[-1]}")

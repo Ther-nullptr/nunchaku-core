@@ -63,6 +63,8 @@ class FP4LoRACacheSummary:
     """Resident cache footprint for converted FP4 LoRA modules."""
 
     module_count: int
+    fused_lora_forward_cache_count: int
+    fused_lora_forward_cache_bytes: int
     fused_lora_dx_cache_count: int
     fused_lora_dx_cache_bytes: int
     backward_weight_cache_count: int
@@ -70,6 +72,7 @@ class FP4LoRACacheSummary:
     fp4_forward_qweight_bytes: int
     dense_weight_bytes: int
     total_cache_bytes: int
+    fused_lora_forward_cache_vs_dense_weight: float
     fused_lora_dx_cache_vs_dense_weight: float
     backward_weight_cache_vs_dense_weight: float
     total_cache_vs_dense_weight: float
@@ -526,6 +529,8 @@ def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
     """Return actual resident cache bytes for converted FP4 LoRA modules."""
 
     module_count = 0
+    fused_lora_forward_cache_count = 0
+    fused_lora_forward_cache_bytes = 0
     fused_lora_dx_cache_count = 0
     fused_lora_dx_cache_bytes = 0
     backward_weight_cache_count = 0
@@ -535,6 +540,13 @@ def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
 
     for _, child in iter_fp4_lora_modules(module):
         module_count += 1
+        lora_forward_bytes = _tensor_nbytes(child._cached_lora_down_fwd_packed) + _tensor_nbytes(
+            child._cached_lora_up_fwd_packed
+        )
+        if lora_forward_bytes > 0:
+            fused_lora_forward_cache_count += 1
+            fused_lora_forward_cache_bytes += lora_forward_bytes
+
         lora_dx_bytes = _tensor_nbytes(child._cached_lora_down_bwd_packed) + _tensor_nbytes(
             child._cached_lora_up_bwd_packed
         )
@@ -554,18 +566,22 @@ def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
             * _dtype_nbytes(child.fp4_forward.compute_dtype)
         )
 
-    total_cache_bytes = fused_lora_dx_cache_bytes + backward_weight_cache_bytes
+    total_cache_bytes = fused_lora_forward_cache_bytes + fused_lora_dx_cache_bytes + backward_weight_cache_bytes
     if dense_weight_bytes <= 0:
+        forward_ratio = 0.0
         fused_ratio = 0.0
         backward_ratio = 0.0
         total_ratio = 0.0
     else:
+        forward_ratio = fused_lora_forward_cache_bytes / dense_weight_bytes
         fused_ratio = fused_lora_dx_cache_bytes / dense_weight_bytes
         backward_ratio = backward_weight_cache_bytes / dense_weight_bytes
         total_ratio = total_cache_bytes / dense_weight_bytes
 
     return FP4LoRACacheSummary(
         module_count=module_count,
+        fused_lora_forward_cache_count=fused_lora_forward_cache_count,
+        fused_lora_forward_cache_bytes=fused_lora_forward_cache_bytes,
         fused_lora_dx_cache_count=fused_lora_dx_cache_count,
         fused_lora_dx_cache_bytes=fused_lora_dx_cache_bytes,
         backward_weight_cache_count=backward_weight_cache_count,
@@ -573,6 +589,7 @@ def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
         fp4_forward_qweight_bytes=fp4_forward_qweight_bytes,
         dense_weight_bytes=dense_weight_bytes,
         total_cache_bytes=total_cache_bytes,
+        fused_lora_forward_cache_vs_dense_weight=forward_ratio,
         fused_lora_dx_cache_vs_dense_weight=fused_ratio,
         backward_weight_cache_vs_dense_weight=backward_ratio,
         total_cache_vs_dense_weight=total_ratio,

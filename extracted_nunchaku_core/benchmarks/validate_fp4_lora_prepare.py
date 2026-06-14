@@ -247,6 +247,9 @@ def main() -> None:
             result.refreshed_backward_weight_count == expected_backward_weight_count
         ),
         "cache_summary_module_count_matches": expected_cache_summary.module_count == len(expected_replaced),
+        "cache_summary_fused_lora_forward_count_initially_zero": (
+            expected_cache_summary.fused_lora_forward_cache_count == 0
+        ),
         "cache_summary_fused_lora_dx_count_matches": (
             expected_cache_summary.fused_lora_dx_cache_count == expected_cache_count
         ),
@@ -255,7 +258,8 @@ def main() -> None:
         ),
         "cache_summary_total_bytes_consistent": (
             expected_cache_summary.total_cache_bytes
-            == expected_cache_summary.fused_lora_dx_cache_bytes
+            == expected_cache_summary.fused_lora_forward_cache_bytes
+            + expected_cache_summary.fused_lora_dx_cache_bytes
             + expected_cache_summary.backward_weight_cache_bytes
         ),
         "cache_summary_dense_weight_bytes_positive": expected_cache_summary.dense_weight_bytes > 0,
@@ -299,6 +303,8 @@ def main() -> None:
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_summary": {
             "module_count": result.cache_summary.module_count,
+            "fused_lora_forward_cache_count": result.cache_summary.fused_lora_forward_cache_count,
+            "fused_lora_forward_cache_bytes": result.cache_summary.fused_lora_forward_cache_bytes,
             "fused_lora_dx_cache_count": result.cache_summary.fused_lora_dx_cache_count,
             "fused_lora_dx_cache_bytes": result.cache_summary.fused_lora_dx_cache_bytes,
             "backward_weight_cache_count": result.cache_summary.backward_weight_cache_count,
@@ -306,6 +312,9 @@ def main() -> None:
             "fp4_forward_qweight_bytes": result.cache_summary.fp4_forward_qweight_bytes,
             "dense_weight_bytes": result.cache_summary.dense_weight_bytes,
             "total_cache_bytes": result.cache_summary.total_cache_bytes,
+            "fused_lora_forward_cache_vs_dense_weight": (
+                result.cache_summary.fused_lora_forward_cache_vs_dense_weight
+            ),
             "fused_lora_dx_cache_vs_dense_weight": (
                 result.cache_summary.fused_lora_dx_cache_vs_dense_weight
             ),

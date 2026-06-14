@@ -218,6 +218,18 @@ def main() -> None:
         cache_lora_act=True,
         backward_weight_policy=args.backward_weight_policy,
     )
+    fp4_cached_fused_forward = NunchakuFP4LoRALinear(
+        weight=weight,
+        bias=bias,
+        rank=args.rank,
+        lora_alpha=args.lora_alpha,
+        lowrank_dtype=lowrank_dtype,
+        init="gaussian",
+        train_bias=args.train_bias,
+        cache_lora_act=True,
+        fuse_lowrank_forward=True,
+        backward_weight_policy=args.backward_weight_policy,
+    )
     fp4_recompute = NunchakuFP4LoRALinear(
         weight=weight,
         bias=bias,
@@ -339,6 +351,7 @@ def main() -> None:
     )
     fp4_modules = [
         fp4_cached,
+        fp4_cached_fused_forward,
         fp4_recompute,
         fp4_cached_fused_dx,
         fp4_recompute_fused_dx,
@@ -353,6 +366,7 @@ def main() -> None:
 
     with torch.no_grad():
         modules_to_sync = [
+            fp4_cached_fused_forward,
             fp4_recompute,
             fp4_cached_fused_dx,
             fp4_recompute_fused_dx,
@@ -375,17 +389,25 @@ def main() -> None:
 
     with torch.no_grad():
         y_cached = fp4_cached(x)
+        y_cached_fused_forward = fp4_cached_fused_forward(x)
         y_recompute = fp4_recompute(x)
         y_dense = dense(x)
+        forward_fused_forward_vs_cached = tensor_error(y_cached_fused_forward, y_cached)
         forward_cache_vs_recompute = tensor_error(y_cached, y_recompute)
         forward_fp4_vs_dense = tensor_error(y_cached, y_dense)
 
     dense_forward_inference_ms = benchmark_forward(dense, x, args.warmup, args.iters, track_grad=False)
     fp4_cached_forward_inference_ms = benchmark_forward(fp4_cached, x, args.warmup, args.iters, track_grad=False)
+    fp4_cached_fused_forward_inference_ms = benchmark_forward(
+        fp4_cached_fused_forward, x, args.warmup, args.iters, track_grad=False
+    )
     fp4_recompute_forward_inference_ms = benchmark_forward(fp4_recompute, x, args.warmup, args.iters, track_grad=False)
 
     dense_forward_train_graph_ms = benchmark_forward(dense, x, args.warmup, args.iters, track_grad=True)
     fp4_cached_forward_train_graph_ms = benchmark_forward(fp4_cached, x, args.warmup, args.iters, track_grad=True)
+    fp4_cached_fused_forward_train_graph_ms = benchmark_forward(
+        fp4_cached_fused_forward, x, args.warmup, args.iters, track_grad=True
+    )
     fp4_recompute_forward_train_graph_ms = benchmark_forward(fp4_recompute, x, args.warmup, args.iters, track_grad=True)
     fp4_cached_fused_dx_cached_pack_fp4_act_cache_d_lora_down_forward_train_graph_ms = benchmark_forward(
         fp4_cached_fused_dx_cached_pack_fp4_act_cache_d_lora_down,
@@ -397,6 +419,9 @@ def main() -> None:
 
     dense_train_step_ms = benchmark_train_step(dense, x, dy, args.warmup, args.iters)
     fp4_cached_train_step_ms = benchmark_train_step(fp4_cached, x, dy, args.warmup, args.iters)
+    fp4_cached_fused_forward_train_step_ms = benchmark_train_step(
+        fp4_cached_fused_forward, x, dy, args.warmup, args.iters
+    )
     fp4_recompute_train_step_ms = benchmark_train_step(fp4_recompute, x, dy, args.warmup, args.iters)
     fp4_cached_fused_dx_train_step_ms = benchmark_train_step(
         fp4_cached_fused_dx, x, dy, args.warmup, args.iters
@@ -411,6 +436,14 @@ def main() -> None:
 
     refresh_fused_lora_dx_cache_ms = time_cuda(
         refresh_fused_lora_dx_cache_fn, warmup=args.warmup, iters=args.iters
+    )
+
+    def refresh_fused_lora_forward_cache_fn() -> None:
+        fp4_cached_fused_forward.clear_fused_lora_forward_cache()
+        fp4_cached_fused_forward.refresh_fused_lora_forward_cache()
+
+    refresh_fused_lora_forward_cache_ms = time_cuda(
+        refresh_fused_lora_forward_cache_fn, warmup=args.warmup, iters=args.iters
     )
     fp4_cached_fused_dx_cached_pack_train_step_ms = benchmark_train_step(
         fp4_cached_fused_dx_cached_pack, x, dy, args.warmup, args.iters
@@ -527,6 +560,7 @@ def main() -> None:
             "backward_weight_policy": args.backward_weight_policy,
             "refreshed_backward_weight_count": refreshed_backward_weight_count,
             "can_reuse_fused_dy_up": can_reuse_fused_dy_up,
+            "native_fused_forward_available": dtype == lowrank_dtype,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
@@ -546,15 +580,18 @@ def main() -> None:
         "latency_ms": {
             "dense_forward_inference": dense_forward_inference_ms,
             "fp4_cached_forward_inference": fp4_cached_forward_inference_ms,
+            "fp4_cached_fused_forward_inference": fp4_cached_fused_forward_inference_ms,
             "fp4_recompute_forward_inference": fp4_recompute_forward_inference_ms,
             "dense_forward_train_graph": dense_forward_train_graph_ms,
             "fp4_cached_forward_train_graph": fp4_cached_forward_train_graph_ms,
+            "fp4_cached_fused_forward_train_graph": fp4_cached_fused_forward_train_graph_ms,
             "fp4_recompute_forward_train_graph": fp4_recompute_forward_train_graph_ms,
             "fp4_cached_fused_dx_cached_pack_fp4_act_cache_d_lora_down_forward_train_graph": (
                 fp4_cached_fused_dx_cached_pack_fp4_act_cache_d_lora_down_forward_train_graph_ms
             ),
             "dense_train_step": dense_train_step_ms,
             "fp4_cached_train_step": fp4_cached_train_step_ms,
+            "fp4_cached_fused_forward_train_step": fp4_cached_fused_forward_train_step_ms,
             "fp4_recompute_train_step": fp4_recompute_train_step_ms,
             "fp4_cached_fused_dx_train_step": fp4_cached_fused_dx_train_step_ms,
             "fp4_recompute_fused_dx_train_step": fp4_recompute_fused_dx_train_step_ms,
@@ -572,6 +609,7 @@ def main() -> None:
                 fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap_train_step_ms
             ),
             "refresh_fused_lora_dx_cache": refresh_fused_lora_dx_cache_ms,
+            "refresh_fused_lora_forward_cache": refresh_fused_lora_forward_cache_ms,
             "fp4_cached_fused_dx_cached_pack_plus_refresh_train_step": fp4_cached_fused_dx_cached_pack_train_step_ms
             + refresh_fused_lora_dx_cache_ms,
             "dense_grad_accum_total": dense_grad_accum_total_ms,
@@ -616,6 +654,9 @@ def main() -> None:
             ),
             "dense_backward_estimate": dense_train_step_ms - dense_forward_train_graph_ms,
             "fp4_cached_backward_estimate": fp4_cached_train_step_ms - fp4_cached_forward_train_graph_ms,
+            "fp4_cached_fused_forward_backward_estimate": (
+                fp4_cached_fused_forward_train_step_ms - fp4_cached_fused_forward_train_graph_ms
+            ),
             "fp4_recompute_backward_estimate": fp4_recompute_train_step_ms - fp4_recompute_forward_train_graph_ms,
             "fp4_cached_fused_dx_backward_estimate": fp4_cached_fused_dx_train_step_ms
             - fp4_cached_forward_train_graph_ms,
@@ -632,13 +673,25 @@ def main() -> None:
         },
         "speedups": {
             "fp4_cached_forward_inference_vs_dense": dense_forward_inference_ms / fp4_cached_forward_inference_ms,
+            "fp4_cached_fused_forward_inference_vs_dense": dense_forward_inference_ms
+            / fp4_cached_fused_forward_inference_ms,
+            "fused_forward_vs_fp4_cached_forward_inference": fp4_cached_forward_inference_ms
+            / fp4_cached_fused_forward_inference_ms,
             "fp4_recompute_forward_inference_vs_dense": dense_forward_inference_ms
             / fp4_recompute_forward_inference_ms,
             "fp4_cached_forward_train_graph_vs_dense": dense_forward_train_graph_ms
             / fp4_cached_forward_train_graph_ms,
+            "fp4_cached_fused_forward_train_graph_vs_dense": dense_forward_train_graph_ms
+            / fp4_cached_fused_forward_train_graph_ms,
+            "fused_forward_vs_fp4_cached_forward_train_graph": fp4_cached_forward_train_graph_ms
+            / fp4_cached_fused_forward_train_graph_ms,
             "fp4_recompute_forward_train_graph_vs_dense": dense_forward_train_graph_ms
             / fp4_recompute_forward_train_graph_ms,
             "fp4_cached_train_step_vs_dense": dense_train_step_ms / fp4_cached_train_step_ms,
+            "fp4_cached_fused_forward_train_step_vs_dense": dense_train_step_ms
+            / fp4_cached_fused_forward_train_step_ms,
+            "fused_forward_vs_fp4_cached_train_step": fp4_cached_train_step_ms
+            / fp4_cached_fused_forward_train_step_ms,
             "fp4_recompute_train_step_vs_dense": dense_train_step_ms / fp4_recompute_train_step_ms,
             "fp4_cached_fused_dx_train_step_vs_dense": dense_train_step_ms / fp4_cached_fused_dx_train_step_ms,
             "fp4_recompute_fused_dx_train_step_vs_dense": dense_train_step_ms
@@ -761,6 +814,7 @@ def main() -> None:
             / fp4_recompute_fused_dx_train_step_ms,
         },
         "errors": {
+            "forward_fused_forward_vs_cached": forward_fused_forward_vs_cached,
             "forward_cache_vs_recompute": forward_cache_vs_recompute,
             "forward_fp4_vs_dense": forward_fp4_vs_dense,
         },

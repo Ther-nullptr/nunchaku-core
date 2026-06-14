@@ -468,7 +468,7 @@ FP4 activation-cache `dA` 接入训练接口后的 BF16 短测，`fuse_lora_dx=T
 
 - `backward estimate = train_step - train_graph_forward`，用于判断 backward 优化方向，不是单独 CUDA event 包住 backward 的精确拆分。
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
-- `fuse_lowrank_forward=True` 是 dual-branch opt-in 实验选项：把 task LoRA forward 和 frozen residual forward 合成一次拼接 low-rank GEMM。它减少 launch/GEMM 次数，但会改变低秩分支的浮点归约顺序；验证脚本会 strict 检查当前调度，并额外用 `5e-4` rel_l2 tolerance 报告它相对“两支分开计算”公式的差异。默认关闭。
+- `fuse_lowrank_forward=True` 是 opt-in forward 消融选项：无 frozen residual 且 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable LoRA forward 并入 FP4 主分支；有 frozen residual 时仍走已有 task/residual 拼接 low-rank GEMM。验证脚本用 `native_fused_forward` 标记原生路径，并用 `5e-4` rel_l2 tolerance 报告它相对精确公式的差异。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
 - `backward_weight_policy="repack"` 是默认策略：每次 backward transient repack 出 `W^T` 的 packed FP4 权重，只预存转置后的 scale，不额外常驻第二份 backbone。`"cache"` 是显式 opt-in：常驻一份 compressed backward qweight，用显存换掉 repack 开销。RTX 5090 4096/rank32 BF16 短测中，cache train step 相对 repack 为 `1.056x`，4-step accumulation 为 `1.050x`；额外 qweight 为 dense BF16 权重的 `25%`、forward qweight 的 `1.0x`。
 - `fp4_activation_cache_d_lora_down=True` 是显存/近似训练模式：forward 保存主分支已有的 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 是默认值，直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 backward 临时物化 dense `x_hat`；`"dequant_gemm"` 会先反量化出 dense `x_hat` 再走 torch GEMM，通常更快但有额外 transient 显存。该模式要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
@@ -849,7 +849,7 @@ RTX 5090 验证结果：
 - 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
 - 按需刷新 fused dX cache。
 - opt-in `backward_weight_policy="cache"` 时预热 compressed backward qweight；默认 `repack` 不额外常驻第二份 backbone。
-- 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例。
+- 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；forward cache 是 lazy resident，prepare 后通常为 0，第一次 native fused forward 后再统计会出现。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
 - 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache；`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
 
@@ -1247,7 +1247,23 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
 | dual branch, residual fused dX | fp16 | 0.2791 | default fused dX reference |
 | dual branch, residual fused dX + fused lowrank forward | fp16 | 0.2797 | essentially tied，`0.998x` vs default fused dX |
 
-结论：当前 fused low-rank forward 只作为消融保留，不建议默认打开。它减少了一次低秩 branch 的 matmul/launch，但拼接 rank 后的 GEMM 形状不一定更优，训练 step 收益在 BF16 下接近噪声，在 FP16 dense residual dX 路径反而变慢。
+task-only native fused forward 消融，RTX 5090 上：
+
+```bash
+conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
+  --m 4096 --in-features 4096 --out-features 4096 --rank 32 \
+  --dtype bf16 --lowrank-dtype bf16 --warmup 5 --iters 10 --grad-accum-steps 4
+```
+
+| metric | default FP4+dense LoRA | native fused forward | result |
+| --- | ---: | ---: | --- |
+| forward inference ms | 0.3458 | 0.2723 | `1.270x` vs default |
+| forward train graph ms | 0.3462 | 0.2711 | `1.277x` vs default |
+| train step ms | 0.9963 | 0.9268 | `1.075x` vs default |
+| forward rel_l2 vs default | - | `1.55e-4` | within `5e-4` |
+| forward cache pack ms | - | 0.0232 | LoRA A/B packed cache refresh |
+
+结论：task-only native fused forward 对 forward 有明确收益，但它相对精确 LoRA formula 有约 `1e-4` 级别 rel_l2 差异，因此仍作为 opt-in；dual-branch residual fused low-rank forward 只作为消融保留，不建议默认打开。实际训练 step 的主要瓶颈仍更偏向 dX 主路径、LoRA 参数梯度和 residual dX 融合。
 
 ## 12. 主要 Python 接口
 
@@ -1264,7 +1280,7 @@ RTX 5090 上 `benchmark_native_fp4_lora_dual_branch.py --m 4096 --in-features 40
 - `native_fp4.NunchakuFP4LowRankBackwardDXOp`
   - backward 混合算子和 full backward 多种路径
 - `native_fp4.NunchakuFP4LoRALinear`
-  - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口；支持 opt-in `fp4_activation_cache_d_lora_down` 显存/近似训练模式，并可通过 `fp4_activation_cache_d_lora_down_backend` 选择 `fused` 或 `dequant_gemm`
+  - frozen FP4 backbone + 可选 frozen residual low-rank + trainable BF16/FP16 task LoRA 微调接口；支持 opt-in `fuse_lowrank_forward` 原生 forward epilogue 消融、`fp4_activation_cache_d_lora_down` 显存/近似训练模式，并可通过 `fp4_activation_cache_d_lora_down_backend` 选择 `fused` 或 `dequant_gemm`
 - `native_fp4.dequantize_fp4_activation`
   - 反解 native `qact/ascales` activation layout；`return_scales=False` 时走 CUDA fast path，供 FP4 activation cache 消融和后续 fused `dA` kernel 使用
 - `native_fp4.fp4_activation_cache_lora_down_grad`

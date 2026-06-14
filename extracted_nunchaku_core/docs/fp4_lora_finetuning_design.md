@@ -238,7 +238,7 @@ optimizer 边界：
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
 - `activation_checkpoint`：逐 `NunchakuFP4LoRALinear` 的局部 checkpoint。它只省该算子内部 saved tensors；要显著降低多层输入 activation，应该在 transformer block/segment 外层做 checkpoint。
 - `fuse_lowrank_forward`：opt-in forward 消融选项。当 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable task LoRA forward 并入 FP4 主分支；有 frozen residual 时，residual 仍作为 dense side branch 追加。该路径会改变低秩分支的累加/量化侧调度，验证脚本用 `native_fused_forward` 标记并用 `5e-4` rel_l2 tolerance 报告相对当前 BF16/FP16 调度公式的差异；默认关闭。
-- `zero_lora_up_fast_path`：默认开启的 zero-init 首步优化。仅当 `init="zero"` 后 `lora_up` 的 parameter version 仍匹配初始化零张量时触发；forward 跳过 LoRA out/native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只计算 `dB=dY.T@(x@A.T)`。初始 cache refresh 不生成 packed LoRA forward/dX cache；`optimizer.step()` 或 adapter load 改变版本后自动回到常规路径。
+- `zero_lora_up_fast_path`：默认开启的 zero-init 首步优化。仅当 `init="zero"` 后 `lora_up` 的 parameter version 仍匹配初始化零张量时触发；forward 跳过 LoRA out/native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只计算 `dB=dY.T@(x@A.T)`。初始 cache refresh 不生成 packed LoRA forward/dX cache；`optimizer.step()` 或 adapter load 改变版本后自动回到常规路径。若 `overlap_lora_grad=True` 且行数达到门槛，则 zero-up backward 会把 FP4 main dX、`dB` 和可选 frozen residual dX 分流到多 CUDA stream。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
 - `target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
 
@@ -302,7 +302,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - P0/P1 接口已经能在典型 4096 线性层上给出约 `1.9x-2.2x` 的训练 step 加速。
 - `fuse_lora_dx=True`：将 `dX_lora = (dY @ B) @ A` 的第二段放进 FP4 dX epilogue。
 - `cache_fused_lora_dx=True`：只缓存 LoRA packed A/B，额外内存约 `rank * (in + out)`，不缓存第二份 FP4 backbone；参数 version 变化时自动刷新。
-- `zero_lora_up_fast_path=True`：zero-init task LoRA 首步只保留 `dB`，跳过 LoRA out、LoRA dX、`dA` 和初始 packed LoRA cache。RTX 5090 4096/rank32 BF16 短测中，fused dX cached-pack train step `0.9058 -> 0.7439ms`（`1.218x`），throughput fused-forward+fused-dX `0.8768 -> 0.7994ms`（`1.097x`）。`lora_up` 更新后 fast path 自动失效，post-step hook 再刷新 packed cache。
+- `zero_lora_up_fast_path=True`：zero-init task LoRA 首步只保留 `dB`，跳过 LoRA out、LoRA dX、`dA` 和初始 packed LoRA cache。RTX 5090 4096/rank32 BF16 短测中，fused dX cached-pack train step `0.9058 -> 0.7439ms`（`1.218x`），throughput fused-forward+fused-DX `0.8768 -> 0.7994ms`（`1.097x`）。打开 zero-up overlap 后，fused dX cached-pack `0.8371 -> 0.7254ms`（`1.154x` vs disabled fast path），throughput fused-forward+fused-DX `0.7713 -> 0.7260ms`（`1.062x`）。`lora_up` 更新后 fast path 自动失效，post-step hook 再刷新 packed cache。
 - `backward_weight_policy="repack"`：默认每次 backward transient repack `W^T` 的 packed FP4 权重，只预存转置后的 scale，不常驻第二份 backbone。`benchmark_native_fp4_lora_training.py --backward-weight-policy cache` 会把该策略接入所有训练变体并报告 `backward_weight_cache_bytes`；`"cache"` 是 memory-budget opt-in，常驻一份 compressed backward qweight。RTX 5090 4096/rank32 BF16 短测中 train step `1.056x`、4-step accumulation `1.050x` vs repack，额外 cache 为 dense BF16 weight 的 `25%`。
 - `fp4_activation_cache_d_lora_down=True`：forward 保存主分支已有 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 dense `x_hat`；`"dequant_gemm"` 先反量化出 dense `x_hat` 再用 torch GEMM，当前更快但 transient 显存更高。这是显存/近似训练模式，要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
@@ -584,6 +584,7 @@ P5.2：zero-init `lora_up` 首步 fast path 已落地。实现要点：
 
 - `NunchakuFP4LoRALinear` 记录初始化后 `lora_up._version`，只在 version 匹配时启用 fast path；不在热路径做 `count_nonzero`。
 - fast path 下 forward 只算 FP4 main 和可选 frozen residual，仍按需保存精确 dense `lora_act=x@A.T` 供 `dB` 使用；backward 只算 FP4 main dX、可选 residual dX、`dB`，并返回零 `dA`。
+- 若 `overlap_lora_grad=True` 且 rows >= `overlap_lora_grad_min_rows`，zero-up backward 使用专用 overlap helper 并行 FP4 main dX、`dB` 和 residual dX；不依赖 packed LoRA dX cache，也不新增 resident memory。
 - `refresh_fused_lora_forward_caches` 和 `refresh_fused_lora_dx_caches` 在初始 zero-up 状态不生成 packed LoRA cache，`prepare(..., refresh_caches=True)` 的 cache summary 因此真实反映 resident bytes 为 0；optimizer post-step hook 会在 `lora_up` 更新后恢复常规 cache refresh。
 - `load_fp4_lora_state_dict` / `load_fp4_lora_peft_state_dict` 会清除 zero-up 标记，避免外部 adapter 被误判为初始化零状态。
 - Correctness 覆盖 active zero-up、fused dX、fused forward、FP4 activation-cache dA、frozen residual 和非 zero-init gaussian 回归。新增 `benchmark_fp4_lora_zero_fast_path.py` 输出 `latest_fp4_lora_zero_fast_path.json`。

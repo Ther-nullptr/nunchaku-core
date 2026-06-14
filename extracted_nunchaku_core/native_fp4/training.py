@@ -277,15 +277,36 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 down_lr_for_act = lora_down.to(ctx.lowrank_dtype)
                 lora_act = torch.matmul(x_lr_for_act, down_lr_for_act.t())
 
-            dy_lr = dy2d.to(ctx.lowrank_dtype)
-            dx = ctx.fp4_backward_op(dy)
-            if ctx.has_frozen_residual:
-                residual_down_lr = frozen_residual_down.to(ctx.lowrank_dtype)
-                residual_up_lr = frozen_residual_up.to(ctx.lowrank_dtype)
-                dy_residual_up = torch.matmul(dy_lr, residual_up_lr)
-                dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(ctx.frozen_residual_scaling)
-                dx = dx.to(dx_residual.dtype) + dx_residual.reshape(ctx.x_shape)
-            d_lora_up = torch.matmul(dy_lr.t(), lora_act.to(ctx.lowrank_dtype)).mul(ctx.scaling).to(lora_up.dtype)
+            should_overlap_zero_up = (
+                ctx.overlap_lora_grad
+                and not ctx.fp4_activation_cache_d_lora_down
+                and rows >= ctx.overlap_lora_grad_min_rows
+                and dy.is_cuda
+            )
+            if should_overlap_zero_up:
+                dx, d_lora_up = _zero_lora_up_backward_overlap(
+                    dy=dy,
+                    lora_act=lora_act,
+                    lora_up=lora_up,
+                    fp4_backward_op=ctx.fp4_backward_op,
+                    scaling=ctx.scaling,
+                    lowrank_dtype=ctx.lowrank_dtype,
+                    in_features=ctx.in_features,
+                    out_features=ctx.out_features,
+                    frozen_residual_down=frozen_residual_down if ctx.has_frozen_residual else None,
+                    frozen_residual_up=frozen_residual_up if ctx.has_frozen_residual else None,
+                    frozen_residual_scaling=ctx.frozen_residual_scaling,
+                )
+            else:
+                dy_lr = dy2d.to(ctx.lowrank_dtype)
+                dx = ctx.fp4_backward_op(dy)
+                if ctx.has_frozen_residual:
+                    residual_down_lr = frozen_residual_down.to(ctx.lowrank_dtype)
+                    residual_up_lr = frozen_residual_up.to(ctx.lowrank_dtype)
+                    dy_residual_up = torch.matmul(dy_lr, residual_up_lr)
+                    dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(ctx.frozen_residual_scaling)
+                    dx = dx.to(dx_residual.dtype) + dx_residual.reshape(ctx.x_shape)
+                d_lora_up = torch.matmul(dy_lr.t(), lora_act.to(ctx.lowrank_dtype)).mul(ctx.scaling).to(lora_up.dtype)
             d_lora_down = torch.zeros_like(lora_down)
             d_bias = dy2d.sum(dim=0).to(grad_output.dtype) if ctx.has_bias else None
             return (
@@ -539,6 +560,63 @@ def _pack_lora_forward_factors(
     if up.shape[0] != fp4_forward_op.n_pad:
         up = pad_tensor(up, divisor=fp4_forward_op.n_pad, dim=0)
     return pack_lowrank_weight(down, down=True).contiguous(), pack_lowrank_weight(up, down=False).contiguous()
+
+
+def _zero_lora_up_backward_overlap(
+    dy: torch.Tensor,
+    lora_act: torch.Tensor,
+    lora_up: torch.Tensor,
+    fp4_backward_op: NunchakuFP4BackwardDXOp,
+    scaling: float,
+    lowrank_dtype: torch.dtype,
+    in_features: int,
+    out_features: int,
+    frozen_residual_down: torch.Tensor | None = None,
+    frozen_residual_up: torch.Tensor | None = None,
+    frozen_residual_scaling: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not dy.is_cuda:
+        raise ValueError("zero-up overlap requires CUDA tensors")
+    has_frozen_residual = (
+        frozen_residual_down is not None
+        and frozen_residual_up is not None
+        and frozen_residual_down.numel() > 0
+        and frozen_residual_up.numel() > 0
+    )
+
+    orig_shape = dy.shape
+    dy2d_src = dy.reshape(-1, out_features)
+
+    current_stream = torch.cuda.current_stream(device=dy.device)
+    dx_stream = torch.cuda.Stream(device=dy.device)
+    up_stream = torch.cuda.Stream(device=dy.device)
+    residual_stream = torch.cuda.Stream(device=dy.device) if has_frozen_residual else None
+
+    dx_stream.wait_stream(current_stream)
+    with torch.cuda.stream(dx_stream):
+        dx = fp4_backward_op(dy)
+
+    up_stream.wait_stream(current_stream)
+    with torch.cuda.stream(up_stream):
+        d_lora_up = torch.matmul(dy2d_src.to(lowrank_dtype).t(), lora_act.to(lowrank_dtype))
+        d_lora_up = d_lora_up.mul(float(scaling)).to(lora_up.dtype)
+
+    if residual_stream is not None:
+        residual_stream.wait_stream(current_stream)
+        with torch.cuda.stream(residual_stream):
+            residual_down_lr = frozen_residual_down.to(lowrank_dtype)
+            residual_up_lr = frozen_residual_up.to(lowrank_dtype)
+            dy_residual_up = torch.matmul(dy2d_src.to(lowrank_dtype), residual_up_lr)
+            dx_residual = torch.matmul(dy_residual_up, residual_down_lr).mul(float(frozen_residual_scaling))
+
+    current_stream.wait_stream(dx_stream)
+    current_stream.wait_stream(up_stream)
+    if residual_stream is not None:
+        current_stream.wait_stream(residual_stream)
+
+    if has_frozen_residual:
+        dx = dx.to(dx_residual.dtype) + dx_residual.reshape(*orig_shape[:-1], in_features)
+    return dx, d_lora_up
 
 
 def _fused_lora_dx(

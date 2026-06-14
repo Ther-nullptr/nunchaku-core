@@ -68,6 +68,8 @@ def make_module(
     fuse_lowrank_forward: bool,
     fuse_lora_dx: bool,
     cache_fused_lora_dx: bool,
+    overlap_lora_grad: bool,
+    overlap_lora_grad_min_rows: int,
     zero_lora_up_fast_path: bool,
 ) -> NunchakuFP4LoRALinear:
     return NunchakuFP4LoRALinear(
@@ -83,6 +85,8 @@ def make_module(
         fuse_lowrank_forward=fuse_lowrank_forward,
         fuse_lora_dx=fuse_lora_dx,
         cache_fused_lora_dx=cache_fused_lora_dx,
+        overlap_lora_grad=overlap_lora_grad,
+        overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
         zero_lora_up_fast_path=zero_lora_up_fast_path,
     )
 
@@ -173,6 +177,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fuse-lowrank-forward", action="store_true")
     p.add_argument("--fuse-lora-dx", action="store_true")
     p.add_argument("--cache-fused-lora-dx", action="store_true")
+    p.add_argument("--overlap-lora-grad", action="store_true")
+    p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--seed", type=int, default=0)
@@ -186,6 +192,8 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     if args.cache_fused_lora_dx and not args.fuse_lora_dx:
         raise ValueError("--cache-fused-lora-dx requires --fuse-lora-dx")
+    if args.overlap_lora_grad and not (args.fuse_lora_dx and args.cache_fused_lora_dx):
+        raise ValueError("--overlap-lora-grad requires --fuse-lora-dx --cache-fused-lora-dx")
 
     torch.manual_seed(args.seed)
     dtype = dtype_from_name(args.dtype)
@@ -206,6 +214,8 @@ def main() -> None:
         fuse_lowrank_forward=args.fuse_lowrank_forward,
         fuse_lora_dx=args.fuse_lora_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
+        overlap_lora_grad=args.overlap_lora_grad,
+        overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         zero_lora_up_fast_path=True,
     )
     baseline = make_module(
@@ -218,6 +228,8 @@ def main() -> None:
         fuse_lowrank_forward=args.fuse_lowrank_forward,
         fuse_lora_dx=args.fuse_lora_dx,
         cache_fused_lora_dx=args.cache_fused_lora_dx,
+        overlap_lora_grad=args.overlap_lora_grad,
+        overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         zero_lora_up_fast_path=False,
     )
     sync_lora(baseline, fast)
@@ -258,6 +270,8 @@ def main() -> None:
             "fuse_lowrank_forward": args.fuse_lowrank_forward,
             "fuse_lora_dx": args.fuse_lora_dx,
             "cache_fused_lora_dx": args.cache_fused_lora_dx,
+            "overlap_lora_grad": args.overlap_lora_grad,
+            "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
         },
         "zero_fast_path_state": {
             "fast_active_before_update": fast_active_before,

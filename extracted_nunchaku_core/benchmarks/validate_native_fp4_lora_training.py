@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fp4-activation-cache-d-lora-down", action="store_true")
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--disable-zero-lora-up-fast-path", action="store_true")
+    p.add_argument("--preserve-zero-fast-path", action="store_true")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -105,25 +106,39 @@ def main() -> None:
     if args.backward_weight_policy == "cache":
         op.refresh_backward_weight_cache()
         backward_weight_cache_check = op.fp4_backward._cached_qweight_bwd is not None
+    preserve_zero_fast_path = bool(args.preserve_zero_fast_path and zero_lora_up_fast_path_active_before_update)
     if args.cache_fused_lora_dx:
         op.refresh_fused_lora_dx_cache()
-        old_down_version = op._cached_lora_down_version
-        old_up_version = op._cached_lora_up_version
-        with torch.no_grad():
-            op.lora_down.add_(1e-4)
-            op.lora_up.add_(1e-4)
-        cache_refresh_check = old_down_version != op.lora_down._version and old_up_version != op.lora_up._version
+        if preserve_zero_fast_path:
+            cache_refresh_check = (
+                op._cached_lora_down_bwd_packed is None
+                and op._cached_lora_up_bwd_packed is None
+            )
+        else:
+            old_down_version = op._cached_lora_down_version
+            old_up_version = op._cached_lora_up_version
+            with torch.no_grad():
+                op.lora_down.add_(1e-4)
+                op.lora_up.add_(1e-4)
+            cache_refresh_check = old_down_version != op.lora_down._version and old_up_version != op.lora_up._version
 
     zero_lora_up_fast_path_active_for_forward = op._lora_up_zero_fast_path_active()
     y = op(x)
     loss = (y.float() * dy.float()).sum()
     loss.backward()
     if args.cache_fused_lora_dx:
-        cache_refresh_check = bool(
-            cache_refresh_check
-            and op._cached_lora_down_version == op.lora_down._version
-            and op._cached_lora_up_version == op.lora_up._version
-        )
+        if preserve_zero_fast_path:
+            cache_refresh_check = bool(
+                cache_refresh_check
+                and op._cached_lora_down_bwd_packed is None
+                and op._cached_lora_up_bwd_packed is None
+            )
+        else:
+            cache_refresh_check = bool(
+                cache_refresh_check
+                and op._cached_lora_down_version == op.lora_down._version
+                and op._cached_lora_up_version == op.lora_up._version
+            )
 
     with torch.no_grad():
         x2d = x.detach().reshape(-1, op.in_features)
@@ -274,6 +289,7 @@ def main() -> None:
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": not args.disable_zero_lora_up_fast_path,
+            "preserve_zero_fast_path": args.preserve_zero_fast_path,
             "zero_lora_up_fast_path_active_before_update": zero_lora_up_fast_path_active_before_update,
             "zero_lora_up_fast_path_active_for_forward": zero_lora_up_fast_path_active_for_forward,
             "zero_lora_up_fast_path_active": op._lora_up_zero_fast_path_active(),

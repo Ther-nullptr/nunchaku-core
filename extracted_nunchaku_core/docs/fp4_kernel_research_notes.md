@@ -227,5 +227,9 @@ RTX 5090 BF16，`m=in=out=4096, rank=32, warmup=5, iters=20`：
 | --- | ---: | ---: | ---: | --- |
 | fused dX cached-pack | 0.9058 | 0.7439 | 1.218x | all_passed |
 | throughput fused forward + fused dX | 0.8768 | 0.7994 | 1.097x | all_passed |
+| fused dX cached-pack + zero-up overlap | 0.8371 | 0.7254 | 1.154x | all_passed |
+| throughput fused forward + fused dX + zero-up overlap | 0.7713 | 0.7260 | 1.062x | all_passed |
 
 throughput disabled-baseline 使用 native fused forward 生成近似 `lora_act`，`d_lora_up_baseline_vs_exact` 约 `7.1e-4`；fast path 使用 dense `x@A.T`，`d_lora_up_fast_vs_exact=0`。初始 packed LoRA forward/dX cache 均不生成；optimizer post-step hook 在 `lora_up` 更新后恢复正常 cache refresh。
+
+`overlap_lora_grad=True` 下新增了 zero-up 专用 backward overlap：FP4 main `dX`、`dB=dY.T@(x@A.T)` 和可选 frozen residual dX 分别放到 CUDA streams 上执行，不依赖 LoRA packed dX cache，也不新增 resident memory。单看 zero-up fast path 自身，fused dX cached-pack 从 `0.7439ms` 降到 `0.7254ms`（`1.025x`），throughput fused-forward+fused-dX 从 `0.7994ms` 降到 `0.7260ms`（`1.101x`）。带 frozen residual 的短测结果为：fused dX cached-pack `1.0189 -> 0.9127ms`（`1.116x`），throughput fused-forward+fused-dX `1.0146 -> 0.9908ms`（`1.024x`）。

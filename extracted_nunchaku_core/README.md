@@ -1248,6 +1248,46 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --iters 3
 ```
 
+如果要在同一批 WikiText-2 token、同一模块选择范围下公平比较几种 outlier 策略，使用 policy sweep 脚本：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_policy_sweep.py \
+  --fp4-variant fp4_balanced \
+  --policies dense_lora fp4_base fp4_task_rank_bump fp4_residual_only fp4_residual_plus_task fp4_keep_dense \
+  --batch-size 1 \
+  --seq-len 64 \
+  --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
+  --warmup 1 \
+  --iters 3
+```
+
+输出 `results/latest_hf_llama_fp4_lora_policy_sweep.json`。每个 FP4 policy 都复用 `benchmark_hf_llama_fp4_lora_finetuning.py` 的真实模型加载、Linear 选择、`prepare_fp4_lora_finetuning` 替换和 train-step 计时路径；JSON 中重点看：
+
+- `records.<policy>.initial_logits_vs_dense_lora.rel_l2`
+- `records.<policy>.relative_to_dense_lora.train_step_speedup`
+- `records.<policy>.relative_to_fp4_base.latency_ratio_vs_fp4_base`
+- `records.<policy>.fp4_module_configs.*.requested_rank`
+- `records.<policy>.fp4_module_configs.*.requested_frozen_residual_rank`
+- `records.<policy>.excluded_selected_modules`
+
+最小 smoke 测试可以只替换第 0 层 `q_proj`，并把输出写到 `/tmp`，避免污染仓库结果：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_policy_sweep.py \
+  --policies fp4_base fp4_residual_only \
+  --batch-size 1 \
+  --seq-len 16 \
+  --replace-layer-start 0 \
+  --replace-layer-end 1 \
+  --replace-name-substrings q_proj \
+  --dataset-max-docs 16 \
+  --warmup 0 \
+  --iters 1 \
+  --prime-steps 0 \
+  --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
+  --results-dir /tmp/nunchaku_hf_policy_sweep_smoke
+```
+
 也可以继续叠加 inference sensitivity scan：
 
 ```bash
@@ -1611,6 +1651,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 高层 `prepare_fp4_lora_finetuning` preset 相对 dense LoRA baseline 的模型级 train step、optimizer/cache hook、peak memory 和 forward 误差消融
 - `latest_hf_llama_fp4_lora_finetuning.json`
   - 真实 HF/LLaMA + WikiText-2 上 dense LoRA 与 FP4 LoRA preset 的 train step、初始 logits 误差、峰值显存和实际替换模块
+- `latest_hf_llama_fp4_lora_policy_sweep.json`
+  - 真实 HF/LLaMA + WikiText-2 上 base、task-rank bump、frozen-residual bump、residual-only 和 keep-dense outlier 策略的同 batch 对比
 - `latest_fp4_lora_initialization.json`
   - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`

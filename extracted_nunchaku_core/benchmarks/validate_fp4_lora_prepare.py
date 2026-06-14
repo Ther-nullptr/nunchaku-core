@@ -104,6 +104,14 @@ def main() -> None:
                     "module": "layers.1.down_proj",
                     "suggested_rank": args.auto_rank,
                 }
+            ],
+            "keep_dense_candidates": [
+                {
+                    "module": "layers.0.q_proj",
+                },
+                {
+                    "module": "layers.1.down_proj",
+                }
             ]
         }
     }
@@ -147,6 +155,52 @@ def main() -> None:
         sensitivity_rank_scale=2.0,
         lr=args.lr,
     )
+    outlier_exclude_model = TinyModel(args.hidden, dtype).cuda()
+    outlier_exclude_result = prepare_fp4_lora_finetuning(
+        outlier_exclude_model,
+        mode=args.mode,
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        use_frozen_residual=not args.no_frozen_residual,
+        backward_weight_policy=args.backward_weight_policy,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+        config_overrides={"layers.1.down_proj": manual_override},
+        outlier_report=outlier_report,
+        outlier_exclude_keep_dense=True,
+        lr=args.lr,
+    )
+    outlier_exclude_modules = dict(iter_fp4_lora_modules(outlier_exclude_result.model))
+    expected_outlier_exclude_replaced = {
+        "layers.0.down_proj",
+        "layers.1.q_proj",
+        "layers.1.down_proj",
+    }
+    outlier_exclude_no_manual_model = TinyModel(args.hidden, dtype).cuda()
+    outlier_exclude_no_manual_result = prepare_fp4_lora_finetuning(
+        outlier_exclude_no_manual_model,
+        mode=args.mode,
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        use_frozen_residual=not args.no_frozen_residual,
+        backward_weight_policy=args.backward_weight_policy,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+        target_modules=("q_proj", "down_proj"),
+        exclude_modules=("lm_head",),
+        outlier_report=outlier_report,
+        outlier_exclude_keep_dense=True,
+        lr=args.lr,
+    )
+    outlier_exclude_no_manual_modules = dict(iter_fp4_lora_modules(outlier_exclude_no_manual_result.model))
+    expected_outlier_exclude_no_manual_replaced = {
+        "layers.0.down_proj",
+        "layers.1.q_proj",
+    }
     prepared = result.model
     fp4_modules = dict(iter_fp4_lora_modules(prepared))
     expected_replaced = {
@@ -253,6 +307,32 @@ def main() -> None:
         "manual_override_wins_over_sensitivity_exclude": (
             "layers.1.down_proj" in fp4_modules and "layers.1.down_proj" not in result.exclude_modules
         ),
+        "outlier_keep_dense_default_is_opt_in": "layers.0.q_proj" in fp4_modules,
+        "outlier_keep_dense_excludes_candidate": (
+            "layers.0.q_proj" not in outlier_exclude_modules
+            and isinstance(outlier_exclude_result.model.layers[0].q_proj, torch.nn.Linear)
+        ),
+        "outlier_keep_dense_manual_override_wins": (
+            "layers.1.down_proj" in outlier_exclude_modules
+            and "layers.1.down_proj" not in outlier_exclude_result.exclude_modules
+        ),
+        "outlier_keep_dense_replaced_expected_modules": (
+            set(outlier_exclude_result.replaced_modules) == expected_outlier_exclude_replaced
+        ),
+        "outlier_keep_dense_exclude_modules_recorded": (
+            outlier_exclude_result.exclude_modules == ("lm_head", "layers.0.q_proj")
+        ),
+        "outlier_keep_dense_no_manual_excludes_all_candidates": (
+            "layers.0.q_proj" not in outlier_exclude_no_manual_modules
+            and "layers.1.down_proj" not in outlier_exclude_no_manual_modules
+        ),
+        "outlier_keep_dense_no_manual_replaced_expected_modules": (
+            set(outlier_exclude_no_manual_result.replaced_modules) == expected_outlier_exclude_no_manual_replaced
+        ),
+        "outlier_keep_dense_no_manual_exclude_modules_recorded": (
+            outlier_exclude_no_manual_result.exclude_modules
+            == ("lm_head", "layers.0.q_proj", "layers.1.down_proj")
+        ),
         "trainable_names_match_lora_params": set(result.trainable_names) == set(named_lora_params),
         "all_non_lora_frozen": all_non_lora_frozen,
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
@@ -319,6 +399,10 @@ def main() -> None:
             "zero_fast_path_initial": zero_fast_path_initial,
         },
         "replaced": result.replaced_modules,
+        "outlier_keep_dense_replaced": outlier_exclude_result.replaced_modules,
+        "outlier_keep_dense_exclude_modules": outlier_exclude_result.exclude_modules,
+        "outlier_keep_dense_no_manual_replaced": outlier_exclude_no_manual_result.replaced_modules,
+        "outlier_keep_dense_no_manual_exclude_modules": outlier_exclude_no_manual_result.exclude_modules,
         "trainable": result.trainable_names,
         "trainable_param_count": result.trainable_param_count,
         "refreshed_forward_cache_count": result.refreshed_forward_cache_count,

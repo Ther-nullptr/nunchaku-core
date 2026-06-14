@@ -768,6 +768,7 @@ from native_fp4 import (
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_finetune_config,
+    fp4_lora_outlier_policy_from_report,
     fp4_lora_parameter_groups,
     fp4_lora_peft_state_dict,
     fp4_lora_sensitivity_policy_from_report,
@@ -964,6 +965,7 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
 - `records.fp4_balanced.cache_summary.total_cache_bytes`
 - `records.fp4_balanced.initial_logits_vs_dense_lora`
 - `records.*.selected_modules`
+- `records.*.excluded_selected_modules`
 
 注意：如果 `--warmup 0 --prime-steps 0`，FP4 zero-init `lora_up` 的首步 fast path 会进入被计时区。默认 `--prime-steps 1` 会先消耗首步，使训练 step 更接近 steady-state。
 
@@ -1201,6 +1203,19 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --batch-size 1 \
   --seq-len 64 \
   --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
+  --warmup 1 \
+  --iters 3
+```
+
+如果 outlier 已经严重到 rank bump 不值得继续尝试，可以追加 `--outlier-keep-dense`。这会消费 `summary.keep_dense_candidates`，把这些模块加入 `exclude_modules`，保留 BF16/FP16 Linear；手写 `config_overrides` 仍然优先，不会被自动 keep-dense 覆盖：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --batch-size 1 \
+  --seq-len 64 \
+  --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
+  --outlier-keep-dense \
   --warmup 1 \
   --iters 3
 ```
@@ -1499,6 +1514,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.fp4_lora_config_overrides_from_outlier_report`
   - 从 outlier 诊断 JSON 自动生成 `config_overrides`
+- `native_fp4.fp4_lora_outlier_policy_from_report`
+  - 从 outlier 诊断 JSON 同时生成 rank bump `config_overrides` 和 opt-in keep-dense `exclude_modules`
 - `native_fp4.fp4_lora_sensitivity_policy_from_report`
   - 从真实模型 module sensitivity JSON 生成 rank bump `config_overrides` 和 BF16/FP16 `exclude_modules` 策略
 - `native_fp4.freeze_non_fp4_lora_parameters`

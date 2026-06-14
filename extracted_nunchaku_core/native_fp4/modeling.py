@@ -110,6 +110,16 @@ class FP4LoRASensitivityPolicy:
     excluded_modules: tuple[str, ...]
 
 
+@dataclass
+class FP4LoRAOutlierPolicy:
+    """Per-module policy derived from activation/grad-output outlier diagnostics."""
+
+    config_overrides: dict[str, FP4LoRAConfig]
+    exclude_modules: tuple[str, ...]
+    rank_bump_modules: tuple[str, ...]
+    excluded_modules: tuple[str, ...]
+
+
 def fp4_lora_finetune_config(
     *,
     mode: FP4LoRAFinetuneMode = "balanced",
@@ -294,15 +304,58 @@ def fp4_lora_config_overrides_from_outlier_report(
     """Build per-module FP4 LoRA overrides from an outlier diagnostic report.
 
     The expected input is the JSON emitted by
-    ``analyze_fp4_lora_activation_grad_outliers.py``. Only
+    ``analyze_fp4_lora_activation_grad_outliers.py`` or
+    ``analyze_hf_llama_activation_grad_outliers.py``. Only
     ``summary.rank_bump_candidates`` is consumed; unsupported fields are ignored.
     """
 
-    report_data = _load_report(report)
+    policy = fp4_lora_outlier_policy_from_report(
+        report,
+        base_config,
+        rank_field=rank_field,
+        rank_multiple=rank_multiple,
+        min_rank=min_rank,
+        max_rank=max_rank,
+        force_init=force_init,
+        disable_fuse_frozen_residual_dx=disable_fuse_frozen_residual_dx,
+        exclude_keep_dense=False,
+    )
+    return policy.config_overrides
 
-    candidates = report_data.get("summary", {}).get("rank_bump_candidates", [])
+
+def fp4_lora_outlier_policy_from_report(
+    report: Mapping[str, Any] | str,
+    base_config: FP4LoRAConfig,
+    *,
+    rank_field: str = "suggested_rank",
+    rank_multiple: int = 16,
+    min_rank: int | None = None,
+    max_rank: int | None = None,
+    force_init: LoRAInitMode | None = None,
+    disable_fuse_frozen_residual_dx: bool = False,
+    exclude_keep_dense: bool = False,
+    keep_dense_candidates_key: str = "keep_dense_candidates",
+) -> FP4LoRAOutlierPolicy:
+    """Convert activation/grad-output outlier diagnostics into a fine-tuning policy.
+
+    ``summary.rank_bump_candidates`` produces per-module rank overrides.
+    When ``exclude_keep_dense=True``, ``summary.keep_dense_candidates`` also
+    becomes ``exclude_modules`` so severe outlier modules stay BF16/FP16.
+    """
+
+    if rank_multiple <= 0:
+        raise ValueError("rank_multiple must be positive")
+
+    report_data = _load_report(report)
+    summary = report_data.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+
     overrides: dict[str, FP4LoRAConfig] = {}
-    for item in candidates:
+    rank_bump_modules: list[str] = []
+    for item in summary.get("rank_bump_candidates", []):
+        if not isinstance(item, Mapping):
+            continue
         module_name = item.get("module")
         if not module_name:
             continue
@@ -311,14 +364,37 @@ def fp4_lora_config_overrides_from_outlier_report(
             rank = max(rank, int(min_rank))
         if max_rank is not None:
             rank = min(rank, int(max_rank))
-        rank = _ceil_to_multiple(rank, rank_multiple)
-        overrides[str(module_name)] = replace(
-            base_config,
-            rank=rank,
-            init=base_config.init if force_init is None else force_init,
-            fuse_frozen_residual_dx=False if disable_fuse_frozen_residual_dx else base_config.fuse_frozen_residual_dx,
-        )
-    return overrides
+        rank = max(base_config.rank, _ceil_to_multiple(rank, rank_multiple))
+        for alias in _module_name_aliases(str(module_name)):
+            overrides[alias] = replace(
+                base_config,
+                rank=rank,
+                init=base_config.init if force_init is None else force_init,
+                fuse_frozen_residual_dx=False
+                if disable_fuse_frozen_residual_dx
+                else base_config.fuse_frozen_residual_dx,
+            )
+        rank_bump_modules.append(str(module_name))
+
+    exclude_modules: list[str] = []
+    excluded_modules: list[str] = []
+    if exclude_keep_dense:
+        for item in summary.get(keep_dense_candidates_key, []):
+            if not isinstance(item, Mapping):
+                continue
+            module_name = item.get("module")
+            if not module_name:
+                continue
+            for alias in _module_name_aliases(str(module_name)):
+                exclude_modules.append(alias)
+            excluded_modules.append(str(module_name))
+
+    return FP4LoRAOutlierPolicy(
+        config_overrides=overrides,
+        exclude_modules=tuple(dict.fromkeys(exclude_modules)),
+        rank_bump_modules=tuple(dict.fromkeys(rank_bump_modules)),
+        excluded_modules=tuple(dict.fromkeys(excluded_modules)),
+    )
 
 
 def fp4_lora_sensitivity_policy_from_report(
@@ -1019,6 +1095,8 @@ def prepare_fp4_lora_finetuning(
     outlier_rank_multiple: int = 16,
     outlier_min_rank: int | None = None,
     outlier_max_rank: int | None = None,
+    outlier_exclude_keep_dense: bool = False,
+    outlier_keep_dense_candidates_key: str = "keep_dense_candidates",
     sensitivity_report: Mapping[str, Any] | str | None = None,
     sensitivity_ratio_field: str = "perplexity_ratio_vs_fp16",
     sensitivity_rank_bump_ratio: float | None = 1.05,
@@ -1074,8 +1152,16 @@ def prepare_fp4_lora_finetuning(
         manual_override_patterns = tuple(
             dict.fromkeys(alias for key in config_overrides for alias in _module_name_aliases(str(key)))
         )
+
+    def not_manually_overridden(name: str) -> bool:
+        if not manual_override_patterns:
+            return True
+        return not _name_matches(name, name.rsplit(".", 1)[-1], manual_override_patterns)
+
+    targets = _as_tuple(target_modules)
+    excludes = _as_tuple(exclude_modules)
     if outlier_report is not None:
-        auto_overrides = fp4_lora_config_overrides_from_outlier_report(
+        outlier_policy = fp4_lora_outlier_policy_from_report(
             outlier_report,
             cfg,
             rank_field=outlier_rank_field,
@@ -1084,12 +1170,15 @@ def prepare_fp4_lora_finetuning(
             max_rank=outlier_max_rank,
             force_init="zero",
             disable_fuse_frozen_residual_dx=True,
+            exclude_keep_dense=outlier_exclude_keep_dense,
+            keep_dense_candidates_key=outlier_keep_dense_candidates_key,
         )
-        for key, value in auto_overrides.items():
+        for key, value in outlier_policy.config_overrides.items():
             merged_overrides.setdefault(key, value)
+        if outlier_policy.exclude_modules:
+            outlier_excludes = tuple(name for name in outlier_policy.exclude_modules if not_manually_overridden(name))
+            excludes = tuple(dict.fromkeys((*excludes, *outlier_excludes)))
 
-    targets = _as_tuple(target_modules)
-    excludes = _as_tuple(exclude_modules)
     if sensitivity_report is not None:
         sensitivity_policy = fp4_lora_sensitivity_policy_from_report(
             sensitivity_report,
@@ -1108,9 +1197,7 @@ def prepare_fp4_lora_finetuning(
             merged_overrides.setdefault(key, value)
         if sensitivity_policy.exclude_modules:
             sensitivity_excludes = tuple(
-                name
-                for name in sensitivity_policy.exclude_modules
-                if not _name_matches(name, name.rsplit(".", 1)[-1], manual_override_patterns)
+                name for name in sensitivity_policy.exclude_modules if not_manually_overridden(name)
             )
             excludes = tuple(dict.fromkeys((*excludes, *sensitivity_excludes)))
 

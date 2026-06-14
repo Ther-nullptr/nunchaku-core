@@ -139,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outlier-rank-multiple", type=int, default=16)
     parser.add_argument("--outlier-min-rank", type=int, default=None)
     parser.add_argument("--outlier-max-rank", type=int, default=None)
+    parser.add_argument("--outlier-keep-dense", action="store_true")
+    parser.add_argument("--outlier-keep-dense-candidates-key", type=str, default="keep_dense_candidates")
     parser.add_argument("--sensitivity-report", type=str, default=None)
     parser.add_argument("--sensitivity-ratio-field", type=str, default="perplexity_ratio_vs_fp16")
     parser.add_argument("--sensitivity-rank-bump-ratio", type=float, default=1.05)
@@ -643,6 +645,8 @@ def run_fp4_variant(
         outlier_rank_multiple=args.outlier_rank_multiple,
         outlier_min_rank=args.outlier_min_rank,
         outlier_max_rank=args.outlier_max_rank,
+        outlier_exclude_keep_dense=args.outlier_keep_dense,
+        outlier_keep_dense_candidates_key=args.outlier_keep_dense_candidates_key,
         sensitivity_report=args.sensitivity_report,
         sensitivity_ratio_field=args.sensitivity_ratio_field,
         sensitivity_rank_bump_ratio=args.sensitivity_rank_bump_ratio,
@@ -688,6 +692,9 @@ def run_fp4_variant(
     all_module_backward_weight_policies_match = all(
         child.backward_weight_policy == args.backward_weight_policy for child in fp4_modules.values()
     )
+    selected_set = set(selected_names)
+    replaced_set = set(result.replaced_modules)
+    excluded_selected_modules = sorted(selected_set - replaced_set)
     cache_hook_count = None if hook is None else hook.last_refresh_count
     cache_hook_forward_count = None if hook is None else hook.last_fused_lora_forward_refresh_count
     cache_hook_dx_count = None if hook is None else hook.last_fused_lora_dx_refresh_count
@@ -700,6 +707,7 @@ def run_fp4_variant(
         "fp4_activation_cache_d_lora_down_backend": backend,
         "config": jsonable_config(result.config),
         "selected_modules": selected_names,
+        "excluded_selected_modules": excluded_selected_modules,
         "replaced_modules": result.replaced_modules,
         "replaced_count": len(result.replaced_modules),
         "trainable_names": result.trainable_names,
@@ -731,7 +739,8 @@ def run_fp4_variant(
         "relative_to_dense_lora": None,
         "checks": {
             "selected_modules_nonempty": bool(selected_names),
-            "replaced_count_matches_selection": len(result.replaced_modules) == len(selected_names),
+            "replaced_modules_subset_of_selection": replaced_set.issubset(selected_set),
+            "replaced_modules_nonempty": len(result.replaced_modules) > 0,
             "trainable_param_count_positive": result.trainable_param_count > 0,
             "initial_loss_finite": bool(torch.isfinite(initial_loss)),
             "final_loss_finite": bool(torch.isfinite(final_loss)),
@@ -842,6 +851,8 @@ def main() -> None:
             "outlier_rank_multiple": args.outlier_rank_multiple,
             "outlier_min_rank": args.outlier_min_rank,
             "outlier_max_rank": args.outlier_max_rank,
+            "outlier_keep_dense": args.outlier_keep_dense,
+            "outlier_keep_dense_candidates_key": args.outlier_keep_dense_candidates_key,
             "sensitivity_report": args.sensitivity_report,
             "sensitivity_ratio_field": args.sensitivity_ratio_field,
             "sensitivity_rank_bump_ratio": args.sensitivity_rank_bump_ratio,

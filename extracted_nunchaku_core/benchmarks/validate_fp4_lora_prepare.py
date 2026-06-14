@@ -183,6 +183,7 @@ def main() -> None:
         len(expected_replaced) if base_cfg.fuse_lora_dx and base_cfg.cache_fused_lora_dx else 0
     )
     expected_backward_weight_count = len(expected_replaced) if base_cfg.backward_weight_policy == "cache" else 0
+    expected_cache_summary = result.cache_summary
     expected_adapter_keys = {
         f"{name}.{param}" for name in expected_replaced for param in ("lora_down", "lora_up")
     }
@@ -245,6 +246,19 @@ def main() -> None:
         "backward_weight_refresh_count_matches": (
             result.refreshed_backward_weight_count == expected_backward_weight_count
         ),
+        "cache_summary_module_count_matches": expected_cache_summary.module_count == len(expected_replaced),
+        "cache_summary_fused_lora_dx_count_matches": (
+            expected_cache_summary.fused_lora_dx_cache_count == expected_cache_count
+        ),
+        "cache_summary_backward_weight_count_matches": (
+            expected_cache_summary.backward_weight_cache_count == expected_backward_weight_count
+        ),
+        "cache_summary_total_bytes_consistent": (
+            expected_cache_summary.total_cache_bytes
+            == expected_cache_summary.fused_lora_dx_cache_bytes
+            + expected_cache_summary.backward_weight_cache_bytes
+        ),
+        "cache_summary_dense_weight_bytes_positive": expected_cache_summary.dense_weight_bytes > 0,
         "backward_weight_cache_state_matches": all(
             (fp4_modules[name].fp4_backward._cached_qweight_bwd is not None)
             == (args.backward_weight_policy == "cache")
@@ -283,6 +297,23 @@ def main() -> None:
         "trainable_param_count": result.trainable_param_count,
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
+        "cache_summary": {
+            "module_count": result.cache_summary.module_count,
+            "fused_lora_dx_cache_count": result.cache_summary.fused_lora_dx_cache_count,
+            "fused_lora_dx_cache_bytes": result.cache_summary.fused_lora_dx_cache_bytes,
+            "backward_weight_cache_count": result.cache_summary.backward_weight_cache_count,
+            "backward_weight_cache_bytes": result.cache_summary.backward_weight_cache_bytes,
+            "fp4_forward_qweight_bytes": result.cache_summary.fp4_forward_qweight_bytes,
+            "dense_weight_bytes": result.cache_summary.dense_weight_bytes,
+            "total_cache_bytes": result.cache_summary.total_cache_bytes,
+            "fused_lora_dx_cache_vs_dense_weight": (
+                result.cache_summary.fused_lora_dx_cache_vs_dense_weight
+            ),
+            "backward_weight_cache_vs_dense_weight": (
+                result.cache_summary.backward_weight_cache_vs_dense_weight
+            ),
+            "total_cache_vs_dense_weight": result.cache_summary.total_cache_vs_dense_weight,
+        },
         "hook_refresh_count": hook_refresh_count,
         "hook_backward_weight_cache_count": hook_backward_weight_cache_count,
         "exclude_modules": result.exclude_modules,

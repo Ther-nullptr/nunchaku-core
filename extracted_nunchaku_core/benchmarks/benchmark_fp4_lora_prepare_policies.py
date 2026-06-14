@@ -346,6 +346,7 @@ def run_record(
         "trainable_param_count": result.trainable_param_count,
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
+        "cache_summary": asdict(result.cache_summary),
         "cache_hook_refresh_count": cache_hook_count,
         "latency_ms": {
             "train_step_with_optimizer": latency_ms,

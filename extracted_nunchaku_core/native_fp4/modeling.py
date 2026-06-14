@@ -58,6 +58,23 @@ class FP4LoRAConfig:
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused"
 
 
+@dataclass(frozen=True)
+class FP4LoRACacheSummary:
+    """Resident cache footprint for converted FP4 LoRA modules."""
+
+    module_count: int
+    fused_lora_dx_cache_count: int
+    fused_lora_dx_cache_bytes: int
+    backward_weight_cache_count: int
+    backward_weight_cache_bytes: int
+    fp4_forward_qweight_bytes: int
+    dense_weight_bytes: int
+    total_cache_bytes: int
+    fused_lora_dx_cache_vs_dense_weight: float
+    backward_weight_cache_vs_dense_weight: float
+    total_cache_vs_dense_weight: float
+
+
 @dataclass
 class FP4LoRAPrepareResult:
     """Artifacts returned by ``prepare_fp4_lora_finetuning``."""
@@ -70,6 +87,7 @@ class FP4LoRAPrepareResult:
     optimizer_param_groups: list[dict[str, Any]]
     refreshed_cache_count: int
     refreshed_backward_weight_count: int
+    cache_summary: FP4LoRACacheSummary
     target_modules: tuple[str, ...]
     exclude_modules: tuple[str, ...]
 
@@ -492,6 +510,73 @@ def iter_fp4_lora_modules(module: torch.nn.Module) -> Iterator[tuple[str, Nuncha
     for name, child in module.named_modules():
         if isinstance(child, NunchakuFP4LoRALinear):
             yield name, child
+
+
+def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
+    """Return actual resident cache bytes for converted FP4 LoRA modules."""
+
+    module_count = 0
+    fused_lora_dx_cache_count = 0
+    fused_lora_dx_cache_bytes = 0
+    backward_weight_cache_count = 0
+    backward_weight_cache_bytes = 0
+    fp4_forward_qweight_bytes = 0
+    dense_weight_bytes = 0
+
+    for _, child in iter_fp4_lora_modules(module):
+        module_count += 1
+        lora_dx_bytes = _tensor_nbytes(child._cached_lora_down_bwd_packed) + _tensor_nbytes(
+            child._cached_lora_up_bwd_packed
+        )
+        if lora_dx_bytes > 0:
+            fused_lora_dx_cache_count += 1
+            fused_lora_dx_cache_bytes += lora_dx_bytes
+
+        backward_qweight_bytes = _tensor_nbytes(child.fp4_backward._cached_qweight_bwd)
+        if backward_qweight_bytes > 0:
+            backward_weight_cache_count += 1
+            backward_weight_cache_bytes += backward_qweight_bytes
+
+        fp4_forward_qweight_bytes += _tensor_nbytes(child.fp4_forward.qweight)
+        dense_weight_bytes += (
+            int(child.out_features)
+            * int(child.in_features)
+            * _dtype_nbytes(child.fp4_forward.compute_dtype)
+        )
+
+    total_cache_bytes = fused_lora_dx_cache_bytes + backward_weight_cache_bytes
+    if dense_weight_bytes <= 0:
+        fused_ratio = 0.0
+        backward_ratio = 0.0
+        total_ratio = 0.0
+    else:
+        fused_ratio = fused_lora_dx_cache_bytes / dense_weight_bytes
+        backward_ratio = backward_weight_cache_bytes / dense_weight_bytes
+        total_ratio = total_cache_bytes / dense_weight_bytes
+
+    return FP4LoRACacheSummary(
+        module_count=module_count,
+        fused_lora_dx_cache_count=fused_lora_dx_cache_count,
+        fused_lora_dx_cache_bytes=fused_lora_dx_cache_bytes,
+        backward_weight_cache_count=backward_weight_cache_count,
+        backward_weight_cache_bytes=backward_weight_cache_bytes,
+        fp4_forward_qweight_bytes=fp4_forward_qweight_bytes,
+        dense_weight_bytes=dense_weight_bytes,
+        total_cache_bytes=total_cache_bytes,
+        fused_lora_dx_cache_vs_dense_weight=fused_ratio,
+        backward_weight_cache_vs_dense_weight=backward_ratio,
+        total_cache_vs_dense_weight=total_ratio,
+    )
 
 
 def refresh_fused_lora_dx_caches(module: torch.nn.Module) -> int:
@@ -989,6 +1074,7 @@ def prepare_fp4_lora_finetuning(
     trainable_names = freeze_non_fp4_lora_parameters(prepared_model, train_bias=train_bias)
     refreshed = refresh_fused_lora_dx_caches(prepared_model) if refresh_caches else 0
     refreshed_backward_weight = refresh_fp4_backward_weight_caches(prepared_model) if refresh_caches else 0
+    cache_summary = fp4_lora_cache_summary(prepared_model)
     param_groups = fp4_lora_parameter_groups(
         prepared_model,
         train_bias=train_bias,
@@ -1007,6 +1093,7 @@ def prepare_fp4_lora_finetuning(
         optimizer_param_groups=param_groups,
         refreshed_cache_count=refreshed,
         refreshed_backward_weight_count=refreshed_backward_weight,
+        cache_summary=cache_summary,
         target_modules=targets,
         exclude_modules=excludes,
     )

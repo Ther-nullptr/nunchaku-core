@@ -790,7 +790,7 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
   --iters 5
 ```
 
-输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
+输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`cache_summary.total_cache_bytes`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
 
 如果要测试第二份 compressed backward qweight 的上限收益，追加 `--backward-weight-policy cache`。默认仍是 `repack`，避免常驻第二份 backbone；cache 策略会在 `prepare_fp4_lora_finetuning(..., refresh_caches=True)` 时预热，并在结果中报告 `refreshed_backward_weight_count`。
 
@@ -824,6 +824,7 @@ RTX 5090 验证结果：
 - 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
 - 按需刷新 fused dX cache。
 - opt-in `backward_weight_policy="cache"` 时预热 compressed backward qweight；默认 `repack` 不额外常驻第二份 backbone。
+- 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
 - 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache；`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
 

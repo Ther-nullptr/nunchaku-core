@@ -311,6 +311,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - 4096/rank32 BF16 短测中，reuse 相对 cached-pack 单步 `1.014x`，reuse+overlap 相对 reuse 单步 `1.032x`，backward estimate 相对 dense `2.086x`。FP16 两次短测中，单步相对 cached-pack 约 `0.968x-1.018x`，梯度累积 per micro-step 约 `1.016x-1.036x`。
 - `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`；实现上用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM。
 - `overlap_lora_grad_min_rows=4096` 是默认 auto gate：小于该 flattened row 数时自动回落到 sequential cached fused-dX 路径，避免 2048 形状上多 stream 调度变慢；设为 `0` 可强制 always-overlap 做消融。
+- `NUNCHAKU_FP4_LORA_CACHE_OVERLAP_RESOURCES=1` 是 stream/event 资源复用消融开关，默认关闭。RTX 5090 上 1024 forced-overlap 约 `1.01x`，4096 主形状约 `0.974x`，说明复用 Python `Stream/Event` 对象不是稳定收益；默认仍在 helper 内临时创建资源。
 - BF16 exact overlap 默认不复用 packed 近似 `dY @ B`，`dA` 仍走 dense `dY @ B`。Correctness：`validate_native_fp4_lora_training.py --m 257 --in-features 3072 --out-features 3584 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --overlap-lora-grad --overlap-lora-grad-min-rows 0` 通过，`dX` rel_l2 `1.55e-4`，`dA` rel_l2 `0`。如果同时打开 `reuse_fused_dy_up_for_d_lora_down=True` 且不使用 frozen residual，BF16 使用 dual dense `dy_up`，强制 overlap correctness 同样通过，`dA` rel_l2 `0`。
 - `benchmark_native_fp4_lora_training_breakdown.py` 现在额外报告 `dy_read_model` 和 overlap 子图 correctness。4096/rank32 BF16 短测中，exact current 约等价于 3 次读 `dY`，reuse 路径约 2 次读 `dY`，理想大融合 kernel 才能降到 1 次；exact overlap 子图 `0.2595ms`、cached fused dX 单独 `0.2158ms`、`dA/dB` exact rel_l2 为 0，reuse `dA` rel_l2 约 `5.75e-4`。
 - BF16 FP4 activation-cache `dA` 已接入 `NunchakuFP4LoRALinear`：`validate_native_fp4_lora_training.py --m 129 --in-features 512 --out-features 768 --rank 32 --dtype bf16 --lowrank-dtype bf16 --fuse-lora-dx --cache-fused-lora-dx --fp4-activation-cache-d-lora-down` 通过；`--fp4-activation-cache-d-lora-down-backend fused/dequant_gemm` 两条路径均通过。`dA` 对齐 FP4-cache reference，FP4-cache reference 相对 exact saved-x `dA` rel_l2 约 `9.7e-2`。
@@ -585,6 +586,7 @@ P5.2：zero-init `lora_up` 首步 fast path 已落地。实现要点：
 - `NunchakuFP4LoRALinear` 记录初始化后 `lora_up._version`，只在 version 匹配时启用 fast path；不在热路径做 `count_nonzero`。
 - fast path 下 forward 只算 FP4 main 和可选 frozen residual，仍按需保存精确 dense `lora_act=x@A.T` 供 `dB` 使用；backward 只算 FP4 main dX、可选 residual dX、`dB`，并返回零 `dA`。
 - 若 `overlap_lora_grad=True` 且 rows >= `overlap_lora_grad_min_rows`，zero-up backward 使用专用 overlap helper 并行 FP4 main dX、`dB` 和 residual dX；不依赖 packed LoRA dX cache，也不新增 resident memory。
+- overlap helper 的 stream/event 资源复用已做消融并默认关闭：4096 主形状下 cache 约 `0.974x`，不值得作为默认路径。
 - `refresh_fused_lora_forward_caches` 和 `refresh_fused_lora_dx_caches` 在初始 zero-up 状态不生成 packed LoRA cache，`prepare(..., refresh_caches=True)` 的 cache summary 因此真实反映 resident bytes 为 0；optimizer post-step hook 会在 `lora_up` 更新后恢复常规 cache refresh。
 - `load_fp4_lora_state_dict` / `load_fp4_lora_peft_state_dict` 会清除 zero-up 标记，避免外部 adapter 被误判为初始化零状态。
 - Correctness 覆盖 active zero-up、fused dX、fused forward、FP4 activation-cache dA、frozen residual 和非 zero-init gaussian 回归。新增 `benchmark_fp4_lora_zero_fast_path.py` 输出 `latest_fp4_lora_zero_fast_path.json`。

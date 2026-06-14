@@ -202,6 +202,15 @@ RTX 5090 BF16，`m=in=out=4096, rank=32, warmup=5, iters=10`：
 - reuse 路径确实把 `dY` consumer 从 3 次降到 2 次，但它复用的是 quantize/fused low-rank 输出，`dA` 会变成近似梯度。
 - 真正的一次读 `dY` 大融合 kernel 仍有理论空间：相对 exact current 可把 `dY` 读流量降到约 `1/3`，相对 reuse 降到约 `1/2`。但这个 kernel 必须同时处理 FP4 quantize/GEMM 输入、`dB` 规约和 `dy_up/dA` 链，不能只用多 stream overlap 替代。
 
+随后对 overlap helper 的 Python-side stream/event 创建做消融。实现上保留 `NUNCHAKU_FP4_LORA_CACHE_OVERLAP_RESOURCES=1` 内部开关，但默认关闭，因为 4096 主形状没有收益：
+
+| shape | cached wall ms | uncached wall ms | cached speedup | correctness |
+| --- | ---: | ---: | ---: | --- |
+| 1024 forced-overlap | 0.4439 | 0.4482 | 1.010x | all_passed |
+| 4096 default-gate | 0.9071 | 0.8837 | 0.974x | all_passed |
+
+结论：复用 Python `torch.cuda.Stream/Event` 对象不是当前瓶颈，且会在 4096 形状引入轻微负收益；默认仍保持 helper 内临时创建资源。下一步真正值得做的是一次读 `dY` 的融合 kernel 或 rank-specialized low-rank gradient kernel，而不是继续堆多 stream 调度。
+
 ## Zero-init LoRA-up fast path
 
 本轮尝试继续扩大 rank32 fused `dA` 的 rank tile，结果不如已推广的 `kVec=4,rVec=16,threads=128`：

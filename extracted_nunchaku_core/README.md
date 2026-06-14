@@ -476,6 +476,7 @@ FP4 activation-cache `dA` 接入训练接口后的 BF16 短测，`fuse_lora_dx=T
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 opt-in 实验选项：复用 fused dX quantize kernel 产生的 `dY @ B`，避免额外 dense `dY @ B` matmul。FP16 走 packed decode，有小量 `dA` 误差；BF16 走 dual dense `dy_up` 输出，保持 `dA` 与手写 BF16 matmul 对齐。
 - `overlap_lora_grad=True` 要求同时打开 `fuse_lora_dx=True` 和 `cache_fused_lora_dx=True`，用多 CUDA stream 重叠 transient FP4 repack、fused dX、`dB` GEMM 和 `dA` GEMM；exact overlap 支持 frozen residual branch，但 residual dX 保持 dense 计算。
 - `overlap_lora_grad_min_rows=4096` 是默认 auto gate：小于该 flattened row 数时自动回落到 sequential cached fused-dX 路径，避免 2048 形状上多 stream 调度变慢；传 `--overlap-lora-grad-min-rows 0` 可强制 always-overlap 做消融。
+- `NUNCHAKU_FP4_LORA_CACHE_OVERLAP_RESOURCES=1` 是 stream/event 资源复用消融开关，默认关闭。RTX 5090 短测中 1024 forced-overlap 约 `1.01x`，4096 主形状约 `0.974x`，因此不作为默认优化；后续若要做 CUDA Graph/多 step capture 再重新评估。
 - BF16 下 `reuse_fused_dy_up_for_d_lora_down=True` 使用 dual quantize 输出 dense `dy_up`，不复用 packed 近似中间量；`fuse_frozen_residual_dx=True` 仍不用于 BF16。
 - BF16 下 `fp4_activation_cache_d_lora_down=True` 可省 saved `x` 约 `3.56x`，但 `dA` 相对 exact saved-x 约 `1e-1` rel_l2，且当前 fused dA kernel 仍慢；4096 train step 只有 exact cached-pack 的约 `0.72x`。它是显存压力模式，不是默认性能模式；如果显存允许临时 dense `x_hat`，可把 backend 切到 `"dequant_gemm"` 做速度消融。
 - FP16 下如果同时打开 `reuse_fused_dy_up_for_d_lora_down=True`，`overlap_lora_grad=True` 会复用 decoded packed `dY @ B`，这是更快但有小量 `dA` 误差的实验路径；BF16 同一开关使用 dual dense `dy_up`，`dA` rel_l2 为 0。
@@ -646,6 +647,27 @@ python benchmarks/benchmark_fp4_lora_lowrank_grad.py \
 结果会写到：
 
 - `results/latest_fp4_lora_lowrank_grad.json`
+
+如果要判断 overlap helper 的 Python-side stream/event 分配是否值得缓存，跑：
+
+```bash
+python benchmarks/benchmark_fp4_lora_overlap_resource_cache.py \
+  --m 4096 \
+  --in-features 4096 \
+  --out-features 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --overlap-lora-grad-min-rows 4096 \
+  --warmup 10 \
+  --iters 50
+```
+
+结果会写到：
+
+- `results/latest_fp4_lora_overlap_resource_cache.json`
+
+当前 5090 结论：缓存 stream/event 资源对 4096 主形状是轻微负收益（约 `0.974x`），所以默认保持每次 helper 内创建资源；该脚本只作为消融工具。
 
 如果要拆开 FP4 dX 主路径，跑：
 
@@ -1388,6 +1410,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - FP4 LoRA training benchmark
 - `latest_fp4_lora_lowrank_grad.json`
   - FP4 LoRA 低秩梯度子图 benchmark，拆分 `dy_up/dA/dB`、复用 `dy_up` 和双 stream overlap
+- `latest_fp4_lora_overlap_resource_cache.json`
+  - overlap backward 中 stream/event 资源复用的消融，当前默认关闭该 cache
 - `latest_fp4_lora_zero_fast_path.json`
   - zero-init `lora_up` 首步 fast path 的 correctness、cache skip 和 train-step speedup
 - `latest_native_fp4_lora_dual_branch_bf16.json`

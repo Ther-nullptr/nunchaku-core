@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Literal
 
 import torch
@@ -30,6 +31,47 @@ FrozenResidualInitMode = Literal["none", "residual_svd"]
 ResidualSVDMethod = Literal["full_svd", "svd_lowrank"]
 FP4ActivationCacheDLoRADownBackend = Literal["fused", "dequant_gemm"]
 DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS = 4096
+_ENABLE_OVERLAP_RESOURCE_CACHE = os.environ.get("NUNCHAKU_FP4_LORA_CACHE_OVERLAP_RESOURCES") == "1"
+
+
+class _FP4LoRAOverlapResources:
+    """Reusable CUDA streams/events for one module/device/current-stream pair."""
+
+    def __init__(self, device: torch.device, current_stream_handle: int):
+        if device.type != "cuda":
+            raise ValueError("overlap resources require a CUDA device")
+        device_index = torch.cuda.current_device() if device.index is None else int(device.index)
+        self.device_index = device_index
+        self.current_stream_handle = int(current_stream_handle)
+        self.device = torch.device("cuda", device_index)
+        with torch.cuda.device(self.device):
+            self.repack_stream = torch.cuda.Stream(device=self.device)
+            self.dx_stream = torch.cuda.Stream(device=self.device)
+            self.up_stream = torch.cuda.Stream(device=self.device)
+            self.down_stream = torch.cuda.Stream(device=self.device)
+            self.residual_stream = torch.cuda.Stream(device=self.device)
+            self.repack_done = torch.cuda.Event()
+            self.quant_done = torch.cuda.Event()
+
+
+def _get_lora_overlap_resources(
+    owner: object,
+    device: torch.device,
+    current_stream: torch.cuda.Stream,
+) -> _FP4LoRAOverlapResources:
+    device = torch.device(device)
+    device_index = torch.cuda.current_device() if device.index is None else int(device.index)
+    stream_handle = int(current_stream.cuda_stream)
+    key = (device_index, stream_handle)
+    resources_by_key = getattr(owner, "_lora_overlap_resources_by_key", None)
+    if resources_by_key is None:
+        resources_by_key = {}
+        setattr(owner, "_lora_overlap_resources_by_key", resources_by_key)
+    resources = resources_by_key.get(key)
+    if resources is None:
+        resources = _FP4LoRAOverlapResources(torch.device("cuda", device_index), stream_handle)
+        resources_by_key[key] = resources
+    return resources
 
 
 def _fp4_activation_cache_lora_down_grad(
@@ -588,9 +630,15 @@ def _zero_lora_up_backward_overlap(
     dy2d_src = dy.reshape(-1, out_features)
 
     current_stream = torch.cuda.current_stream(device=dy.device)
-    dx_stream = torch.cuda.Stream(device=dy.device)
-    up_stream = torch.cuda.Stream(device=dy.device)
-    residual_stream = torch.cuda.Stream(device=dy.device) if has_frozen_residual else None
+    if _ENABLE_OVERLAP_RESOURCE_CACHE:
+        resources = _get_lora_overlap_resources(fp4_backward_op, torch.device(dy.device), current_stream)
+        dx_stream = resources.dx_stream
+        up_stream = resources.up_stream
+        residual_stream = resources.residual_stream if has_frozen_residual else None
+    else:
+        dx_stream = torch.cuda.Stream(device=dy.device)
+        up_stream = torch.cuda.Stream(device=dy.device)
+        residual_stream = torch.cuda.Stream(device=dy.device) if has_frozen_residual else None
 
     dx_stream.wait_stream(current_stream)
     with torch.cuda.stream(dx_stream):
@@ -728,13 +776,23 @@ def _fused_lora_backward_overlap_exact(
     lora_scales = [1.0] * ceil_divide(packed_rank, 16)
 
     current_stream = torch.cuda.current_stream(device=dy.device)
-    repack_stream = torch.cuda.Stream(device=dy.device)
-    dx_stream = torch.cuda.Stream(device=dy.device)
-    up_stream = torch.cuda.Stream(device=dy.device)
-    down_stream = torch.cuda.Stream(device=dy.device)
-    residual_stream = torch.cuda.Stream(device=dy.device) if has_frozen_residual else None
-    repack_done = torch.cuda.Event()
-    quant_done = torch.cuda.Event()
+    if _ENABLE_OVERLAP_RESOURCE_CACHE:
+        resources = _get_lora_overlap_resources(fp4_backward_op, torch.device(dy.device), current_stream)
+        repack_stream = resources.repack_stream
+        dx_stream = resources.dx_stream
+        up_stream = resources.up_stream
+        down_stream = resources.down_stream
+        residual_stream = resources.residual_stream if has_frozen_residual else None
+        repack_done = resources.repack_done
+        quant_done = resources.quant_done
+    else:
+        repack_stream = torch.cuda.Stream(device=dy.device)
+        dx_stream = torch.cuda.Stream(device=dy.device)
+        up_stream = torch.cuda.Stream(device=dy.device)
+        down_stream = torch.cuda.Stream(device=dy.device)
+        residual_stream = torch.cuda.Stream(device=dy.device) if has_frozen_residual else None
+        repack_done = torch.cuda.Event()
+        quant_done = torch.cuda.Event()
 
     repack_stream.wait_stream(current_stream)
     with torch.cuda.stream(repack_stream):
@@ -821,12 +879,21 @@ def _fused_lora_backward_overlap_reuse(
     lora_scales = [1.0] * ceil_divide(packed_rank, 16)
 
     current_stream = torch.cuda.current_stream(device=dy.device)
-    repack_stream = torch.cuda.Stream(device=dy.device)
-    dx_stream = torch.cuda.Stream(device=dy.device)
-    up_stream = torch.cuda.Stream(device=dy.device)
-    down_stream = torch.cuda.Stream(device=dy.device)
-    repack_done = torch.cuda.Event()
-    quant_done = torch.cuda.Event()
+    if _ENABLE_OVERLAP_RESOURCE_CACHE:
+        resources = _get_lora_overlap_resources(fp4_backward_op, torch.device(dy.device), current_stream)
+        repack_stream = resources.repack_stream
+        dx_stream = resources.dx_stream
+        up_stream = resources.up_stream
+        down_stream = resources.down_stream
+        repack_done = resources.repack_done
+        quant_done = resources.quant_done
+    else:
+        repack_stream = torch.cuda.Stream(device=dy.device)
+        dx_stream = torch.cuda.Stream(device=dy.device)
+        up_stream = torch.cuda.Stream(device=dy.device)
+        down_stream = torch.cuda.Stream(device=dy.device)
+        repack_done = torch.cuda.Event()
+        quant_done = torch.cuda.Event()
 
     repack_stream.wait_stream(current_stream)
     with torch.cuda.stream(repack_stream):

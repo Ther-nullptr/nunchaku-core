@@ -284,6 +284,7 @@ def run_record(
         activation_checkpoint=args.activation_checkpoint,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=backend,
         lr=args.lr,
         lora_weight_decay=args.lora_weight_decay,
@@ -313,6 +314,10 @@ def run_record(
     all_module_backends_match = all(
         child.fp4_activation_cache_d_lora_down_backend == backend for child in fp4_modules.values()
     )
+    all_module_activation_cache_min_rows_match = all(
+        child.fp4_activation_cache_min_rows == args.fp4_activation_cache_min_rows
+        for child in fp4_modules.values()
+    )
     all_module_backward_weight_policies_match = all(
         child.backward_weight_policy == args.backward_weight_policy for child in fp4_modules.values()
     )
@@ -337,6 +342,7 @@ def run_record(
         "x_grad_finite": x_grad_finite,
         "trainable_grads_finite": grads_finite,
         "module_backends_match": all_module_backends_match,
+        "module_activation_cache_min_rows_match": all_module_activation_cache_min_rows_match,
         "module_backward_weight_policies_match": all_module_backward_weight_policies_match,
         "latency_positive": latency_ms > 0.0,
         "peak_delta_nonnegative": peak_delta >= 0,
@@ -479,6 +485,7 @@ def parse_args() -> argparse.Namespace:
         choices=["fused", "dequant_gemm"],
         default=["fused", "dequant_gemm"],
     )
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--no-frozen-residual", action="store_true")
     p.add_argument("--train-bias", action="store_true")
@@ -577,6 +584,7 @@ def main() -> None:
             "cache_lora_act": not args.no_cache_lora_act,
             "activation_checkpoint": args.activation_checkpoint,
             "backward_weight_policy": args.backward_weight_policy,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "include_reuse_policies": args.include_reuse_policies,
             "warmup": args.warmup,
             "iters": args.iters,

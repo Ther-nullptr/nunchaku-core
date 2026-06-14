@@ -99,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     parser.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     parser.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    parser.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     parser.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     parser.add_argument("--no-zero-lora-up-fast-path", action="store_true")
     parser.add_argument("--outlier-report", type=str, default=None)
@@ -180,6 +181,7 @@ def policy_metadata(args: argparse.Namespace, policy: str) -> dict[str, Any]:
         "outlier_frozen_residual_rank_field": p_args.outlier_frozen_residual_rank_field,
         "outlier_disable_fuse_frozen_residual_dx": p_args.outlier_disable_fuse_frozen_residual_dx,
         "sensitivity_disable_fuse_frozen_residual_dx": p_args.sensitivity_disable_fuse_frozen_residual_dx,
+        "fp4_activation_cache_min_rows": p_args.fp4_activation_cache_min_rows,
     }
 
 
@@ -311,6 +313,7 @@ def main() -> None:
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": not args.no_zero_lora_up_fast_path,
             "sensitivity_report": args.sensitivity_report,

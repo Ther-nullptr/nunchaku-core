@@ -55,6 +55,7 @@ class FP4LoRAConfig:
     overlap_lora_grad: bool = False
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS
     fp4_activation_cache_d_lora_down: bool = False
+    fp4_activation_cache_min_rows: int = 0
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused"
     zero_lora_up_fast_path: bool = True
 
@@ -138,6 +139,7 @@ def fp4_lora_finetune_config(
     backward_weight_policy: FP4BackwardWeightPolicy = "repack",
     reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    fp4_activation_cache_min_rows: int = 0,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
     zero_lora_up_fast_path: bool = True,
 ) -> FP4LoRAConfig:
@@ -170,6 +172,8 @@ def fp4_lora_finetune_config(
         raise ValueError("backward_weight_policy must be one of: repack, cache")
     if overlap_lora_grad_min_rows < 0:
         raise ValueError("overlap_lora_grad_min_rows must be non-negative")
+    if fp4_activation_cache_min_rows < 0:
+        raise ValueError("fp4_activation_cache_min_rows must be non-negative")
     if reuse_fused_dy_up_for_d_lora_down and dtype != lowrank_dtype:
         raise ValueError("reuse_fused_dy_up_for_d_lora_down requires dtype to match lowrank_dtype")
     if reuse_fused_dy_up_for_d_lora_down and mode == "accuracy":
@@ -240,6 +244,7 @@ def fp4_lora_finetune_config(
         overlap_lora_grad=overlap_lora_grad,
         overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_min_rows=int(fp4_activation_cache_min_rows),
         fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
         zero_lora_up_fast_path=bool(zero_lora_up_fast_path),
     )
@@ -606,6 +611,7 @@ def convert_linear_to_fp4_lora(
                         overlap_lora_grad=child_cfg.overlap_lora_grad,
                         overlap_lora_grad_min_rows=child_cfg.overlap_lora_grad_min_rows,
                         fp4_activation_cache_d_lora_down=child_cfg.fp4_activation_cache_d_lora_down,
+                        fp4_activation_cache_min_rows=child_cfg.fp4_activation_cache_min_rows,
                         fp4_activation_cache_d_lora_down_backend=(
                             child_cfg.fp4_activation_cache_d_lora_down_backend
                         ),
@@ -1115,6 +1121,7 @@ def prepare_fp4_lora_finetuning(
     backward_weight_policy: FP4BackwardWeightPolicy = "repack",
     reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    fp4_activation_cache_min_rows: int = 0,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
     zero_lora_up_fast_path: bool = True,
     target_modules: Iterable[str] | None = DEFAULT_FP4_LORA_TARGET_MODULES,
@@ -1174,6 +1181,7 @@ def prepare_fp4_lora_finetuning(
             backward_weight_policy=backward_weight_policy,
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
+            fp4_activation_cache_min_rows=fp4_activation_cache_min_rows,
             fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
             zero_lora_up_fast_path=zero_lora_up_fast_path,
         )

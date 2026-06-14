@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlap-lora-grad", action="store_true")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--fp4-activation-cache-d-lora-down", action="store_true")
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
@@ -114,6 +115,7 @@ def main() -> None:
         overlap_lora_grad=args.overlap_lora_grad,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=args.fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     override_rank = 24 if args.rank != 24 else 16
@@ -352,6 +354,10 @@ def main() -> None:
             == args.fp4_activation_cache_d_lora_down_backend
             for name in expected_replaced
         ),
+        "all_replaced_activation_cache_min_rows_matches": all(
+            fp4_modules[name].fp4_activation_cache_min_rows == args.fp4_activation_cache_min_rows
+            for name in expected_replaced
+        ),
         "config_override_rank_applied": fp4_modules["layers.1.down_proj"].requested_rank == override_rank,
         "config_override_init_applied": fp4_modules["layers.1.down_proj"].init_mode == "zero",
         "base_configs_preserved": all(
@@ -432,6 +438,7 @@ def main() -> None:
             "overlap_lora_grad": args.overlap_lora_grad,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": cfg.zero_lora_up_fast_path,
         },

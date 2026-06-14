@@ -132,6 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     parser.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     parser.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    parser.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     parser.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     parser.add_argument("--no-zero-lora-up-fast-path", action="store_true")
     parser.add_argument("--outlier-report", type=str, default=None)
@@ -641,6 +642,7 @@ def run_fp4_variant(
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=backend,
         zero_lora_up_fast_path=not args.no_zero_lora_up_fast_path,
         target_modules=tuple(selected_names),
@@ -699,6 +701,10 @@ def run_fp4_variant(
         for param in group["params"]
     )
     all_module_backends_match = all(child.fp4_activation_cache_d_lora_down_backend == backend for child in fp4_modules.values())
+    all_module_activation_cache_min_rows_match = all(
+        child.fp4_activation_cache_min_rows == args.fp4_activation_cache_min_rows
+        for child in fp4_modules.values()
+    )
     all_module_backward_weight_policies_match = all(
         child.backward_weight_policy == args.backward_weight_policy for child in fp4_modules.values()
     )
@@ -732,6 +738,9 @@ def run_fp4_variant(
                 "fuse_lora_dx": bool(child.fuse_lora_dx),
                 "fuse_frozen_residual_dx": bool(child.fuse_frozen_residual_dx),
                 "cache_fused_lora_dx": bool(child.cache_fused_lora_dx),
+                "fp4_activation_cache_d_lora_down": bool(child.fp4_activation_cache_d_lora_down),
+                "fp4_activation_cache_min_rows": int(child.fp4_activation_cache_min_rows),
+                "fp4_activation_cache_d_lora_down_backend": child.fp4_activation_cache_d_lora_down_backend,
             }
             for name, child in sorted(fp4_modules.items())
         },
@@ -771,6 +780,7 @@ def run_fp4_variant(
             "final_loss_finite": bool(torch.isfinite(final_loss)),
             "trainable_grads_finite": grads_finite,
             "module_backends_match": all_module_backends_match,
+            "module_activation_cache_min_rows_match": all_module_activation_cache_min_rows_match,
             "module_backward_weight_policies_match": all_module_backward_weight_policies_match,
             "latency_positive": latency_ms > 0.0,
             "peak_delta_nonnegative": peak_delta >= 0,
@@ -869,6 +879,7 @@ def main() -> None:
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": not args.no_zero_lora_up_fast_path,
             "outlier_report": args.outlier_report,

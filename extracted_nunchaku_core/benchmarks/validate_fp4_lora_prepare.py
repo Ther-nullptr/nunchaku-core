@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adam-eps", type=float, default=1e-4)
     p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
@@ -94,6 +95,7 @@ def main() -> None:
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     manual_override = replace(base_cfg, rank=args.override_rank)
@@ -144,6 +146,7 @@ def main() -> None:
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
@@ -165,6 +168,7 @@ def main() -> None:
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
@@ -189,6 +193,7 @@ def main() -> None:
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
@@ -211,6 +216,7 @@ def main() -> None:
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
@@ -233,6 +239,7 @@ def main() -> None:
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         target_modules=("q_proj", "down_proj"),
         exclude_modules=("lm_head",),
@@ -315,6 +322,9 @@ def main() -> None:
             result.config.fp4_activation_cache_d_lora_down_backend
             == args.fp4_activation_cache_d_lora_down_backend
         ),
+        "result_config_activation_cache_min_rows_matches": (
+            result.config.fp4_activation_cache_min_rows == args.fp4_activation_cache_min_rows
+        ),
         "result_config_reuse_flag_matches": (
             result.config.reuse_fused_dy_up_for_d_lora_down
             == args.reuse_fused_dy_up_for_d_lora_down
@@ -325,6 +335,10 @@ def main() -> None:
         "all_replaced_backend_matches": all(
             fp4_modules[name].fp4_activation_cache_d_lora_down_backend
             == args.fp4_activation_cache_d_lora_down_backend
+            for name in expected_replaced
+        ),
+        "all_replaced_activation_cache_min_rows_matches": all(
+            fp4_modules[name].fp4_activation_cache_min_rows == args.fp4_activation_cache_min_rows
             for name in expected_replaced
         ),
         "all_replaced_reuse_flag_matches": all(
@@ -469,6 +483,7 @@ def main() -> None:
             "use_frozen_residual": not args.no_frozen_residual,
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": base_cfg.zero_lora_up_fast_path,
             "zero_fast_path_initial": zero_fast_path_initial,

@@ -81,6 +81,7 @@ def make_module(
         overlap_lora_grad=cfg.overlap_lora_grad,
         overlap_lora_grad_min_rows=cfg.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=cfg.fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_min_rows=cfg.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=cfg.fp4_activation_cache_d_lora_down_backend,
     )
 
@@ -91,6 +92,7 @@ def mode_expectations(
     lowrank_dtype: torch.dtype,
     backend: str,
     backward_weight_policy: str,
+    fp4_activation_cache_min_rows: int,
 ) -> dict[str, Any]:
     fuse_frozen_residual_dx = mode == "throughput" and dtype == lowrank_dtype
     return {
@@ -99,6 +101,7 @@ def mode_expectations(
         "backward_weight_policy": backward_weight_policy,
         "overlap_lora_grad": mode in ("balanced", "throughput") and not fuse_frozen_residual_dx,
         "fp4_activation_cache_d_lora_down": mode == "memory_saving",
+        "fp4_activation_cache_min_rows": fp4_activation_cache_min_rows,
         "fp4_activation_cache_d_lora_down_backend": backend,
         "fuse_lowrank_forward": mode == "throughput",
         "fuse_frozen_residual_dx": fuse_frozen_residual_dx,
@@ -130,6 +133,7 @@ def run_policy(
         train_bias=args.train_bias,
         backward_weight_policy=args.backward_weight_policy,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     module = make_module(cfg, weight=weight, bias=bias).train()
@@ -188,6 +192,7 @@ def run_policy(
         lowrank_dtype,
         args.fp4_activation_cache_d_lora_down_backend,
         args.backward_weight_policy,
+        args.fp4_activation_cache_min_rows,
     )
     actual_flags = {
         "fuse_lora_dx": module.fuse_lora_dx,
@@ -195,6 +200,7 @@ def run_policy(
         "backward_weight_policy": module.backward_weight_policy,
         "overlap_lora_grad": module.overlap_lora_grad,
         "fp4_activation_cache_d_lora_down": module.fp4_activation_cache_d_lora_down,
+        "fp4_activation_cache_min_rows": module.fp4_activation_cache_min_rows,
         "fp4_activation_cache_d_lora_down_backend": module.fp4_activation_cache_d_lora_down_backend,
         "fuse_lowrank_forward": module.fuse_lowrank_forward,
         "fuse_frozen_residual_dx": module.fuse_frozen_residual_dx,
@@ -263,6 +269,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-frozen-residual", action="store_true")
     p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -300,6 +307,7 @@ def main() -> None:
             "train_bias": args.train_bias,
             "backward_weight_policy": args.backward_weight_policy,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "steps": args.steps,
         },

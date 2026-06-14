@@ -119,6 +119,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         overlap_lora_grad: bool,
         overlap_lora_grad_min_rows: int,
         fp4_activation_cache_d_lora_down: bool,
+        fp4_activation_cache_min_rows: int,
         fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend,
         lora_up_zero_fast_path_active: bool,
         packed_lora_dx: tuple[torch.Tensor, torch.Tensor] | None,
@@ -139,7 +140,10 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             and lowrank_dtype == fp4_forward_op.compute_dtype
         )
 
-        use_fp4_act_cache = bool(fp4_activation_cache_d_lora_down)
+        fp4_activation_cache_min_rows = max(0, int(fp4_activation_cache_min_rows))
+        use_fp4_act_cache = bool(
+            fp4_activation_cache_d_lora_down and x2d.shape[0] >= fp4_activation_cache_min_rows
+        )
         lora_up_zero_fast_path_active = bool(lora_up_zero_fast_path_active)
         if lora_up_zero_fast_path_active:
             if use_fp4_act_cache:
@@ -276,6 +280,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         ctx.overlap_lora_grad = bool(overlap_lora_grad)
         ctx.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
         ctx.fp4_activation_cache_d_lora_down = use_fp4_act_cache
+        ctx.fp4_activation_cache_min_rows = fp4_activation_cache_min_rows
         ctx.fp4_activation_cache_d_lora_down_backend = fp4_activation_cache_d_lora_down_backend
         ctx.lora_up_zero_fast_path_active = lora_up_zero_fast_path_active
         ctx.packed_lora_dx = packed_lora_dx
@@ -375,6 +380,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         should_overlap_lora_grad = (
@@ -433,6 +439,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
                 None,
                 None,
                 d_bias,
+                None,
                 None,
                 None,
                 None,
@@ -522,6 +529,7 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
             None,
             None,
             d_bias,
+            None,
             None,
             None,
             None,
@@ -977,8 +985,9 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         LoRA term or the optional fused LoRA dX epilogue. The fused path can
         cache packed LoRA dX weights with version-based invalidation. dA uses
         exact BF16/FP16 matmul by default, or an opt-in FP4 activation-cache
-        approximation when activation memory is the bottleneck. dB uses the
-        saved LoRA activation.
+        approximation when activation memory is the bottleneck. The FP4 cache
+        path can be gated by flattened row count. dB uses the saved LoRA
+        activation.
     """
 
     def __init__(
@@ -1003,6 +1012,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
         fp4_activation_cache_d_lora_down: bool = False,
+        fp4_activation_cache_min_rows: int = 0,
         fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
         zero_lora_up_fast_path: bool = True,
         residual_svd_method: ResidualSVDMethod = "full_svd",
@@ -1070,6 +1080,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("fp4_activation_cache_d_lora_down does not currently support overlap_lora_grad")
         if fp4_activation_cache_d_lora_down and reuse_fused_dy_up_for_d_lora_down:
             raise ValueError("fp4_activation_cache_d_lora_down does not reuse packed dy_up")
+        if fp4_activation_cache_min_rows < 0:
+            raise ValueError("fp4_activation_cache_min_rows must be non-negative")
 
         self.out_features, self.in_features = weight.shape
         self.rank = max(16, ceil_divide(rank, 16) * 16)
@@ -1091,6 +1103,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.overlap_lora_grad = bool(overlap_lora_grad)
         self.overlap_lora_grad_min_rows = int(overlap_lora_grad_min_rows)
         self.fp4_activation_cache_d_lora_down = bool(fp4_activation_cache_d_lora_down)
+        self.fp4_activation_cache_min_rows = int(fp4_activation_cache_min_rows)
         self.fp4_activation_cache_d_lora_down_backend = fp4_activation_cache_d_lora_down_backend
         self.zero_lora_up_fast_path = bool(zero_lora_up_fast_path)
         self.init_mode = init
@@ -1185,6 +1198,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         overlap_lora_grad: bool = False,
         overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
         fp4_activation_cache_d_lora_down: bool = False,
+        fp4_activation_cache_min_rows: int = 0,
         fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
         zero_lora_up_fast_path: bool = True,
         frozen_residual_rank: int = 0,
@@ -1214,6 +1228,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             overlap_lora_grad=overlap_lora_grad,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
             fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+            fp4_activation_cache_min_rows=fp4_activation_cache_min_rows,
             fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
             zero_lora_up_fast_path=zero_lora_up_fast_path,
             residual_svd_method=residual_svd_method,
@@ -1465,6 +1480,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             self.overlap_lora_grad,
             self.overlap_lora_grad_min_rows,
             self.fp4_activation_cache_d_lora_down,
+            self.fp4_activation_cache_min_rows,
             self.fp4_activation_cache_d_lora_down_backend,
             zero_lora_up_fast_path_active,
             packed_lora_dx,
@@ -1504,6 +1520,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             f"overlap_lora_grad={self.overlap_lora_grad}, "
             f"overlap_lora_grad_min_rows={self.overlap_lora_grad_min_rows}, "
             f"fp4_activation_cache_d_lora_down={self.fp4_activation_cache_d_lora_down}, "
+            f"fp4_activation_cache_min_rows={self.fp4_activation_cache_min_rows}, "
             f"fp4_activation_cache_d_lora_down_backend={self.fp4_activation_cache_d_lora_down_backend}, "
             f"zero_lora_up_fast_path={self.zero_lora_up_fast_path}"
         )

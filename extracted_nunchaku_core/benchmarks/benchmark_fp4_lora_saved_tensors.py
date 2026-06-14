@@ -118,6 +118,7 @@ def make_module(
     rank: int,
     lowrank_dtype: torch.dtype,
     fp4_activation_cache_d_lora_down: bool,
+    fp4_activation_cache_min_rows: int = 0,
     fp4_activation_cache_d_lora_down_backend: str = "fused",
 ) -> NunchakuFP4LoRALinear:
     return NunchakuFP4LoRALinear(
@@ -130,6 +131,7 @@ def make_module(
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
         fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_min_rows=fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
     )
 
@@ -173,6 +175,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
@@ -198,6 +201,7 @@ def main() -> None:
         args.rank,
         lowrank_dtype,
         fp4_activation_cache_d_lora_down=True,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     sync_lora(fp4_cache, exact)
@@ -225,6 +229,8 @@ def main() -> None:
             "effective_rank": exact.rank,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
+            "fp4_activation_cache_active_for_forward": bool(args.m >= args.fp4_activation_cache_min_rows),
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "saved_tensors": {

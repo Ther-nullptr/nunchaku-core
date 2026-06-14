@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlap-lora-grad", action="store_true")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--fp4-activation-cache-d-lora-down", action="store_true")
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--disable-zero-lora-up-fast-path", action="store_true")
     p.add_argument("--preserve-zero-fast-path", action="store_true")
@@ -96,6 +97,7 @@ def main() -> None:
         overlap_lora_grad=args.overlap_lora_grad,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=args.fp4_activation_cache_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
         zero_lora_up_fast_path=not args.disable_zero_lora_up_fast_path,
     )
@@ -201,7 +203,10 @@ def main() -> None:
         d_up_ref = torch.matmul(dy_lr.t(), lora_act).mul(op.scaling).to(op.lora_up.dtype)
         d_down_exact_ref = torch.matmul(dy_up.t(), x_lr).mul(op.scaling).to(op.lora_down.dtype)
         d_down_ref = d_down_exact_ref
-        if args.fp4_activation_cache_d_lora_down:
+        fp4_activation_cache_active_for_forward = bool(
+            args.fp4_activation_cache_d_lora_down and args.m >= args.fp4_activation_cache_min_rows
+        )
+        if fp4_activation_cache_active_for_forward:
             x2d_fp4 = x2d
             if op.fp4_forward.k_pad != op.in_features:
                 x2d_fp4 = pad_tensor(x2d_fp4, divisor=op.fp4_forward.k_pad, dim=1)
@@ -227,7 +232,7 @@ def main() -> None:
         "lora_down_grad_vs_manual": tensor_error(op.lora_down.grad, d_down_ref),
         "bias_grad_vs_manual": tensor_error(op.bias.grad, d_bias_ref),
     }
-    if args.fp4_activation_cache_d_lora_down:
+    if fp4_activation_cache_active_for_forward:
         errors["lora_down_grad_fp4_cache_vs_exact_manual"] = tensor_error(d_down_ref, d_down_exact_ref)
     if args.fuse_lowrank_forward and separate_y_ref is not None:
         errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
@@ -294,6 +299,8 @@ def main() -> None:
             "overlap_lora_grad": args.overlap_lora_grad,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
+            "fp4_activation_cache_active_for_forward": fp4_activation_cache_active_for_forward,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": not args.disable_zero_lora_up_fast_path,
             "preserve_zero_fast_path": args.preserve_zero_fast_path,

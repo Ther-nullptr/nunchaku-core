@@ -186,6 +186,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum-steps", type=int, default=4)
     p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    p.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", type=str, default="results")
@@ -306,6 +307,7 @@ def main() -> None:
         cache_fused_lora_dx=True,
         backward_weight_policy=args.backward_weight_policy,
         fp4_activation_cache_d_lora_down=True,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     fp4_cached_fused_dx_cached_pack_reuse_dy_up = None
@@ -562,6 +564,8 @@ def main() -> None:
             "can_reuse_fused_dy_up": can_reuse_fused_dy_up,
             "native_fused_forward_available": dtype == lowrank_dtype,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
+            "fp4_activation_cache_active_for_forward": bool(args.m >= args.fp4_activation_cache_min_rows),
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "activation_cache_bytes": {

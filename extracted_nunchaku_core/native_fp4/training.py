@@ -26,7 +26,7 @@ from .operators import (
     quantize_fp4_act_with_lora_dual,
 )
 
-LoRAInitMode = Literal["zero", "gaussian", "residual_svd"]
+LoRAInitMode = Literal["zero", "gaussian", "residual_svd", "pissa"]
 FrozenResidualInitMode = Literal["none", "residual_svd"]
 ResidualSVDMethod = Literal["full_svd", "svd_lowrank"]
 FP4ActivationCacheDLoRADownBackend = Literal["fused", "dequant_gemm"]
@@ -1032,8 +1032,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("rank must be positive")
         if lowrank_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("lowrank_dtype must be float16 or bfloat16")
-        if init not in ("zero", "gaussian", "residual_svd"):
-            raise ValueError("init must be one of: zero, gaussian, residual_svd")
+        if init not in ("zero", "gaussian", "residual_svd", "pissa"):
+            raise ValueError("init must be one of: zero, gaussian, residual_svd, pissa")
         if frozen_residual_init not in ("none", "residual_svd"):
             raise ValueError("frozen_residual_init must be one of: none, residual_svd")
         if residual_svd_method not in ("full_svd", "svd_lowrank"):
@@ -1112,9 +1112,22 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.residual_svd_lowrank_oversample = int(residual_svd_lowrank_oversample)
         self.residual_svd_lowrank_niter = int(residual_svd_lowrank_niter)
 
-        self.fp4_forward = NunchakuFP4GemmOp(weight=weight, bias=None, dummy_rank=self.rank)
+        pissa_down = None
+        pissa_up = None
+        backbone_weight = weight
+        if init == "pissa":
+            pissa_down, pissa_up = self._svd_factors_for_matrix(
+                weight,
+                self.rank,
+                scale=self.scaling,
+                split_singular_values=True,
+            )
+            pissa_weight = torch.matmul(pissa_up.float(), pissa_down.float()).mul(float(self.scaling))
+            backbone_weight = (weight.float() - pissa_weight).to(weight.dtype).contiguous()
+
+        self.fp4_forward = NunchakuFP4GemmOp(weight=backbone_weight, bias=None, dummy_rank=self.rank)
         self.fp4_backward = NunchakuFP4BackwardDXOp(
-            weight=weight,
+            weight=backbone_weight,
             dummy_rank=self.rank,
             backward_weight_policy=backward_weight_policy,
         )
@@ -1147,7 +1160,7 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         self.register_buffer("frozen_residual_up", None, persistent=True)
         if frozen_residual_init == "residual_svd":
             self.frozen_residual_rank = max(16, ceil_divide(frozen_residual_rank, 16) * 16)
-            down, up = self._residual_svd_factors(weight, self.frozen_residual_rank, scale=1.0)
+            down, up = self._residual_svd_factors(backbone_weight, self.frozen_residual_rank, scale=1.0)
             self.frozen_residual_down = down.to(lowrank_dtype).contiguous()
             self.frozen_residual_up = up.to(lowrank_dtype).contiguous()
 
@@ -1158,7 +1171,16 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
         else:
             self.register_buffer("bias", bias.detach().to(weight.dtype).contiguous(), persistent=True)
 
-        self.reset_lora_parameters(weight)
+        if init == "pissa":
+            assert pissa_down is not None and pissa_up is not None
+            with torch.no_grad():
+                self.lora_down.copy_(pissa_down.to(self.lowrank_dtype))
+                self.lora_up.copy_(pissa_up.to(self.lowrank_dtype))
+                self.clear_lora_up_zero_fast_path()
+                self.clear_fused_lora_forward_cache()
+                self.clear_fused_lora_dx_cache()
+        else:
+            self.reset_lora_parameters(weight)
 
     def _share_forward_backbone_with_backward(self) -> None:
         # Keep one resident FP4 packed backbone. Backward still builds W^T transiently.
@@ -1399,13 +1421,48 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
                 torch.nn.init.normal_(self.lora_down, mean=0.0, std=0.02)
                 torch.nn.init.normal_(self.lora_up, mean=0.0, std=0.02)
                 self.clear_lora_up_zero_fast_path()
-            else:
+            elif self.init_mode == "residual_svd":
                 if weight is None:
                     raise ValueError("weight is required for residual_svd initialization")
                 self._init_from_residual_svd(weight)
                 self.clear_lora_up_zero_fast_path()
+            else:
+                if weight is None:
+                    raise ValueError("weight is required for pissa initialization")
+                self._init_from_pissa(weight)
+                self.clear_lora_up_zero_fast_path()
             self.clear_fused_lora_forward_cache()
             self.clear_fused_lora_dx_cache()
+
+    def _svd_factors_for_matrix(
+        self,
+        matrix: torch.Tensor,
+        rank: int,
+        scale: float,
+        *,
+        split_singular_values: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        matrix_pad = pad_tensor(matrix, divisor=(256, 128), dim=(0, 1)).float()
+        if self.residual_svd_method == "full_svd":
+            u, s, vh = torch.linalg.svd(matrix_pad, full_matrices=False)
+        else:
+            q = min(rank + self.residual_svd_lowrank_oversample, min(matrix_pad.shape))
+            u, s, v = torch.svd_lowrank(matrix_pad, q=q, niter=self.residual_svd_lowrank_niter)
+            vh = v.transpose(0, 1).contiguous()
+        eff_rank = min(rank, s.numel())
+        safe_scale = scale if abs(scale) > 1e-12 else 1.0
+        n_pad = self.fp4_forward.n_pad if hasattr(self, "fp4_forward") else matrix_pad.shape[0]
+        k_pad = self.fp4_forward.k_pad if hasattr(self, "fp4_forward") else matrix_pad.shape[1]
+        up = torch.zeros(n_pad, rank, device=matrix.device, dtype=matrix.dtype)
+        down = torch.zeros(rank, k_pad, device=matrix.device, dtype=matrix.dtype)
+        if split_singular_values:
+            factor = torch.sqrt(s[:eff_rank] / safe_scale)
+            up[:, :eff_rank] = (u[:, :eff_rank] * factor.unsqueeze(0)).to(matrix.dtype)
+            down[:eff_rank, :] = (factor.unsqueeze(1) * vh[:eff_rank, :]).to(matrix.dtype)
+        else:
+            up[:, :eff_rank] = (u[:, :eff_rank] * s[:eff_rank].unsqueeze(0) / safe_scale).to(matrix.dtype)
+            down[:eff_rank, :] = vh[:eff_rank, :].to(matrix.dtype)
+        return down[:, : self.in_features], up[: self.out_features, :]
 
     def _residual_svd_factors(
         self,
@@ -1422,24 +1479,25 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             dtype=weight.dtype,
         )
         residual = (weight_pad - weight_hat).float()
-        if self.residual_svd_method == "full_svd":
-            u, s, vh = torch.linalg.svd(residual, full_matrices=False)
-        else:
-            q = min(rank + self.residual_svd_lowrank_oversample, min(residual.shape))
-            q = max(rank, q)
-            u, s, v = torch.svd_lowrank(residual, q=q, niter=self.residual_svd_lowrank_niter)
-            vh = v.transpose(0, 1).contiguous()
-        eff_rank = min(rank, s.numel())
-        safe_scale = scale if abs(scale) > 1e-12 else 1.0
-
-        up = torch.zeros(self.fp4_forward.n_pad, rank, device=weight.device, dtype=weight.dtype)
-        down = torch.zeros(rank, self.fp4_forward.k_pad, device=weight.device, dtype=weight.dtype)
-        up[:, :eff_rank] = (u[:, :eff_rank] * s[:eff_rank].unsqueeze(0) / safe_scale).to(weight.dtype)
-        down[:eff_rank, :] = vh[:eff_rank, :].to(weight.dtype)
-        return down[:, : self.in_features], up[: self.out_features, :]
+        return self._svd_factors_for_matrix(
+            residual.to(weight.dtype),
+            rank,
+            scale=scale,
+            split_singular_values=False,
+        )
 
     def _init_from_residual_svd(self, weight: torch.Tensor) -> None:
         down, up = self._residual_svd_factors(weight, self.rank, scale=self.scaling)
+        self.lora_up.copy_(up.to(self.lowrank_dtype))
+        self.lora_down.copy_(down.to(self.lowrank_dtype))
+
+    def _init_from_pissa(self, weight: torch.Tensor) -> None:
+        down, up = self._svd_factors_for_matrix(
+            weight,
+            self.rank,
+            scale=self.scaling,
+            split_singular_values=True,
+        )
         self.lora_up.copy_(up.to(self.lowrank_dtype))
         self.lora_down.copy_(down.to(self.lowrank_dtype))
 

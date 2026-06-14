@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frozen-residual-init", choices=["none", "residual_svd"], default="none")
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
-    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd"], default="gaussian")
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="gaussian")
     p.add_argument("--residual-svd-method", choices=["full_svd", "svd_lowrank"], default="full_svd")
     p.add_argument("--residual-svd-lowrank-oversample", type=int, default=8)
     p.add_argument("--residual-svd-lowrank-niter", type=int, default=2)

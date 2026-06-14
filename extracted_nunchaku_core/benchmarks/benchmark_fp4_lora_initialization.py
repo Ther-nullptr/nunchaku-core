@@ -102,7 +102,7 @@ def module_record(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Benchmark FP4 LoRA residual-SVD initialization policies.")
+    p = argparse.ArgumentParser(description="Benchmark FP4 LoRA residual-SVD and PiSSA initialization policies.")
     p.add_argument("--m", type=int, default=1024)
     p.add_argument("--in-features", type=int, default=1024)
     p.add_argument("--out-features", type=int, default=1024)
@@ -162,6 +162,20 @@ def main() -> None:
             cache_fused_lora_dx=True,
         )
 
+    def make_pissa(method: str) -> NunchakuFP4LoRALinear:
+        return NunchakuFP4LoRALinear(
+            weight=weight,
+            bias=bias,
+            rank=args.rank,
+            lowrank_dtype=lowrank_dtype,
+            init="pissa",
+            residual_svd_method=method,
+            residual_svd_lowrank_oversample=args.residual_svd_lowrank_oversample,
+            residual_svd_lowrank_niter=args.residual_svd_lowrank_niter,
+            fuse_lora_dx=True,
+            cache_fused_lora_dx=True,
+        )
+
     def make_frozen_residual(method: str) -> NunchakuFP4LoRALinear:
         return NunchakuFP4LoRALinear(
             weight=weight,
@@ -182,11 +196,14 @@ def main() -> None:
     trainable_residual_full, trainable_residual_full_construct_s = time_construct(
         lambda: make_trainable_residual("full_svd")
     )
+    pissa_full, pissa_full_construct_s = time_construct(lambda: make_pissa("full_svd"))
     frozen_residual_full, frozen_residual_full_construct_s = time_construct(lambda: make_frozen_residual("full_svd"))
     torch.manual_seed(args.seed + 17)
     trainable_residual_lowrank, trainable_residual_lowrank_construct_s = time_construct(
         lambda: make_trainable_residual("svd_lowrank")
     )
+    torch.manual_seed(args.seed + 17)
+    pissa_lowrank, pissa_lowrank_construct_s = time_construct(lambda: make_pissa("svd_lowrank"))
     torch.manual_seed(args.seed + 17)
     frozen_residual_lowrank, frozen_residual_lowrank_construct_s = time_construct(
         lambda: make_frozen_residual("svd_lowrank")
@@ -198,6 +215,7 @@ def main() -> None:
             trainable_residual_full,
             trainable_residual_full_construct_s,
         ),
+        "fp4_pissa_lora_full": (pissa_full, pissa_full_construct_s),
         "fp4_frozen_residual_svd_zero_lora_full": (
             frozen_residual_full,
             frozen_residual_full_construct_s,
@@ -206,6 +224,7 @@ def main() -> None:
             trainable_residual_lowrank,
             trainable_residual_lowrank_construct_s,
         ),
+        "fp4_pissa_lora_lowrank": (pissa_lowrank, pissa_lowrank_construct_s),
         "fp4_frozen_residual_svd_zero_lora_lowrank": (
             frozen_residual_lowrank,
             frozen_residual_lowrank_construct_s,
@@ -229,8 +248,10 @@ def main() -> None:
 
     zero_rel_l2 = records["fp4_zero_lora"]["forward_vs_dense"]["rel_l2"]
     trainable_full_rel_l2 = records["fp4_trainable_residual_svd_lora_full"]["forward_vs_dense"]["rel_l2"]
+    pissa_full_rel_l2 = records["fp4_pissa_lora_full"]["forward_vs_dense"]["rel_l2"]
     frozen_full_rel_l2 = records["fp4_frozen_residual_svd_zero_lora_full"]["forward_vs_dense"]["rel_l2"]
     trainable_lowrank_rel_l2 = records["fp4_trainable_residual_svd_lora_lowrank"]["forward_vs_dense"]["rel_l2"]
+    pissa_lowrank_rel_l2 = records["fp4_pissa_lora_lowrank"]["forward_vs_dense"]["rel_l2"]
     frozen_lowrank_rel_l2 = records["fp4_frozen_residual_svd_zero_lora_lowrank"]["forward_vs_dense"]["rel_l2"]
 
     payload = {
@@ -254,6 +275,14 @@ def main() -> None:
                 outputs["fp4_trainable_residual_svd_lora_full"],
                 outputs["fp4_zero_lora"],
             ),
+            "pissa_full_vs_zero": tensor_error(
+                outputs["fp4_pissa_lora_full"],
+                outputs["fp4_zero_lora"],
+            ),
+            "pissa_lowrank_vs_full": tensor_error(
+                outputs["fp4_pissa_lora_lowrank"],
+                outputs["fp4_pissa_lora_full"],
+            ),
             "frozen_residual_svd_full_zero_vs_trainable_residual_svd_full": tensor_error(
                 outputs["fp4_frozen_residual_svd_zero_lora_full"],
                 outputs["fp4_trainable_residual_svd_lora_full"],
@@ -269,18 +298,23 @@ def main() -> None:
         },
         "derived": {
             "trainable_residual_svd_full_error_reduction_vs_zero": zero_rel_l2 / trainable_full_rel_l2,
+            "pissa_full_error_reduction_vs_zero": zero_rel_l2 / pissa_full_rel_l2,
             "frozen_residual_svd_full_error_reduction_vs_zero": zero_rel_l2 / frozen_full_rel_l2,
             "trainable_residual_svd_lowrank_error_reduction_vs_zero": zero_rel_l2 / trainable_lowrank_rel_l2,
+            "pissa_lowrank_error_reduction_vs_zero": zero_rel_l2 / pissa_lowrank_rel_l2,
             "frozen_residual_svd_lowrank_error_reduction_vs_zero": zero_rel_l2 / frozen_lowrank_rel_l2,
             "frozen_lowrank_construct_speedup_vs_full": (
                 frozen_residual_full_construct_s / frozen_residual_lowrank_construct_s
             ),
-            "recommended_policy": "fp4_frozen_residual_svd_zero_lora_full_or_lowrank_for_large_models",
+            "pissa_lowrank_construct_speedup_vs_full": pissa_full_construct_s / pissa_lowrank_construct_s,
+            "recommended_policy": "fp4_frozen_residual_svd_zero_lora_or_pissa_for_accuracy_experiments",
         },
         "checks": {
             "trainable_residual_svd_full_improves_forward": trainable_full_rel_l2 < zero_rel_l2,
+            "pissa_full_improves_forward": pissa_full_rel_l2 < zero_rel_l2,
             "frozen_residual_svd_full_improves_forward": frozen_full_rel_l2 < zero_rel_l2,
             "trainable_residual_svd_lowrank_improves_forward": trainable_lowrank_rel_l2 < zero_rel_l2,
+            "pissa_lowrank_improves_forward": pissa_lowrank_rel_l2 < zero_rel_l2,
             "frozen_residual_svd_lowrank_improves_forward": frozen_lowrank_rel_l2 < zero_rel_l2,
             "frozen_and_trainable_residual_svd_full_close": (
                 tensor_error(

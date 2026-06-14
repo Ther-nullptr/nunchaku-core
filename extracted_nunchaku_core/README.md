@@ -471,6 +471,7 @@ FP4 activation-cache `dA` 接入训练接口后的 BF16 短测，`fuse_lora_dx=T
 - `fuse_lowrank_forward=True` 是 opt-in forward 消融选项：当 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable task LoRA 和可选 frozen residual forward 一起并入 FP4 主分支；zero-init 首步 fast path 仍会跳过 task LoRA，并把 residual 保留为 dense side branch。验证脚本用 `native_fused_forward` 标记原生路径；BF16 task-only rel_l2 约 `1.5e-4`，BF16 task+frozen-residual rel_l2 约 `2.8e-3`，后者定位为 throughput 近似快路径。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
 - `zero_lora_up_fast_path=True` 是默认开启的 zero-init 首步优化：当 `init="zero"` 且 `lora_up` 的版本仍等于初始化后的零张量版本时，forward 跳过 LoRA out / native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只保留 `dB=dY.T@(x@A.T)`；同时初始 `refresh_fused_lora_forward_caches/refresh_fused_lora_dx_caches` 不生成 packed LoRA cache。`optimizer.step()` 或 adapter load 改变 `lora_up` 后该 fast path 自动失效，post-step hook 再刷新 packed cache。若 `overlap_lora_grad=True` 且行数达到门槛，zero-up backward 会把 FP4 main dX、`dB` 和可选 residual dX 放到多 stream 并行。
+- `init="pissa"` 是 QPiSSA 风格初始化：LoRA 保存 `W0` 的 principal SVD component，FP4 backbone 则量化 `W0 - BA`。它用于精度/收敛实验；若同时打开 fused LoRA dX，需要把 `dX` 视作 throughput 近似路径。
 - `backward_weight_policy="repack"` 是默认策略：每次 backward transient repack 出 `W^T` 的 packed FP4 权重，只预存转置后的 scale，不额外常驻第二份 backbone。`"cache"` 是显式 opt-in：常驻一份 compressed backward qweight，用显存换掉 repack 开销。RTX 5090 4096/rank32 BF16 短测中，cache train step 相对 repack 为 `1.056x`，4-step accumulation 为 `1.050x`；额外 qweight 为 dense BF16 权重的 `25%`、forward qweight 的 `1.0x`。
 - `fp4_activation_cache_d_lora_down=True` 是显存/近似训练模式：forward 保存主分支已有的 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_min_rows=0` 是默认兼容行为，表示启用后所有 row 数都走 FP4 cache；设成如 `4096` 后，flattened row 数低于阈值时自动回落 exact saved-x `dA`，适合让长序列/prefill 省显存、短序列/decode 保持精度和低开销。`fp4_activation_cache_d_lora_down_backend="fused"` 是默认值，直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 backward 临时物化 dense `x_hat`；`"dequant_gemm"` 会先反量化出 dense `x_hat` 再走 torch GEMM，通常更快但有额外 transient 显存。该模式要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - `reuse_fused_dy_up_for_d_lora_down=True` 是 opt-in 实验选项：复用 fused dX quantize kernel 产生的 `dY @ B`，避免额外 dense `dY @ B` matmul。FP16 走 packed decode，有小量 `dA` 误差；BF16 走 dual dense `dy_up` 输出，保持 `dA` 与手写 BF16 matmul 对齐。
@@ -1075,9 +1076,9 @@ python benchmarks/validate_native_fp4_lora_modeling.py \
 - `fuse_lowrank_forward=True` 可用于测试 native forward epilogue 收益；它会改变 task LoRA / frozen residual activation 的生成路径和低秩分支归约顺序，验证脚本按 dtype/path 相关 rel_l2 tolerance 报告该近似。
 - `fuse_frozen_residual_dx=True` 可在 FP16/BF16 下把 task LoRA 和 frozen residual 的 dX 一并打包进 fused epilogue；BF16 的 residual fused dX 相对 dense residual dX 约 `2.7e-3` rel_l2，因此只在 throughput 近似快路径中默认启用。
 
-### 10.5.1 residual_svd 初始化消融
+### 10.5.1 residual_svd/PiSSA 初始化消融
 
-比较 `zero`、trainable `residual_svd`、以及推荐的 frozen `residual_svd + zero task LoRA` 初始化策略：
+比较 `zero`、trainable `residual_svd`、`pissa`、以及推荐的 frozen `residual_svd + zero task LoRA` 初始化策略：
 
 ```bash
 python benchmarks/benchmark_fp4_lora_initialization.py \
@@ -1097,6 +1098,7 @@ python benchmarks/benchmark_fp4_lora_initialization.py \
 - `policies.*.forward_vs_dense`
 - `policies.*.construct_s`
 - `derived.*_error_reduction_vs_zero`
+- `derived.pissa_*_error_reduction_vs_zero`
 - `derived.frozen_lowrank_construct_speedup_vs_full`
 
 RTX 5090 BF16 `2048^2, rank32, weight_std=0.02` 短测：
@@ -1112,8 +1114,9 @@ RTX 5090 BF16 `2048^2, rank32, weight_std=0.02` 短测：
 结论：
 
 - `residual_svd` 初始化能降低初始 FP4 量化误差；随机权重短测中收益约 `2.6%-3.1%` rel_l2，真实 outlier 层需要结合 sensitivity scan 单独评估。
+- `init="pissa"` 采用 QPiSSA 语义：先把 `W0` 的 rank-r principal component 放进 trainable LoRA，再把 FP4 backbone 量化为 `W0 - BA`，避免 `Q4(W0) + BA` 双计 principal component。它适合做初始化/收敛精度实验，构造期会执行 SVD 并重新量化 residual backbone，不是默认 throughput 路径。
 - `svd_lowrank` 保留了大部分误差收益，同时显著降低 frozen residual 构造开销；适合大模型批量替换时先用作默认。
-- trainable `init="residual_svd"` 如果搭配 `fuse_lora_dx=True`，BF16 下较大的 residual factors 会放大 fused LoRA dX 近似误差；需要精确梯度时用 dense LoRA dX，或采用推荐的 `frozen_residual_init="residual_svd" + init="zero"`。
+- trainable `init="residual_svd"` 或 `init="pissa"` 如果搭配 `fuse_lora_dx=True`，BF16 下较大的 low-rank factors 会放大 fused LoRA dX 近似误差；需要精确梯度时用 dense LoRA dX，或采用推荐的 `frozen_residual_init="residual_svd" + init="zero"`。
 
 ### 10.5.2 单层微调收敛验证
 
@@ -1690,7 +1693,7 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
 - `latest_hf_llama_fp4_lora_policy_sweep.json`
   - 真实 HF/LLaMA + WikiText-2 上 base、task-rank bump、frozen-residual bump、residual-only 和 keep-dense outlier 策略的同 batch 对比
 - `latest_fp4_lora_initialization.json`
-  - FP4 LoRA `zero`、trainable `residual_svd`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
+  - FP4 LoRA `zero`、trainable `residual_svd`、`pissa`、frozen `residual_svd` 初始化策略和 `full_svd/svd_lowrank` 后端消融
 - `latest_fp4_lora_finetune_convergence.json`
   - frozen FP4 backbone + frozen residual_svd + zero-init task LoRA 的单层微调 loss 收敛验证
 - `latest_fp4_lora_activation_grad_outliers.json`

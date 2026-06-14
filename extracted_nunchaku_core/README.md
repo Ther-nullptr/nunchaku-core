@@ -376,7 +376,8 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
   --lowrank-dtype bf16 \
   --warmup 5 \
   --iters 10 \
-  --grad-accum-steps 4
+  --grad-accum-steps 4 \
+  --backward-weight-policy repack
 ```
 
 结果会写到：
@@ -397,6 +398,7 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
 - `latency_ms.fp4_cached_fused_dx_cached_pack_fp4_act_cache_d_lora_down_grad_accum_per_micro_step`
 - `latency_ms.fp4_cached_fused_dx_cached_pack_reuse_dy_up_grad_accum_per_micro_step`
 - `activation_cache_bytes.fp4_cache_reduction_vs_saved_x`
+- `backward_weight_cache_bytes.cached_backward_qweight_vs_dense_weight`
 - `speedups.fp4_cached_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_train_step_vs_dense`
 - `speedups.fp4_cached_fused_dx_cached_pack_train_step_vs_dense`
@@ -413,6 +415,8 @@ python benchmarks/benchmark_native_fp4_lora_training.py \
 - `speedups.fused_dx_cached_pack_reuse_overlap_vs_reuse_train_step`
 - `speedups.fused_dx_cached_pack_plus_refresh_vs_dynamic_pack_train_step`
 - `speedups.fused_dx_cached_pack_vs_dynamic_pack_grad_accum`
+
+`--backward-weight-policy cache` 会在所有 FP4 LoRA 变体里常驻一份 compressed backward qweight，用于量化去掉 transient repack 后的训练 step 上限；默认 `repack` 不额外常驻第二份 backbone。
 
 当前 RTX 5090 短测结果，形状 `M=N=K=4096, rank=32, warmup=5, iters=10`：
 

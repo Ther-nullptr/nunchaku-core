@@ -155,6 +155,22 @@ def dtype_bytes(dtype: torch.dtype) -> int:
     raise ValueError(f"Unsupported dtype for byte estimate: {dtype}")
 
 
+def refresh_backward_weight_caches(modules: list[torch.nn.Module]) -> int:
+    count = 0
+    for module in modules:
+        if isinstance(module, NunchakuFP4LoRALinear) and module.backward_weight_policy == "cache":
+            module.refresh_backward_weight_cache()
+            count += 1
+    return count
+
+
+def cached_backward_qweight_bytes(module: NunchakuFP4LoRALinear) -> int:
+    cached = module.fp4_backward._cached_qweight_bwd
+    if cached is None:
+        return 0
+    return int(cached.numel() * cached.element_size())
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--m", type=int, default=4096)
@@ -168,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--grad-accum-steps", type=int, default=4)
+    p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--seed", type=int, default=0)
@@ -199,6 +216,7 @@ def main() -> None:
         init="gaussian",
         train_bias=args.train_bias,
         cache_lora_act=True,
+        backward_weight_policy=args.backward_weight_policy,
     )
     fp4_recompute = NunchakuFP4LoRALinear(
         weight=weight,
@@ -209,6 +227,7 @@ def main() -> None:
         init="gaussian",
         train_bias=args.train_bias,
         cache_lora_act=False,
+        backward_weight_policy=args.backward_weight_policy,
     )
     fp4_cached_fused_dx = NunchakuFP4LoRALinear(
         weight=weight,
@@ -220,6 +239,7 @@ def main() -> None:
         train_bias=args.train_bias,
         cache_lora_act=True,
         fuse_lora_dx=True,
+        backward_weight_policy=args.backward_weight_policy,
     )
     fp4_recompute_fused_dx = NunchakuFP4LoRALinear(
         weight=weight,
@@ -231,6 +251,7 @@ def main() -> None:
         train_bias=args.train_bias,
         cache_lora_act=False,
         fuse_lora_dx=True,
+        backward_weight_policy=args.backward_weight_policy,
     )
     fp4_cached_fused_dx_cached_pack = NunchakuFP4LoRALinear(
         weight=weight,
@@ -243,6 +264,7 @@ def main() -> None:
         cache_lora_act=True,
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
+        backward_weight_policy=args.backward_weight_policy,
     )
     fp4_cached_fused_dx_cached_pack_overlap_exact = NunchakuFP4LoRALinear(
         weight=weight,
@@ -255,6 +277,7 @@ def main() -> None:
         cache_lora_act=True,
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
+        backward_weight_policy=args.backward_weight_policy,
         overlap_lora_grad=True,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
     )
@@ -269,6 +292,7 @@ def main() -> None:
         cache_lora_act=True,
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
+        backward_weight_policy=args.backward_weight_policy,
         fp4_activation_cache_d_lora_down=True,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
@@ -286,6 +310,7 @@ def main() -> None:
             cache_lora_act=True,
             fuse_lora_dx=True,
             cache_fused_lora_dx=True,
+            backward_weight_policy=args.backward_weight_policy,
             reuse_fused_dy_up_for_d_lora_down=True,
         )
         fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap = NunchakuFP4LoRALinear(
@@ -299,6 +324,7 @@ def main() -> None:
             cache_lora_act=True,
             fuse_lora_dx=True,
             cache_fused_lora_dx=True,
+            backward_weight_policy=args.backward_weight_policy,
             reuse_fused_dy_up_for_d_lora_down=True,
             overlap_lora_grad=True,
             overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
@@ -311,6 +337,19 @@ def main() -> None:
         lowrank_dtype=lowrank_dtype,
         train_bias=args.train_bias,
     )
+    fp4_modules = [
+        fp4_cached,
+        fp4_recompute,
+        fp4_cached_fused_dx,
+        fp4_recompute_fused_dx,
+        fp4_cached_fused_dx_cached_pack,
+        fp4_cached_fused_dx_cached_pack_overlap_exact,
+        fp4_cached_fused_dx_cached_pack_fp4_act_cache_d_lora_down,
+    ]
+    if fp4_cached_fused_dx_cached_pack_reuse_dy_up is not None:
+        fp4_modules.append(fp4_cached_fused_dx_cached_pack_reuse_dy_up)
+    if fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap is not None:
+        fp4_modules.append(fp4_cached_fused_dx_cached_pack_reuse_dy_up_overlap)
 
     with torch.no_grad():
         modules_to_sync = [
@@ -332,6 +371,7 @@ def main() -> None:
         if args.train_bias:
             for module in modules_to_sync:
                 module.bias.copy_(fp4_cached.bias)
+    refreshed_backward_weight_count = refresh_backward_weight_caches(fp4_modules)
 
     with torch.no_grad():
         y_cached = fp4_cached(x)
@@ -469,6 +509,8 @@ def main() -> None:
     saved_x_bytes = args.m * args.in_features * dtype_bytes(dtype)
     fp4_activation_cache_bytes = m_pad * k_pad // 2 + m_pad * k_pad // 16
     lora_act_bytes = args.m * fp4_cached.rank * dtype_bytes(lowrank_dtype)
+    cached_backward_qweight_bytes_per_module = cached_backward_qweight_bytes(fp4_cached_fused_dx_cached_pack)
+    dense_weight_bytes = args.out_features * args.in_features * dtype_bytes(dtype)
 
     payload = {
         "shape": {
@@ -482,6 +524,8 @@ def main() -> None:
             "lowrank_dtype": args.lowrank_dtype,
             "train_bias": args.train_bias,
             "grad_accum_steps": args.grad_accum_steps,
+            "backward_weight_policy": args.backward_weight_policy,
+            "refreshed_backward_weight_count": refreshed_backward_weight_count,
             "can_reuse_fused_dy_up": can_reuse_fused_dy_up,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
@@ -491,6 +535,13 @@ def main() -> None:
             "fp4_qact_plus_fp8_ascales": fp4_activation_cache_bytes,
             "saved_lora_act": lora_act_bytes,
             "fp4_cache_reduction_vs_saved_x": saved_x_bytes / fp4_activation_cache_bytes,
+        },
+        "backward_weight_cache_bytes": {
+            "per_module_cached_backward_qweight": cached_backward_qweight_bytes_per_module,
+            "per_module_dense_weight": dense_weight_bytes,
+            "cached_backward_qweight_vs_dense_weight": (
+                cached_backward_qweight_bytes_per_module / dense_weight_bytes
+            ),
         },
         "latency_ms": {
             "dense_forward_inference": dense_forward_inference_ms,

@@ -276,7 +276,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   --lowrank-dtype bf16 \
   --warmup 5 \
   --iters 10 \
-  --grad-accum-steps 4
+  --grad-accum-steps 4 \
+  --backward-weight-policy repack
 ```
 
 RTX 5090 短测，`M=N=K=4096, rank=32`：
@@ -298,7 +299,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 - P0/P1 接口已经能在典型 4096 线性层上给出约 `1.9x-2.2x` 的训练 step 加速。
 - `fuse_lora_dx=True`：将 `dX_lora = (dY @ B) @ A` 的第二段放进 FP4 dX epilogue。
 - `cache_fused_lora_dx=True`：只缓存 LoRA packed A/B，额外内存约 `rank * (in + out)`，不缓存第二份 FP4 backbone；参数 version 变化时自动刷新。
-- `backward_weight_policy="repack"`：默认每次 backward transient repack `W^T` 的 packed FP4 权重，只预存转置后的 scale，不常驻第二份 backbone。`"cache"` 是 memory-budget opt-in，常驻一份 compressed backward qweight；RTX 5090 4096/rank32 BF16 短测中 train step `1.056x`、4-step accumulation `1.050x` vs repack，额外 cache 为 dense BF16 weight 的 `25%`。
+- `backward_weight_policy="repack"`：默认每次 backward transient repack `W^T` 的 packed FP4 权重，只预存转置后的 scale，不常驻第二份 backbone。`benchmark_native_fp4_lora_training.py --backward-weight-policy cache` 会把该策略接入所有训练变体并报告 `backward_weight_cache_bytes`；`"cache"` 是 memory-budget opt-in，常驻一份 compressed backward qweight。RTX 5090 4096/rank32 BF16 短测中 train step `1.056x`、4-step accumulation `1.050x` vs repack，额外 cache 为 dense BF16 weight 的 `25%`。
 - `fp4_activation_cache_d_lora_down=True`：forward 保存主分支已有 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_d_lora_down_backend="fused"` 直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 dense `x_hat`；`"dequant_gemm"` 先反量化出 dense `x_hat` 再用 torch GEMM，当前更快但 transient 显存更高。这是显存/近似训练模式，要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
 - BF16 单步下 cached-pack fused dX 相比 dynamic-pack fused dX 快 `1.026x`；每步刷新 cache 后仍快 `1.010x`。FP16 单步下 cached-pack 约 `1.012x`，每步刷新后基本持平。
 - Gradient accumulation 会摊薄 cache refresh 开销；accumulation benchmark 对测量顺序更敏感，默认策略仍应以真实训练循环为准。

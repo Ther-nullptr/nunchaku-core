@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--mode", choices=["accuracy", "balanced", "throughput", "memory_saving"], default="balanced")
+    p.add_argument("--no-frozen-residual", action="store_true")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--adam-eps", type=float, default=1e-4)
     p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
@@ -90,6 +91,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
@@ -131,6 +133,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
@@ -167,6 +170,8 @@ def main() -> None:
     hook = result.register_cache_refresh_hook(optimizer)
     optimizer.step()
     hook_refresh_count = hook.last_refresh_count
+    hook_forward_refresh_count = hook.last_fused_lora_forward_refresh_count
+    hook_dx_refresh_count = hook.last_fused_lora_dx_refresh_count
     hook_backward_weight_cache_count = hook.last_backward_weight_cache_count
     hook.remove()
 
@@ -181,6 +186,15 @@ def main() -> None:
     )
     expected_cache_count = (
         len(expected_replaced) if base_cfg.fuse_lora_dx and base_cfg.cache_fused_lora_dx else 0
+    )
+    expected_forward_cache_count = sum(
+        1
+        for name in expected_replaced
+        if (
+            fp4_modules[name].fuse_lowrank_forward
+            and not fp4_modules[name].has_frozen_residual
+            and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
+        )
     )
     expected_backward_weight_count = len(expected_replaced) if base_cfg.backward_weight_policy == "cache" else 0
     expected_cache_summary = result.cache_summary
@@ -242,13 +256,14 @@ def main() -> None:
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
         "optimizer_param_groups_have_lr": groups_have_lr,
         "trainable_param_count_matches": result.trainable_param_count == trainable_param_count,
+        "forward_refresh_count_matches": result.refreshed_forward_cache_count == expected_forward_cache_count,
         "refresh_count_matches": result.refreshed_cache_count == expected_cache_count,
         "backward_weight_refresh_count_matches": (
             result.refreshed_backward_weight_count == expected_backward_weight_count
         ),
         "cache_summary_module_count_matches": expected_cache_summary.module_count == len(expected_replaced),
-        "cache_summary_fused_lora_forward_count_initially_zero": (
-            expected_cache_summary.fused_lora_forward_cache_count == 0
+        "cache_summary_fused_lora_forward_count_matches": (
+            expected_cache_summary.fused_lora_forward_cache_count == expected_forward_cache_count
         ),
         "cache_summary_fused_lora_dx_count_matches": (
             expected_cache_summary.fused_lora_dx_cache_count == expected_cache_count
@@ -268,7 +283,9 @@ def main() -> None:
             == (args.backward_weight_policy == "cache")
             for name in expected_replaced
         ),
-        "cache_hook_refresh_count_matches": hook_refresh_count == expected_cache_count,
+        "cache_hook_forward_refresh_count_matches": hook_forward_refresh_count == expected_forward_cache_count,
+        "cache_hook_dx_refresh_count_matches": hook_dx_refresh_count == expected_cache_count,
+        "cache_hook_refresh_count_matches": hook_refresh_count == expected_forward_cache_count + expected_cache_count,
         "cache_hook_backward_weight_cache_count_matches": (
             hook_backward_weight_cache_count == expected_backward_weight_count
         ),
@@ -292,6 +309,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "mode": args.mode,
+            "use_frozen_residual": not args.no_frozen_residual,
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
@@ -299,6 +317,7 @@ def main() -> None:
         "replaced": result.replaced_modules,
         "trainable": result.trainable_names,
         "trainable_param_count": result.trainable_param_count,
+        "refreshed_forward_cache_count": result.refreshed_forward_cache_count,
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_summary": {
@@ -324,6 +343,8 @@ def main() -> None:
             "total_cache_vs_dense_weight": result.cache_summary.total_cache_vs_dense_weight,
         },
         "hook_refresh_count": hook_refresh_count,
+        "hook_forward_refresh_count": hook_forward_refresh_count,
+        "hook_dx_refresh_count": hook_dx_refresh_count,
         "hook_backward_weight_cache_count": hook_backward_weight_cache_count,
         "exclude_modules": result.exclude_modules,
         "checks": checks,

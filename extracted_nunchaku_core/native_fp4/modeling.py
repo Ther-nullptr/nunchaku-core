@@ -87,6 +87,7 @@ class FP4LoRAPrepareResult:
     replaced_modules: list[str]
     trainable_names: list[str]
     trainable_param_count: int
+    refreshed_forward_cache_count: int
     optimizer_param_groups: list[dict[str, Any]]
     refreshed_cache_count: int
     refreshed_backward_weight_count: int
@@ -596,6 +597,24 @@ def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
     )
 
 
+def refresh_fused_lora_forward_caches(module: torch.nn.Module) -> int:
+    count = 0
+    for _, child in iter_fp4_lora_modules(module):
+        if child.fuse_lowrank_forward:
+            child.refresh_fused_lora_forward_cache()
+            if child._cached_lora_down_fwd_packed is not None and child._cached_lora_up_fwd_packed is not None:
+                count += 1
+    return count
+
+
+def clear_fused_lora_forward_caches(module: torch.nn.Module) -> int:
+    count = 0
+    for _, child in iter_fp4_lora_modules(module):
+        child.clear_fused_lora_forward_cache()
+        count += 1
+    return count
+
+
 def refresh_fused_lora_dx_caches(module: torch.nn.Module) -> int:
     count = 0
     for _, child in iter_fp4_lora_modules(module):
@@ -684,14 +703,16 @@ class FP4LoRACacheRefreshHook:
     def __init__(self, optimizer: torch.optim.Optimizer, module: torch.nn.Module):
         self.module = module
         self.last_refresh_count = 0
+        self.last_fused_lora_forward_refresh_count = 0
         self.last_fused_lora_dx_refresh_count = 0
         self.last_backward_weight_cache_count = 0
         self.handle = optimizer.register_step_post_hook(self._hook)
 
     def _hook(self, optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         del optimizer, args, kwargs
+        self.last_fused_lora_forward_refresh_count = refresh_fused_lora_forward_caches(self.module)
         self.last_fused_lora_dx_refresh_count = refresh_fused_lora_dx_caches(self.module)
-        self.last_refresh_count = self.last_fused_lora_dx_refresh_count
+        self.last_refresh_count = self.last_fused_lora_forward_refresh_count + self.last_fused_lora_dx_refresh_count
         self.last_backward_weight_cache_count = sum(
             1
             for _, child in iter_fp4_lora_modules(self.module)
@@ -706,7 +727,7 @@ def register_fp4_lora_cache_refresh_hook(
     optimizer: torch.optim.Optimizer,
     module: torch.nn.Module,
 ) -> FP4LoRACacheRefreshHook:
-    """Refresh packed LoRA dX caches after every optimizer step.
+    """Refresh packed LoRA forward/dX caches after every optimizer step.
 
     The wrapped modules also have lazy version-based invalidation, so this hook
     is an eager refresh convenience for stable training-step latency. Static
@@ -855,6 +876,7 @@ def load_fp4_lora_state_dict(
             loaded += 1
 
     if loaded:
+        clear_fused_lora_forward_caches(module)
         clear_fused_lora_dx_caches(module)
     return missing, unexpected
 
@@ -937,6 +959,7 @@ def load_fp4_lora_peft_state_dict(
                     loaded += 1
 
     if loaded:
+        clear_fused_lora_forward_caches(module)
         clear_fused_lora_dx_caches(module)
     return missing, unexpected
 
@@ -1089,6 +1112,7 @@ def prepare_fp4_lora_finetuning(
         inplace=inplace,
     )
     trainable_names = freeze_non_fp4_lora_parameters(prepared_model, train_bias=train_bias)
+    refreshed_forward = refresh_fused_lora_forward_caches(prepared_model) if refresh_caches else 0
     refreshed = refresh_fused_lora_dx_caches(prepared_model) if refresh_caches else 0
     refreshed_backward_weight = refresh_fp4_backward_weight_caches(prepared_model) if refresh_caches else 0
     cache_summary = fp4_lora_cache_summary(prepared_model)
@@ -1107,6 +1131,7 @@ def prepare_fp4_lora_finetuning(
         replaced_modules=replaced,
         trainable_names=trainable_names,
         trainable_param_count=trainable_param_count,
+        refreshed_forward_cache_count=refreshed_forward,
         optimizer_param_groups=param_groups,
         refreshed_cache_count=refreshed,
         refreshed_backward_weight_count=refreshed_backward_weight,

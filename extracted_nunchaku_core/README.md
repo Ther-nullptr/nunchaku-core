@@ -703,6 +703,7 @@ from native_fp4 import (
     load_fp4_lora_state_dict,
     prepare_fp4_lora_finetuning,
     register_fp4_lora_cache_refresh_hook,
+    refresh_fused_lora_forward_caches,
     refresh_fused_lora_dx_caches,
 )
 
@@ -847,11 +848,11 @@ RTX 5090 验证结果：
 
 - 按 `target_modules/exclude_modules/config_overrides/outlier_report/sensitivity_report` 替换模型 Linear。
 - 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
-- 按需刷新 fused dX cache。
+- 按需刷新 native fused forward cache 和 fused dX cache。
 - opt-in `backward_weight_policy="cache"` 时预热 compressed backward qweight；默认 `repack` 不额外常驻第二份 backbone。
-- 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；forward cache 是 lazy resident，prepare 后通常为 0，第一次 native fused forward 后再统计会出现。
+- 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；task-only native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
-- 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache；`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
+- 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA forward/dX cache；`hook.last_fused_lora_forward_refresh_count` 和 `hook.last_fused_lora_dx_refresh_count` 分别记录两类动态 cache，`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
 
 验证 prepare 接口：
 
@@ -970,7 +971,7 @@ RTX 5090 BF16 默认短测，`m=256, in=512, out=768, rank=32, target_rank=8, st
 - `lora_down/lora_up` 均发生更新，梯度和 loss 全部 finite。
 - `frozen_residual_down/up` 保持不变，确认 residual branch 是 frozen buffer。
 - 只有 LoRA A/B 可训练；打开 `--train-bias` 时才额外训练 bias。
-- 默认 fused dX cache 的 optimizer post-step refresh hook 会运行。
+- 默认动态 packed cache 的 optimizer post-step refresh hook 会运行。
 
 ## 10.6 FP4 LoRA activation / grad outlier 诊断
 
@@ -1300,19 +1301,23 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
 - `native_fp4.fp4_lora_parameter_groups`
   - 生成只含 LoRA adapter 的 optimizer 参数组
 - `native_fp4.register_fp4_lora_cache_refresh_hook`
-  - 在 `optimizer.step()` 后 eager refresh fused dX packed LoRA cache
+  - 在 `optimizer.step()` 后 eager refresh native fused forward 和 fused dX packed LoRA cache
 - `native_fp4.fp4_lora_state_dict`
   - 导出 LoRA-only adapter checkpoint，不包含 FP4 backbone buffers
 - `native_fp4.load_fp4_lora_state_dict`
-  - strict 加载 LoRA-only adapter checkpoint，并清空 packed LoRA cache
+  - strict 加载 LoRA-only adapter checkpoint，并清空 packed LoRA forward/dX cache
 - `native_fp4.fp4_lora_peft_state_dict`
   - 导出 PEFT 风格 `lora_A/lora_B` adapter checkpoint，默认保留 padded effective rank 以保证无损
 - `native_fp4.load_fp4_lora_peft_state_dict`
   - 加载 PEFT 风格 adapter checkpoint，支持 requested-rank 输入并清零 padded tail
+- `native_fp4.refresh_fused_lora_forward_caches`
+  - optimizer step 后显式刷新 native fused forward packed LoRA cache
+- `native_fp4.clear_fused_lora_forward_caches`
+  - 清空模型内所有 native fused forward packed LoRA cache
 - `native_fp4.refresh_fused_lora_dx_caches`
   - optimizer step 后显式刷新 fused dX packed LoRA cache
 - `native_fp4.clear_fused_lora_dx_caches`
-  - 清空模型内所有 FP4 LoRA cache
+  - 清空模型内所有 fused dX packed LoRA cache
 
 ## 13. 结果文件说明
 

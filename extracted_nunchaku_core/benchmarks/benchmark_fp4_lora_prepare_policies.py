@@ -290,7 +290,11 @@ def run_record(
         bias_weight_decay=args.bias_weight_decay,
     )
     optimizer = torch.optim.AdamW(result.optimizer_param_groups, lr=args.lr, eps=args.adam_eps)
-    hook = result.register_cache_refresh_hook(optimizer) if result.config.cache_fused_lora_dx else None
+    hook = (
+        result.register_cache_refresh_hook(optimizer)
+        if result.config.fuse_lowrank_forward or result.config.cache_fused_lora_dx
+        else None
+    )
     x, target = make_inputs(args, dtype)
 
     with torch.no_grad():
@@ -319,6 +323,8 @@ def run_record(
     )
     x_grad_finite = bool(x.grad is not None and torch.isfinite(x.grad).all())
     cache_hook_count = None if hook is None else hook.last_refresh_count
+    cache_hook_forward_count = None if hook is None else hook.last_fused_lora_forward_refresh_count
+    cache_hook_dx_count = None if hook is None else hook.last_fused_lora_dx_refresh_count
     if hook is not None:
         hook.remove()
 
@@ -344,10 +350,13 @@ def run_record(
         "config": jsonable_config(result.config),
         "replaced_count": len(result.replaced_modules),
         "trainable_param_count": result.trainable_param_count,
+        "refreshed_forward_cache_count": result.refreshed_forward_cache_count,
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_summary": asdict(result.cache_summary),
         "cache_hook_refresh_count": cache_hook_count,
+        "cache_hook_forward_refresh_count": cache_hook_forward_count,
+        "cache_hook_dx_refresh_count": cache_hook_dx_count,
         "latency_ms": {
             "train_step_with_optimizer": latency_ms,
         },

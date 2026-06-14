@@ -74,6 +74,8 @@ forward: y = x @ Q4(W0).T + x @ R_down.T @ R_up.T + scaling * x @ A.T @ B.T
 - `native_fp4.modeling.register_fp4_lora_cache_refresh_hook`
 - `native_fp4.modeling.fp4_lora_state_dict`
 - `native_fp4.modeling.load_fp4_lora_state_dict`
+- `native_fp4.modeling.refresh_fused_lora_forward_caches`
+- `native_fp4.modeling.clear_fused_lora_forward_caches`
 - `native_fp4.modeling.refresh_fused_lora_dx_caches`
 - `native_fp4.modeling.clear_fused_lora_dx_caches`
 - `benchmarks/validate_native_fp4_lora_training.py`
@@ -159,7 +161,7 @@ model = prepared.model
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则；`memory_saving + fp4_activation_cache_d_lora_down_backend="dequant_gemm"` 也通过。验证脚本也覆盖 `backward_weight_policy="cache"`，确认 compressed backward qweight cache 预热后仍常驻。
 
-`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；forward cache 是 lazy resident，prepare 后通常为 0，第一次 native fused forward 后再统计会出现；optimizer hook 只刷新会随 LoRA 参数变化的 packed dX cache，并用 `last_backward_weight_cache_count` 报告静态 qweight cache 是否仍常驻，默认 `repack` 仍不常驻第二份 FP4 backbone。
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；task-only native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、初始 forward 误差和相对 dense LoRA speedup 消融。
 
@@ -191,7 +193,7 @@ checkpoint 边界：
 - `trim_to_requested_rank=True` 会裁到用户请求的 rank；加载时 padded tail 清零，适合需要原始 rank 的外部生态，但会丢弃 tail rank。
 - 不导出 `qweight/wscales/wscales_bwd_*` 等 frozen FP4 backbone buffers。
 - 不导出 `frozen_residual_down/frozen_residual_up`；它们属于 quantized base model 的 frozen compensation branch，不属于 task adapter。
-- `load_fp4_lora_state_dict` 和 `load_fp4_lora_peft_state_dict` 加载后都会清空 packed LoRA dX cache，避免 adapter 参数与 cache 不一致。
+- `load_fp4_lora_state_dict` 和 `load_fp4_lora_peft_state_dict` 加载后都会清空 packed LoRA forward/dX cache，避免 adapter 参数与 cache 不一致。
 
 Optimizer 示例：
 
@@ -334,7 +336,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | FP4 initial + teacher low-rank delta | 1.0753e-2 | 2.9362e-6 | 2.7307e-4 | 3.5572e-3 | 1.6525e-2 | pass |
 
-这个实验对应 personal-vault 中的“单层微调 loss 收敛曲线”待办。默认 `target_base=fp4_initial`，目标是初始 `FP4 + frozen residual` 输出加 teacher low-rank delta，避免把高秩量化误差混进 task LoRA 的低秩拟合目标。验证通过项包括 loss 显著下降、LoRA A/B 参数发生更新、梯度 finite、frozen residual buffer 不变、只有预期参数可训练，以及 fused dX cache 的 optimizer post-step refresh hook 已运行。
+这个实验对应 personal-vault 中的“单层微调 loss 收敛曲线”待办。默认 `target_base=fp4_initial`，目标是初始 `FP4 + frozen residual` 输出加 teacher low-rank delta，避免把高秩量化误差混进 task LoRA 的低秩拟合目标。验证通过项包括 loss 显著下降、LoRA A/B 参数发生更新、梯度 finite、frozen residual buffer 不变、只有预期参数可训练，以及动态 packed cache 的 optimizer post-step refresh hook 已运行。
 
 ## 后续优化路线
 

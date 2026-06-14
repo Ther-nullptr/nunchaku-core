@@ -16,6 +16,7 @@ from native_fp4 import (  # noqa: E402
     FP4LoRAConfig,
     NunchakuFP4LoRALinear,
     clear_fused_lora_dx_caches,
+    clear_fused_lora_forward_caches,
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_parameter_groups,
@@ -28,6 +29,7 @@ from native_fp4 import (  # noqa: E402
     load_fp4_lora_state_dict,
     register_fp4_lora_cache_refresh_hook,
     refresh_fused_lora_dx_caches,
+    refresh_fused_lora_forward_caches,
 )
 
 
@@ -141,8 +143,11 @@ def main() -> None:
         config_overrides=config_overrides,
     )
     trainable = freeze_non_fp4_lora_parameters(model)
+    refreshed_forward = refresh_fused_lora_forward_caches(model)
     refreshed = refresh_fused_lora_dx_caches(model)
+    cleared_forward = clear_fused_lora_forward_caches(model)
     cleared = clear_fused_lora_dx_caches(model)
+    refreshed_forward_after_clear = refresh_fused_lora_forward_caches(model)
     refreshed_after_clear = refresh_fused_lora_dx_caches(model)
 
     x = torch.randn(args.batch, args.hidden, device="cuda", dtype=dtype, requires_grad=True)
@@ -173,20 +178,41 @@ def main() -> None:
     }
     expected_adapter_keys = {f"{name}.{param}" for name in expected_replaced for param in ("lora_down", "lora_up")}
     expected_cache_count = len(replaced) if args.fuse_lora_dx and args.cache_fused_lora_dx else 0
+    expected_forward_cache_count = sum(
+        1
+        for name in expected_replaced
+        if (
+            fp4_modules[name].fuse_lowrank_forward
+            and not fp4_modules[name].has_frozen_residual
+            and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
+        )
+    )
 
     named_lora_params = dict(iter_fp4_lora_named_parameters(model))
     param_groups = fp4_lora_parameter_groups(model, lora_weight_decay=0.0)
     optimizer = torch.optim.AdamW(param_groups, lr=1e-3, eps=1e-4)
     optimizer_hook = register_fp4_lora_cache_refresh_hook(optimizer, model)
+    pre_step_forward_refreshed = refresh_fused_lora_forward_caches(model)
     pre_step_refreshed = refresh_fused_lora_dx_caches(model)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     hook_refresh_count = optimizer_hook.last_refresh_count
+    hook_forward_refresh_count = optimizer_hook.last_fused_lora_forward_refresh_count
+    hook_dx_refresh_count = optimizer_hook.last_fused_lora_dx_refresh_count
     optimizer_hook.remove()
     optimizer_param_ids = {id(param) for group in param_groups for param in group["params"]}
     expected_param_ids = {id(param) for param in named_lora_params.values()}
     optimizer_hook_caches_current = all(
-        child._cached_lora_down_version == child.lora_down._version
+        (
+            not child.fuse_lowrank_forward
+            or child.has_frozen_residual
+            or child.lowrank_dtype != child.fp4_forward.compute_dtype
+            or (
+                child._cached_lora_down_fwd_version == child.lora_down._version
+                and child._cached_lora_up_fwd_version == child.lora_up._version
+            )
+        )
+        and child._cached_lora_down_version == child.lora_down._version
         and child._cached_lora_up_version == child.lora_up._version
         and child._cached_lora_scaling == float(child.scaling)
         for _, child in iter_fp4_lora_modules(model)
@@ -203,13 +229,17 @@ def main() -> None:
         exclude_modules=("lm_head",),
         config_overrides=config_overrides,
     )
+    pre_load_forward_refreshed = refresh_fused_lora_forward_caches(model2)
     pre_load_refreshed = refresh_fused_lora_dx_caches(model2)
     missing, unexpected = load_fp4_lora_state_dict(model2, adapter_state, strict=True)
     loaded_state = fp4_lora_state_dict(model2)
     loaded_matches = all(torch.equal(adapter_state[key], loaded_state[key]) for key in expected_adapter_keys)
     fp4_modules2 = dict(iter_fp4_lora_modules(model2))
     caches_cleared_after_load = all(
-        child._cached_lora_down_bwd_packed is None and child._cached_lora_up_bwd_packed is None
+        child._cached_lora_down_fwd_packed is None
+        and child._cached_lora_up_fwd_packed is None
+        and child._cached_lora_down_bwd_packed is None
+        and child._cached_lora_up_bwd_packed is None
         for _, child in iter_fp4_lora_modules(model2)
     )
     strict_mismatch_raises = False
@@ -325,16 +355,22 @@ def main() -> None:
         "trainable_grads_present": set(trainable).issubset(grad_named),
         "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
         "output_finite": bool(torch.isfinite(y).all()),
+        "forward_cache_count_matches": refreshed_forward == expected_forward_cache_count,
         "cache_count_matches": refreshed == expected_cache_count,
+        "forward_clear_count_matches": cleared_forward == len(replaced),
         "clear_count_matches": cleared == len(replaced),
+        "forward_refresh_after_clear_matches": refreshed_forward_after_clear == expected_forward_cache_count,
         "refresh_after_clear_matches": refreshed_after_clear == expected_cache_count,
         "frozen_residual_count_matches": len(frozen_residual_modules) == expected_frozen_residual_count,
         "frozen_residual_not_parameter": frozen_residual_params == set(),
         "frozen_residual_buffers_finite": frozen_residual_buffers_finite,
         "lora_named_parameters_match_trainable": set(named_lora_params) == set(trainable),
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
+        "optimizer_pre_step_forward_refresh_count_matches": pre_step_forward_refreshed == expected_forward_cache_count,
         "optimizer_pre_step_refresh_count_matches": pre_step_refreshed == expected_cache_count,
-        "optimizer_hook_refresh_count_matches": hook_refresh_count == expected_cache_count,
+        "optimizer_hook_forward_refresh_count_matches": hook_forward_refresh_count == expected_forward_cache_count,
+        "optimizer_hook_dx_refresh_count_matches": hook_dx_refresh_count == expected_cache_count,
+        "optimizer_hook_refresh_count_matches": hook_refresh_count == expected_forward_cache_count + expected_cache_count,
         "optimizer_hook_caches_current": optimizer_hook_caches_current,
         "adapter_state_finite": adapter_state_finite,
         "adapter_state_keys_match": set(adapter_state) == expected_adapter_keys,
@@ -399,11 +435,18 @@ def main() -> None:
         "grad_named": sorted(grad_named),
         "frozen_residual_modules": sorted(frozen_residual_modules),
         "cache_counts": {
+            "forward_refreshed": refreshed_forward,
             "refreshed": refreshed,
+            "forward_cleared": cleared_forward,
             "cleared": cleared,
+            "forward_refreshed_after_clear": refreshed_forward_after_clear,
             "refreshed_after_clear": refreshed_after_clear,
+            "pre_load_forward_refreshed": pre_load_forward_refreshed,
             "pre_load_refreshed": pre_load_refreshed,
+            "pre_step_forward_refreshed": pre_step_forward_refreshed,
             "pre_step_refreshed": pre_step_refreshed,
+            "optimizer_hook_forward_refreshed": hook_forward_refresh_count,
+            "optimizer_hook_dx_refreshed": hook_dx_refresh_count,
             "optimizer_hook_refreshed": hook_refresh_count,
         },
         "adapter_state_keys": sorted(adapter_state),

@@ -766,6 +766,7 @@ cfg = fp4_lora_finetune_config(
 ```bash
 python benchmarks/validate_fp4_lora_training_policies.py
 python benchmarks/validate_fp4_lora_training_policies.py --dtype fp16 --lowrank-dtype fp16 --modes throughput --steps 2
+python benchmarks/validate_fp4_lora_training_policies.py --modes balanced memory_saving --backward-weight-policy cache --steps 2
 ```
 
 模型级性能/显存消融使用高层 `prepare_fp4_lora_finetuning` 入口，而不是手写替换：
@@ -817,7 +818,7 @@ RTX 5090 验证结果：
 - 按需刷新 fused dX cache。
 - opt-in `backward_weight_policy="cache"` 时预热 compressed backward qweight；默认 `repack` 不额外常驻第二份 backbone。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
-- 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache。
+- 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA cache；`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
 
 验证 prepare 接口：
 

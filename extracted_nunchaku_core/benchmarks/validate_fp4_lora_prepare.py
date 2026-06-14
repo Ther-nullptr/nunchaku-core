@@ -167,6 +167,7 @@ def main() -> None:
     hook = result.register_cache_refresh_hook(optimizer)
     optimizer.step()
     hook_refresh_count = hook.last_refresh_count
+    hook_backward_weight_cache_count = hook.last_backward_weight_cache_count
     hook.remove()
 
     adapter_state = fp4_lora_state_dict(prepared)
@@ -250,6 +251,9 @@ def main() -> None:
             for name in expected_replaced
         ),
         "cache_hook_refresh_count_matches": hook_refresh_count == expected_cache_count,
+        "cache_hook_backward_weight_cache_count_matches": (
+            hook_backward_weight_cache_count == expected_backward_weight_count
+        ),
         "cache_hook_caches_current": caches_current,
         "forward_output_finite": bool(torch.isfinite(y).all()),
         "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
@@ -280,6 +284,7 @@ def main() -> None:
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "hook_refresh_count": hook_refresh_count,
+        "hook_backward_weight_cache_count": hook_backward_weight_cache_count,
         "exclude_modules": result.exclude_modules,
         "checks": checks,
         "all_passed": bool(all(checks.values())),

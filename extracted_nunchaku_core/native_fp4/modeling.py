@@ -582,11 +582,19 @@ class FP4LoRACacheRefreshHook:
     def __init__(self, optimizer: torch.optim.Optimizer, module: torch.nn.Module):
         self.module = module
         self.last_refresh_count = 0
+        self.last_fused_lora_dx_refresh_count = 0
+        self.last_backward_weight_cache_count = 0
         self.handle = optimizer.register_step_post_hook(self._hook)
 
     def _hook(self, optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         del optimizer, args, kwargs
-        self.last_refresh_count = refresh_fused_lora_dx_caches(self.module)
+        self.last_fused_lora_dx_refresh_count = refresh_fused_lora_dx_caches(self.module)
+        self.last_refresh_count = self.last_fused_lora_dx_refresh_count
+        self.last_backward_weight_cache_count = sum(
+            1
+            for _, child in iter_fp4_lora_modules(self.module)
+            if child.backward_weight_policy == "cache" and child.fp4_backward._cached_qweight_bwd is not None
+        )
 
     def remove(self) -> None:
         self.handle.remove()
@@ -599,7 +607,9 @@ def register_fp4_lora_cache_refresh_hook(
     """Refresh packed LoRA dX caches after every optimizer step.
 
     The wrapped modules also have lazy version-based invalidation, so this hook
-    is an eager refresh convenience for stable training-step latency.
+    is an eager refresh convenience for stable training-step latency. Static
+    backward qweight caches are not rebuilt here; the hook only reports whether
+    they remain resident after the step.
     """
 
     return FP4LoRACacheRefreshHook(optimizer, module)

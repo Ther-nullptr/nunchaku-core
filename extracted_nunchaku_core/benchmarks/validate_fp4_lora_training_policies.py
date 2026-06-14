@@ -76,6 +76,7 @@ def make_module(
         fuse_lora_dx=cfg.fuse_lora_dx,
         fuse_frozen_residual_dx=cfg.fuse_frozen_residual_dx,
         cache_fused_lora_dx=cfg.cache_fused_lora_dx,
+        backward_weight_policy=cfg.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=cfg.reuse_fused_dy_up_for_d_lora_down,
         overlap_lora_grad=cfg.overlap_lora_grad,
         overlap_lora_grad_min_rows=cfg.overlap_lora_grad_min_rows,
@@ -84,11 +85,18 @@ def make_module(
     )
 
 
-def mode_expectations(mode: str, dtype: torch.dtype, lowrank_dtype: torch.dtype, backend: str) -> dict[str, Any]:
+def mode_expectations(
+    mode: str,
+    dtype: torch.dtype,
+    lowrank_dtype: torch.dtype,
+    backend: str,
+    backward_weight_policy: str,
+) -> dict[str, Any]:
     fuse_frozen_residual_dx = mode == "throughput" and dtype == torch.float16 and lowrank_dtype == torch.float16
     return {
         "fuse_lora_dx": mode != "accuracy",
         "cache_fused_lora_dx": mode != "accuracy",
+        "backward_weight_policy": backward_weight_policy,
         "overlap_lora_grad": mode in ("balanced", "throughput") and not fuse_frozen_residual_dx,
         "fp4_activation_cache_d_lora_down": mode == "memory_saving",
         "fp4_activation_cache_d_lora_down_backend": backend,
@@ -120,12 +128,15 @@ def run_policy(
         use_frozen_residual=not args.no_frozen_residual,
         frozen_residual_rank=None if args.frozen_residual_rank is None else args.frozen_residual_rank,
         train_bias=args.train_bias,
+        backward_weight_policy=args.backward_weight_policy,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
     module = make_module(cfg, weight=weight, bias=bias).train()
     if cfg.cache_fused_lora_dx:
         module.refresh_fused_lora_dx_cache()
+    if cfg.backward_weight_policy == "cache":
+        module.refresh_backward_weight_cache()
 
     frozen_down_before = (
         module.frozen_residual_down.detach().clone() if module.has_frozen_residual else torch.empty(0, device="cuda")
@@ -171,10 +182,17 @@ def run_policy(
     expected_trainable = {"lora_down", "lora_up"}
     if cfg.train_bias:
         expected_trainable.add("bias")
-    expected_flags = mode_expectations(mode, dtype, lowrank_dtype, args.fp4_activation_cache_d_lora_down_backend)
+    expected_flags = mode_expectations(
+        mode,
+        dtype,
+        lowrank_dtype,
+        args.fp4_activation_cache_d_lora_down_backend,
+        args.backward_weight_policy,
+    )
     actual_flags = {
         "fuse_lora_dx": module.fuse_lora_dx,
         "cache_fused_lora_dx": module.cache_fused_lora_dx,
+        "backward_weight_policy": module.backward_weight_policy,
         "overlap_lora_grad": module.overlap_lora_grad,
         "fp4_activation_cache_d_lora_down": module.fp4_activation_cache_d_lora_down,
         "fp4_activation_cache_d_lora_down_backend": module.fp4_activation_cache_d_lora_down_backend,
@@ -197,6 +215,10 @@ def run_policy(
         "frozen_residual_unchanged": frozen_unchanged,
         "only_expected_params_trainable": set(trainable_names) == expected_trainable,
         "cache_hook_ran_if_needed": hook is None or hook.last_refresh_count > 0,
+        "backward_weight_cache_state_matches": (
+            (module.fp4_backward._cached_qweight_bwd is not None)
+            == (args.backward_weight_policy == "cache")
+        ),
     }
     if hook is not None:
         hook.remove()
@@ -239,6 +261,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adam-eps", type=float, default=1e-4)
     p.add_argument("--train-bias", action="store_true")
     p.add_argument("--no-frozen-residual", action="store_true")
+    p.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     p.add_argument("--results-dir", type=str, default="results")
@@ -275,6 +298,7 @@ def main() -> None:
             "modes": args.modes,
             "no_frozen_residual": args.no_frozen_residual,
             "train_bias": args.train_bias,
+            "backward_weight_policy": args.backward_weight_policy,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "steps": args.steps,

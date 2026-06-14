@@ -144,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outlier-no-task-rank-bump", action="store_true")
     parser.add_argument("--outlier-bump-frozen-residual", action="store_true")
     parser.add_argument("--outlier-frozen-residual-rank-field", type=str, default=None)
+    parser.add_argument("--outlier-disable-fuse-frozen-residual-dx", action="store_true")
     parser.add_argument("--sensitivity-report", type=str, default=None)
     parser.add_argument("--sensitivity-ratio-field", type=str, default="perplexity_ratio_vs_fp16")
     parser.add_argument("--sensitivity-rank-bump-ratio", type=float, default=1.05)
@@ -152,6 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensitivity-rank-multiple", type=int, default=16)
     parser.add_argument("--sensitivity-min-rank", type=int, default=None)
     parser.add_argument("--sensitivity-max-rank", type=int, default=None)
+    parser.add_argument("--sensitivity-disable-fuse-frozen-residual-dx", action="store_true")
     parser.add_argument("--attn-implementation", type=str, default=None)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=0)
@@ -653,6 +655,7 @@ def run_fp4_variant(
         outlier_bump_task_rank=not args.outlier_no_task_rank_bump,
         outlier_bump_frozen_residual=args.outlier_bump_frozen_residual,
         outlier_frozen_residual_rank_field=args.outlier_frozen_residual_rank_field,
+        outlier_disable_fuse_frozen_residual_dx=args.outlier_disable_fuse_frozen_residual_dx,
         sensitivity_report=args.sensitivity_report,
         sensitivity_ratio_field=args.sensitivity_ratio_field,
         sensitivity_rank_bump_ratio=args.sensitivity_rank_bump_ratio,
@@ -661,6 +664,7 @@ def run_fp4_variant(
         sensitivity_rank_multiple=args.sensitivity_rank_multiple,
         sensitivity_min_rank=args.sensitivity_min_rank,
         sensitivity_max_rank=args.sensitivity_max_rank,
+        sensitivity_disable_fuse_frozen_residual_dx=args.sensitivity_disable_fuse_frozen_residual_dx,
         lr=args.lr,
         lora_weight_decay=args.lora_weight_decay,
         bias_weight_decay=args.bias_weight_decay,
@@ -726,6 +730,7 @@ def run_fp4_variant(
                 "has_frozen_residual": bool(child.has_frozen_residual),
                 "fuse_lowrank_forward": bool(child.fuse_lowrank_forward),
                 "fuse_lora_dx": bool(child.fuse_lora_dx),
+                "fuse_frozen_residual_dx": bool(child.fuse_frozen_residual_dx),
                 "cache_fused_lora_dx": bool(child.cache_fused_lora_dx),
             }
             for name, child in sorted(fp4_modules.items())
@@ -876,6 +881,7 @@ def main() -> None:
             "outlier_bump_task_rank": not args.outlier_no_task_rank_bump,
             "outlier_bump_frozen_residual": args.outlier_bump_frozen_residual,
             "outlier_frozen_residual_rank_field": args.outlier_frozen_residual_rank_field,
+            "outlier_disable_fuse_frozen_residual_dx": args.outlier_disable_fuse_frozen_residual_dx,
             "sensitivity_report": args.sensitivity_report,
             "sensitivity_ratio_field": args.sensitivity_ratio_field,
             "sensitivity_rank_bump_ratio": args.sensitivity_rank_bump_ratio,
@@ -884,6 +890,7 @@ def main() -> None:
             "sensitivity_rank_multiple": args.sensitivity_rank_multiple,
             "sensitivity_min_rank": args.sensitivity_min_rank,
             "sensitivity_max_rank": args.sensitivity_max_rank,
+            "sensitivity_disable_fuse_frozen_residual_dx": args.sensitivity_disable_fuse_frozen_residual_dx,
         },
         "records": {},
         "all_passed": False,

@@ -1130,6 +1130,7 @@ def prepare_fp4_lora_finetuning(
     outlier_bump_task_rank: bool = True,
     outlier_bump_frozen_residual: bool = False,
     outlier_frozen_residual_rank_field: str | None = None,
+    outlier_disable_fuse_frozen_residual_dx: bool = False,
     sensitivity_report: Mapping[str, Any] | str | None = None,
     sensitivity_ratio_field: str = "perplexity_ratio_vs_fp16",
     sensitivity_rank_bump_ratio: float | None = 1.05,
@@ -1138,6 +1139,7 @@ def prepare_fp4_lora_finetuning(
     sensitivity_rank_multiple: int = 16,
     sensitivity_min_rank: int | None = None,
     sensitivity_max_rank: int | None = None,
+    sensitivity_disable_fuse_frozen_residual_dx: bool = False,
     inplace: bool = True,
     refresh_caches: bool = True,
     lora_weight_decay: float = 0.0,
@@ -1202,7 +1204,7 @@ def prepare_fp4_lora_finetuning(
             min_rank=outlier_min_rank,
             max_rank=outlier_max_rank,
             force_init="zero",
-            disable_fuse_frozen_residual_dx=True,
+            disable_fuse_frozen_residual_dx=outlier_disable_fuse_frozen_residual_dx,
             exclude_keep_dense=outlier_exclude_keep_dense,
             keep_dense_candidates_key=outlier_keep_dense_candidates_key,
             bump_task_rank=outlier_bump_task_rank,
@@ -1227,7 +1229,7 @@ def prepare_fp4_lora_finetuning(
             min_rank=sensitivity_min_rank,
             max_rank=sensitivity_max_rank,
             force_init="zero",
-            disable_fuse_frozen_residual_dx=True,
+            disable_fuse_frozen_residual_dx=sensitivity_disable_fuse_frozen_residual_dx,
         )
         for key, value in sensitivity_policy.config_overrides.items():
             merged_overrides.setdefault(key, value)

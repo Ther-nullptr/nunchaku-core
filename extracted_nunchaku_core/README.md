@@ -800,7 +800,8 @@ auto_overrides = fp4_lora_config_overrides_from_outlier_report(
     "results/latest_fp4_lora_activation_grad_outliers.json",
     cfg,
     force_init="zero",
-    disable_fuse_frozen_residual_dx=True,
+    # 可选：敏感层如果要强制回到 dense residual dX，再设为 True。
+    disable_fuse_frozen_residual_dx=False,
 )
 sensitive_overrides.update(auto_overrides)
 
@@ -1160,7 +1161,7 @@ config_overrides = fp4_lora_config_overrides_from_outlier_report(
     "results/latest_fp4_lora_activation_grad_outliers.json",
     cfg,
     force_init="zero",
-    disable_fuse_frozen_residual_dx=True,
+    disable_fuse_frozen_residual_dx=False,
 )
 ```
 
@@ -1197,6 +1198,8 @@ python benchmarks/analyze_hf_llama_activation_grad_outliers.py \
 - `summary.keep_dense_candidates`
 
 这个 JSON 的 `summary.rank_bump_candidates` 与 `prepare_fp4_lora_finetuning(..., outlier_report=...)` 兼容，可直接驱动 per-module rank bump：
+
+注意：`prepare_fp4_lora_finetuning(..., outlier_report=...)` 和 `sensitivity_report` 默认继承 base config 的 `fuse_frozen_residual_dx`。因此 `mode="throughput"`、BF16/BF16、且启用 frozen residual 时，自动 rank/residual bump 模块也会继续走 fused residual dX。若要做精度优先消融或回到旧行为，可传 `outlier_disable_fuse_frozen_residual_dx=True` / `sensitivity_disable_fuse_frozen_residual_dx=True`，HF benchmark 对应 CLI 是 `--outlier-disable-fuse-frozen-residual-dx` / `--sensitivity-disable-fuse-frozen-residual-dx`。
 
 ```bash
 python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \

@@ -108,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outlier-max-rank", type=int, default=None)
     parser.add_argument("--outlier-keep-dense-candidates-key", type=str, default="keep_dense_candidates")
     parser.add_argument("--outlier-frozen-residual-rank-field", type=str, default=None)
+    parser.add_argument("--outlier-disable-fuse-frozen-residual-dx", action="store_true")
     parser.add_argument("--sensitivity-report", type=str, default=None)
     parser.add_argument("--sensitivity-ratio-field", type=str, default="perplexity_ratio_vs_fp16")
     parser.add_argument("--sensitivity-rank-bump-ratio", type=float, default=1.05)
@@ -116,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensitivity-rank-multiple", type=int, default=16)
     parser.add_argument("--sensitivity-min-rank", type=int, default=None)
     parser.add_argument("--sensitivity-max-rank", type=int, default=None)
+    parser.add_argument("--sensitivity-disable-fuse-frozen-residual-dx", action="store_true")
     parser.add_argument("--attn-implementation", type=str, default=None)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=0)
@@ -176,6 +178,8 @@ def policy_metadata(args: argparse.Namespace, policy: str) -> dict[str, Any]:
         "outlier_min_rank": p_args.outlier_min_rank,
         "outlier_max_rank": p_args.outlier_max_rank,
         "outlier_frozen_residual_rank_field": p_args.outlier_frozen_residual_rank_field,
+        "outlier_disable_fuse_frozen_residual_dx": p_args.outlier_disable_fuse_frozen_residual_dx,
+        "sensitivity_disable_fuse_frozen_residual_dx": p_args.sensitivity_disable_fuse_frozen_residual_dx,
     }
 
 
@@ -317,6 +321,7 @@ def main() -> None:
             "sensitivity_rank_multiple": args.sensitivity_rank_multiple,
             "sensitivity_min_rank": args.sensitivity_min_rank,
             "sensitivity_max_rank": args.sensitivity_max_rank,
+            "sensitivity_disable_fuse_frozen_residual_dx": args.sensitivity_disable_fuse_frozen_residual_dx,
         },
         "records": {},
         "all_passed": False,

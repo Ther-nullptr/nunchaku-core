@@ -254,6 +254,7 @@ def main() -> None:
         args.rank,
         ((int(math.ceil(args.rank * 2.0)) + 15) // 16) * 16,
     )
+    expected_auto_fuse_frozen_residual_dx = base_cfg.fuse_frozen_residual_dx
 
     x = torch.randn(args.batch, args.hidden, device="cuda", dtype=dtype, requires_grad=True)
     y = prepared(x)
@@ -342,6 +343,9 @@ def main() -> None:
         "sensitivity_rank_bump_applied": (
             fp4_modules["layers.0.q_proj"].requested_rank == expected_sensitivity_rank
         ),
+        "sensitivity_rank_bump_preserves_fused_residual_dx": (
+            fp4_modules["layers.0.q_proj"].fuse_frozen_residual_dx == expected_auto_fuse_frozen_residual_dx
+        ),
         "manual_override_wins_over_outlier_report": (
             fp4_modules["layers.1.down_proj"].requested_rank == args.override_rank
         ),
@@ -384,6 +388,10 @@ def main() -> None:
             outlier_residual_modules["layers.1.down_proj"].frozen_residual_init == "residual_svd"
             and outlier_residual_modules["layers.1.down_proj"].has_frozen_residual
         ),
+        "outlier_bump_frozen_residual_preserves_fused_residual_dx": (
+            outlier_residual_modules["layers.1.down_proj"].fuse_frozen_residual_dx
+            == expected_auto_fuse_frozen_residual_dx
+        ),
         "outlier_bump_frozen_residual_does_not_change_non_candidate_rank": (
             outlier_residual_modules["layers.0.q_proj"].requested_frozen_residual_rank
             == base_cfg.frozen_residual_rank
@@ -395,6 +403,10 @@ def main() -> None:
             outlier_residual_only_modules["layers.1.down_proj"].requested_frozen_residual_rank
             == expected_outlier_residual_rank
             and outlier_residual_only_modules["layers.1.down_proj"].has_frozen_residual
+        ),
+        "outlier_residual_only_preserves_fused_residual_dx": (
+            outlier_residual_only_modules["layers.1.down_proj"].fuse_frozen_residual_dx
+            == expected_auto_fuse_frozen_residual_dx
         ),
         "trainable_names_match_lora_params": set(result.trainable_names) == set(named_lora_params),
         "all_non_lora_frozen": all_non_lora_frozen,
@@ -460,6 +472,7 @@ def main() -> None:
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": base_cfg.zero_lora_up_fast_path,
             "zero_fast_path_initial": zero_fast_path_initial,
+            "base_fuse_frozen_residual_dx": base_cfg.fuse_frozen_residual_dx,
         },
         "replaced": result.replaced_modules,
         "outlier_keep_dense_replaced": outlier_exclude_result.replaced_modules,

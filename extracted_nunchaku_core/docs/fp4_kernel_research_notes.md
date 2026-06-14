@@ -171,3 +171,33 @@ Correctness gates:
 - 若继续追求性能，需要把 `dA` 改写成更接近 tensor-core GEMM 的形式，例如分块 dequant 到 shared/register 后做 rank tile MMA，或者显式分离 `qact` dequant staging 与 rank GEMM reduction。
 - 对 rank512 以外的更高 LoRA rank 仍需继续做 tile sweep；当前 rank > 512 保持旧 `kVec=2,rVec=16`，避免无证据推广。
 - `dA` 精度瓶颈来自 FP4 activation cache 本身，kernel tile 只能优化速度，不能消除约 `1e-1` 的 exact saved-x `dA` 误差。
+
+## dY 读取融合 follow-up
+
+为评估 `dX/dA/dB` 整体融合的上限，`benchmark_native_fp4_lora_training_breakdown.py` 新增了 overlap 子图计时、correctness 和 `dy_read_model`：
+
+- `cached_pack_sequential_exact`：FP4 `dX` quantize/fused `dy_up`、exact `dB=dY.T@lora_act`、exact `dy_up=dY@B` 三条 consumer，按 3 次读 `dY` 建模。
+- `reuse_fused_dy_up`：复用 fused `dX` 路径产出的 `dy_up`，exact `dB` 仍需读 `dY`，按 2 次读 `dY` 建模。
+- `hypothetical_single_dy_read_fusion`：理想大融合 kernel，在一次读 `dY` 时同时喂给 FP4 `dX`、`dB` 和 `dy_up/dA`。
+
+RTX 5090 BF16，`m=in=out=4096, rank=32, warmup=5, iters=10`：
+
+| item | value |
+| --- | ---: |
+| `dy_bytes` | 33.55 MB |
+| exact current estimated `dY` reads | 100.66 MB |
+| reuse estimated `dY` reads | 67.11 MB |
+| hypothetical fused read | 33.55 MB |
+| `fused_dx_cached_pack` | 0.2158 ms |
+| `fused_backward_overlap_exact` | 0.2595 ms |
+| `fused_backward_overlap_reuse` | 0.2908 ms |
+| `dense_lora_grad_pair_with_dy_up` | 0.0853 ms |
+| exact overlap `dX` rel_l2 vs cached dX | 1.88e-6 |
+| exact overlap `dA/dB` rel_l2 vs sequential | 0 |
+| reuse overlap `dA` rel_l2 vs sequential | 5.75e-4 |
+
+解释：
+
+- 当前 exact overlap 主要通过和 FP4 repack/dX 重叠获得端到端收益；低秩梯度子图单独 overlap 并不一定更快。
+- reuse 路径确实把 `dY` consumer 从 3 次降到 2 次，但它复用的是 quantize/fused low-rank 输出，`dA` 会变成近似梯度。
+- 真正的一次读 `dY` 大融合 kernel 仍有理论空间：相对 exact current 可把 `dY` 读流量降到约 `1/3`，相对 reuse 降到约 `1/2`。但这个 kernel 必须同时处理 FP4 quantize/GEMM 输入、`dB` 规约和 `dy_up/dA` 链，不能只用多 stream overlap 替代。

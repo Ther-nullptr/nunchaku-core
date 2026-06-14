@@ -13,7 +13,11 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from native_fp4 import NunchakuFP4LoRALinear  # noqa: E402
-from native_fp4.training import _fused_lora_dx  # noqa: E402
+from native_fp4.training import (  # noqa: E402
+    _fused_lora_backward_overlap_exact,
+    _fused_lora_backward_overlap_reuse,
+    _fused_lora_dx,
+)
 
 
 def time_cuda(fn, warmup: int, iters: int) -> float:
@@ -31,6 +35,20 @@ def time_cuda(fn, warmup: int, iters: int) -> float:
         torch.cuda.synchronize()
         values.append(start.elapsed_time(end))
     return float(sum(values) / len(values))
+
+
+def dtype_bytes(dtype: torch.dtype) -> int:
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2
+    if dtype == torch.float32:
+        return 4
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+    diff = (a.float() - b.float()).norm()
+    denom = b.float().norm().clamp_min(1e-12)
+    return float((diff / denom).item())
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +102,7 @@ def main() -> None:
     up_lr = op.lora_up.detach().to(lowrank_dtype)
     lora_act = torch.matmul(x_lr, down_lr.t()).contiguous()
     dy_up = torch.matmul(dy_lr, up_lr).contiguous()
+    can_reuse_fused_dy_up = dtype == lowrank_dtype
     op.refresh_fused_lora_dx_cache()
     if args.backward_weight_policy == "cache":
         op.refresh_backward_weight_cache()
@@ -135,6 +154,38 @@ def main() -> None:
             packed_lora_dx=packed_lora_dx,
         )
 
+    def fused_backward_overlap_exact_fn() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _fused_lora_backward_overlap_exact(
+            dy=dy,
+            x2d=x2d,
+            lora_act=lora_act,
+            lora_down=op.lora_down,
+            lora_up=op.lora_up,
+            fp4_backward_op=op.fp4_backward,
+            scaling=op.scaling,
+            lowrank_dtype=op.lowrank_dtype,
+            in_features=op.in_features,
+            out_features=op.out_features,
+            packed_lora_dx=packed_lora_dx,
+        )
+
+    def fused_backward_overlap_reuse_fn() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not can_reuse_fused_dy_up:
+            return None
+        return _fused_lora_backward_overlap_reuse(
+            dy=dy,
+            x2d=x2d,
+            lora_act=lora_act,
+            lora_down=op.lora_down,
+            lora_up=op.lora_up,
+            fp4_backward_op=op.fp4_backward,
+            scaling=op.scaling,
+            lowrank_dtype=op.lowrank_dtype,
+            in_features=op.in_features,
+            out_features=op.out_features,
+            packed_lora_dx=packed_lora_dx,
+        )
+
     def dy_up_fn() -> torch.Tensor:
         return torch.matmul(dy_lr, up_lr)
 
@@ -150,6 +201,12 @@ def main() -> None:
     def dense_lora_grad_pair_fn() -> tuple[torch.Tensor, torch.Tensor]:
         return d_lora_up_fn(), d_lora_down_fn()
 
+    def dense_lora_grad_pair_with_dy_up_fn() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dy_up_local = torch.matmul(dy_lr, up_lr)
+        d_lora_up = torch.matmul(dy_lr.t(), lora_act).mul(op.scaling)
+        d_lora_down = torch.matmul(dy_up_local.t(), x_lr).mul(op.scaling)
+        return dy_up_local, d_lora_down, d_lora_up
+
     def full_backward_cached_pack_fn() -> None:
         op.zero_grad(set_to_none=True)
         x.grad = None
@@ -157,9 +214,23 @@ def main() -> None:
         loss = (y.float() * dy.float()).sum()
         loss.backward()
 
+    dx_cached = fused_dx_cached_pack_fn()
+    dx_overlap, down_overlap, up_overlap = fused_backward_overlap_exact_fn()
+    overlap_reuse_result = fused_backward_overlap_reuse_fn()
+    if overlap_reuse_result is None:
+        dx_overlap_reuse, down_overlap_reuse, up_overlap_reuse = None, None, None
+    else:
+        dx_overlap_reuse, down_overlap_reuse, up_overlap_reuse = overlap_reuse_result
+    _, down_sequential, up_sequential = dense_lora_grad_pair_with_dy_up_fn()
+    torch.cuda.synchronize()
+
     refresh_backward_qweight_cache_ms = None
     if args.backward_weight_policy == "cache":
         refresh_backward_qweight_cache_ms = time_cuda(refresh_backward_qweight_cache_fn, args.warmup, args.iters)
+
+    fused_backward_overlap_reuse_ms = None
+    if can_reuse_fused_dy_up:
+        fused_backward_overlap_reuse_ms = time_cuda(fused_backward_overlap_reuse_fn, args.warmup, args.iters)
 
     latency = {
         "forward_train_graph": time_cuda(forward_train_graph_fn, args.warmup, args.iters),
@@ -170,11 +241,14 @@ def main() -> None:
         "fp4_dx_main": time_cuda(fp4_dx_main_fn, args.warmup, args.iters),
         "fused_dx_dynamic_pack": time_cuda(fused_dx_dynamic_pack_fn, args.warmup, args.iters),
         "fused_dx_cached_pack": time_cuda(fused_dx_cached_pack_fn, args.warmup, args.iters),
+        "fused_backward_overlap_exact": time_cuda(fused_backward_overlap_exact_fn, args.warmup, args.iters),
+        "fused_backward_overlap_reuse": fused_backward_overlap_reuse_ms,
         "dy_up": time_cuda(dy_up_fn, args.warmup, args.iters),
         "dense_dx_lora": time_cuda(dense_dx_lora_fn, args.warmup, args.iters),
         "d_lora_up": time_cuda(d_lora_up_fn, args.warmup, args.iters),
         "d_lora_down": time_cuda(d_lora_down_fn, args.warmup, args.iters),
         "dense_lora_grad_pair": time_cuda(dense_lora_grad_pair_fn, args.warmup, args.iters),
+        "dense_lora_grad_pair_with_dy_up": time_cuda(dense_lora_grad_pair_with_dy_up_fn, args.warmup, args.iters),
         "full_backward_cached_pack": time_cuda(full_backward_cached_pack_fn, args.warmup, args.iters),
     }
 
@@ -182,6 +256,20 @@ def main() -> None:
     cached_qweight = op.fp4_backward._cached_qweight_bwd
     cached_backward_qweight_bytes = 0 if cached_qweight is None else cached_qweight.numel() * cached_qweight.element_size()
     dense_weight_bytes = weight.numel() * weight.element_size()
+    dy_bytes = dy.numel() * dtype_bytes(dtype)
+    dy_read_passes = {
+        "cached_pack_sequential_exact": 3,
+        "overlap_exact": 3,
+        "reuse_fused_dy_up": 2,
+        "hypothetical_single_dy_read_fusion": 1,
+    }
+    estimated_dy_read_bytes = {name: int(dy_bytes * passes) for name, passes in dy_read_passes.items()}
+    overlap_reuse_over_cached_pack = (
+        None if latency["fused_backward_overlap_reuse"] is None else latency["fused_dx_cached_pack"] / latency["fused_backward_overlap_reuse"]
+    )
+    overlap_reuse_down_rel_l2 = None if down_overlap_reuse is None else rel_l2(down_overlap_reuse, down_sequential)
+    overlap_reuse_up_rel_l2 = None if up_overlap_reuse is None else rel_l2(up_overlap_reuse, up_sequential)
+    overlap_reuse_dx_rel_l2 = None if dx_overlap_reuse is None else rel_l2(dx_overlap_reuse, dx_cached)
     payload = {
         "shape": {
             "m": args.m,
@@ -192,11 +280,26 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "backward_weight_policy": args.backward_weight_policy,
+            "can_reuse_fused_dy_up": can_reuse_fused_dy_up,
         },
         "backward_weight_cache_bytes": {
             "cached_backward_qweight": int(cached_backward_qweight_bytes),
             "dense_weight": int(dense_weight_bytes),
             "cached_backward_qweight_vs_dense_weight": cached_backward_qweight_bytes / dense_weight_bytes,
+        },
+        "dy_read_model": {
+            "dy_bytes": int(dy_bytes),
+            "passes": dy_read_passes,
+            "estimated_read_bytes": estimated_dy_read_bytes,
+            "hypothetical_single_read_reduction_vs_cached_pack_sequential": (
+                estimated_dy_read_bytes["cached_pack_sequential_exact"]
+                / estimated_dy_read_bytes["hypothetical_single_dy_read_fusion"]
+            ),
+            "hypothetical_single_read_reduction_vs_reuse": (
+                estimated_dy_read_bytes["reuse_fused_dy_up"]
+                / estimated_dy_read_bytes["hypothetical_single_dy_read_fusion"]
+            ),
+            "note": "Pass counts model dY consumers: FP4 dX quantize/fused dy_up, exact dB, and exact dy_up for dA.",
         },
         "latency_ms": latency,
         "derived": {
@@ -210,7 +313,21 @@ def main() -> None:
             "d_lora_up_over_backward": latency["d_lora_up"] / backward,
             "d_lora_down_over_backward": latency["d_lora_down"] / backward,
             "dense_lora_grad_pair_over_backward": latency["dense_lora_grad_pair"] / backward,
+            "dense_lora_grad_pair_with_dy_up_over_backward": latency["dense_lora_grad_pair_with_dy_up"] / backward,
             "fused_dx_cached_pack_over_backward": latency["fused_dx_cached_pack"] / backward,
+            "fused_backward_overlap_exact_over_backward": latency["fused_backward_overlap_exact"] / backward,
+            "cached_pack_dx_only_over_overlap_exact_full_subgraph": (
+                latency["fused_dx_cached_pack"] / latency["fused_backward_overlap_exact"]
+            ),
+            "cached_pack_dx_only_over_overlap_reuse_full_subgraph": overlap_reuse_over_cached_pack,
+        },
+        "correctness": {
+            "overlap_exact_dx_vs_cached_dx_rel_l2": rel_l2(dx_overlap, dx_cached),
+            "overlap_exact_d_lora_down_vs_sequential_rel_l2": rel_l2(down_overlap, down_sequential),
+            "overlap_exact_d_lora_up_vs_sequential_rel_l2": rel_l2(up_overlap, up_sequential),
+            "overlap_reuse_dx_vs_cached_dx_rel_l2": overlap_reuse_dx_rel_l2,
+            "overlap_reuse_d_lora_down_vs_sequential_rel_l2": overlap_reuse_down_rel_l2,
+            "overlap_reuse_d_lora_up_vs_sequential_rel_l2": overlap_reuse_up_rel_l2,
         },
     }
 

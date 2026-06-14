@@ -195,6 +195,9 @@ def main() -> None:
             and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
         )
     )
+    zero_fast_path_initial = bool(base_cfg.init == "zero" and base_cfg.zero_lora_up_fast_path)
+    expected_initial_cache_count = 0 if zero_fast_path_initial else expected_cache_count
+    expected_initial_forward_cache_count = 0 if zero_fast_path_initial else expected_forward_cache_count
     expected_backward_weight_count = len(expected_replaced) if base_cfg.backward_weight_policy == "cache" else 0
     expected_cache_summary = result.cache_summary
     expected_adapter_keys = {
@@ -255,17 +258,17 @@ def main() -> None:
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
         "optimizer_param_groups_have_lr": groups_have_lr,
         "trainable_param_count_matches": result.trainable_param_count == trainable_param_count,
-        "forward_refresh_count_matches": result.refreshed_forward_cache_count == expected_forward_cache_count,
-        "refresh_count_matches": result.refreshed_cache_count == expected_cache_count,
+        "forward_refresh_count_matches": result.refreshed_forward_cache_count == expected_initial_forward_cache_count,
+        "refresh_count_matches": result.refreshed_cache_count == expected_initial_cache_count,
         "backward_weight_refresh_count_matches": (
             result.refreshed_backward_weight_count == expected_backward_weight_count
         ),
         "cache_summary_module_count_matches": expected_cache_summary.module_count == len(expected_replaced),
         "cache_summary_fused_lora_forward_count_matches": (
-            expected_cache_summary.fused_lora_forward_cache_count == expected_forward_cache_count
+            expected_cache_summary.fused_lora_forward_cache_count == expected_initial_forward_cache_count
         ),
         "cache_summary_fused_lora_dx_count_matches": (
-            expected_cache_summary.fused_lora_dx_cache_count == expected_cache_count
+            expected_cache_summary.fused_lora_dx_cache_count == expected_initial_cache_count
         ),
         "cache_summary_backward_weight_count_matches": (
             expected_cache_summary.backward_weight_cache_count == expected_backward_weight_count
@@ -312,6 +315,8 @@ def main() -> None:
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
+            "zero_lora_up_fast_path": base_cfg.zero_lora_up_fast_path,
+            "zero_fast_path_initial": zero_fast_path_initial,
         },
         "replaced": result.replaced_modules,
         "trainable": result.trainable_names,

@@ -186,6 +186,24 @@ def main() -> None:
             and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
         )
     )
+    expected_initial_cache_count = sum(
+        1
+        for name in expected_replaced
+        if (
+            fp4_modules[name].fuse_lora_dx
+            and fp4_modules[name].cache_fused_lora_dx
+            and not fp4_modules[name]._lora_up_zero_fast_path_active()
+        )
+    )
+    expected_initial_forward_cache_count = sum(
+        1
+        for name in expected_replaced
+        if (
+            fp4_modules[name].fuse_lowrank_forward
+            and fp4_modules[name].lowrank_dtype == fp4_modules[name].fp4_forward.compute_dtype
+            and not fp4_modules[name]._lora_up_zero_fast_path_active()
+        )
+    )
 
     named_lora_params = dict(iter_fp4_lora_named_parameters(model))
     param_groups = fp4_lora_parameter_groups(model, lora_weight_decay=0.0)
@@ -353,19 +371,21 @@ def main() -> None:
         "trainable_grads_present": set(trainable).issubset(grad_named),
         "x_grad_finite": bool(x.grad is not None and torch.isfinite(x.grad).all()),
         "output_finite": bool(torch.isfinite(y).all()),
-        "forward_cache_count_matches": refreshed_forward == expected_forward_cache_count,
-        "cache_count_matches": refreshed == expected_cache_count,
+        "forward_cache_count_matches": refreshed_forward == expected_initial_forward_cache_count,
+        "cache_count_matches": refreshed == expected_initial_cache_count,
         "forward_clear_count_matches": cleared_forward == len(replaced),
         "clear_count_matches": cleared == len(replaced),
-        "forward_refresh_after_clear_matches": refreshed_forward_after_clear == expected_forward_cache_count,
-        "refresh_after_clear_matches": refreshed_after_clear == expected_cache_count,
+        "forward_refresh_after_clear_matches": refreshed_forward_after_clear == expected_initial_forward_cache_count,
+        "refresh_after_clear_matches": refreshed_after_clear == expected_initial_cache_count,
         "frozen_residual_count_matches": len(frozen_residual_modules) == expected_frozen_residual_count,
         "frozen_residual_not_parameter": frozen_residual_params == set(),
         "frozen_residual_buffers_finite": frozen_residual_buffers_finite,
         "lora_named_parameters_match_trainable": set(named_lora_params) == set(trainable),
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
-        "optimizer_pre_step_forward_refresh_count_matches": pre_step_forward_refreshed == expected_forward_cache_count,
-        "optimizer_pre_step_refresh_count_matches": pre_step_refreshed == expected_cache_count,
+        "optimizer_pre_step_forward_refresh_count_matches": (
+            pre_step_forward_refreshed == expected_initial_forward_cache_count
+        ),
+        "optimizer_pre_step_refresh_count_matches": pre_step_refreshed == expected_initial_cache_count,
         "optimizer_hook_forward_refresh_count_matches": hook_forward_refresh_count == expected_forward_cache_count,
         "optimizer_hook_dx_refresh_count_matches": hook_dx_refresh_count == expected_cache_count,
         "optimizer_hook_refresh_count_matches": hook_refresh_count == expected_forward_cache_count + expected_cache_count,
@@ -413,6 +433,7 @@ def main() -> None:
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
+            "zero_lora_up_fast_path": cfg.zero_lora_up_fast_path,
         },
         "config_overrides": {
             "layers.1.down_proj": {
@@ -446,6 +467,10 @@ def main() -> None:
             "optimizer_hook_forward_refreshed": hook_forward_refresh_count,
             "optimizer_hook_dx_refreshed": hook_dx_refresh_count,
             "optimizer_hook_refreshed": hook_refresh_count,
+            "expected_initial_forward_cache_count": expected_initial_forward_cache_count,
+            "expected_initial_dx_cache_count": expected_initial_cache_count,
+            "expected_post_step_forward_cache_count": expected_forward_cache_count,
+            "expected_post_step_dx_cache_count": expected_cache_count,
         },
         "adapter_state_keys": sorted(adapter_state),
         "peft_adapter_state_keys": sorted(peft_state),

@@ -201,3 +201,31 @@ RTX 5090 BF16，`m=in=out=4096, rank=32, warmup=5, iters=10`：
 - 当前 exact overlap 主要通过和 FP4 repack/dX 重叠获得端到端收益；低秩梯度子图单独 overlap 并不一定更快。
 - reuse 路径确实把 `dY` consumer 从 3 次降到 2 次，但它复用的是 quantize/fused low-rank 输出，`dA` 会变成近似梯度。
 - 真正的一次读 `dY` 大融合 kernel 仍有理论空间：相对 exact current 可把 `dY` 读流量降到约 `1/3`，相对 reuse 降到约 `1/2`。但这个 kernel 必须同时处理 FP4 quantize/GEMM 输入、`dB` 规约和 `dy_up/dA` 链，不能只用多 stream overlap 替代。
+
+## Zero-init LoRA-up fast path
+
+本轮尝试继续扩大 rank32 fused `dA` 的 rank tile，结果不如已推广的 `kVec=4,rVec=16,threads=128`：
+
+| candidate | 2048 fused dA ms | 4096 fused dA ms | status | reason |
+| --- | ---: | ---: | --- | --- |
+| current `kVec=4,rVec=16,threads=128` | ~0.1126 | ~0.3060 | kept | 已知稳定最优 |
+| `kVec=2,rVec=32,threads=128` | 0.1345 | 0.3724 | rejected | full-rank tile 降低重复 decode，但列 tile 变窄，整体更慢 |
+| `kVec=4,rVec=32,threads=64` | 0.1574 | 0.3951 | rejected | 行并行度不足，occupancy/latency 退化 |
+
+因此本轮没有改 fused `dA` CUDA tile，转而优化 zero-init task LoRA 的首步训练路径。标准 LoRA 初始化 `lora_up=0` 时：
+
+- forward 的 LoRA out 为 0；
+- LoRA dX 为 0；
+- `dA = (dY @ B).T @ x` 为 0；
+- 只有 `dB = dY.T @ (x @ A.T)` 需要计算。
+
+已实现的 `zero_lora_up_fast_path` 用 parameter version 判断是否仍处于初始化零 `lora_up` 状态，不在热路径做全张量检查；optimizer step 或 adapter load 后自动失效。
+
+RTX 5090 BF16，`m=in=out=4096, rank=32, warmup=5, iters=20`：
+
+| config | baseline train step ms | zero-up fast train step ms | speedup | correctness |
+| --- | ---: | ---: | ---: | --- |
+| fused dX cached-pack | 0.9058 | 0.7439 | 1.218x | all_passed |
+| throughput fused forward + fused dX | 0.8768 | 0.7994 | 1.097x | all_passed |
+
+throughput disabled-baseline 使用 native fused forward 生成近似 `lora_act`，`d_lora_up_baseline_vs_exact` 约 `7.1e-4`；fast path 使用 dense `x@A.T`，`d_lora_up_fast_vs_exact=0`。初始 packed LoRA forward/dX cache 均不生成；optimizer post-step hook 在 `lora_up` 更新后恢复正常 cache refresh。

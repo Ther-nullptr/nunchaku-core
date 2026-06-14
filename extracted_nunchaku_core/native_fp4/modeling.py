@@ -56,6 +56,7 @@ class FP4LoRAConfig:
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS
     fp4_activation_cache_d_lora_down: bool = False
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused"
+    zero_lora_up_fast_path: bool = True
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,7 @@ def fp4_lora_finetune_config(
     reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
+    zero_lora_up_fast_path: bool = True,
 ) -> FP4LoRAConfig:
     """Return a recommended FP4 LoRA fine-tuning config.
 
@@ -230,6 +232,7 @@ def fp4_lora_finetune_config(
         overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=fp4_activation_cache_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
+        zero_lora_up_fast_path=bool(zero_lora_up_fast_path),
     )
 
 
@@ -500,6 +503,7 @@ def convert_linear_to_fp4_lora(
                         fp4_activation_cache_d_lora_down_backend=(
                             child_cfg.fp4_activation_cache_d_lora_down_backend
                         ),
+                        zero_lora_up_fast_path=child_cfg.zero_lora_up_fast_path,
                     )
                     setattr(parent, child_name, fp4_lora)
                     replaced.append(full_name)
@@ -620,7 +624,8 @@ def refresh_fused_lora_dx_caches(module: torch.nn.Module) -> int:
     for _, child in iter_fp4_lora_modules(module):
         if child.fuse_lora_dx and child.cache_fused_lora_dx:
             child.refresh_fused_lora_dx_cache()
-            count += 1
+            if child._cached_lora_down_bwd_packed is not None and child._cached_lora_up_bwd_packed is not None:
+                count += 1
     return count
 
 
@@ -876,6 +881,8 @@ def load_fp4_lora_state_dict(
             loaded += 1
 
     if loaded:
+        for _, child in iter_fp4_lora_modules(module):
+            child.clear_lora_up_zero_fast_path()
         clear_fused_lora_forward_caches(module)
         clear_fused_lora_dx_caches(module)
     return missing, unexpected
@@ -959,6 +966,8 @@ def load_fp4_lora_peft_state_dict(
                     loaded += 1
 
     if loaded:
+        for _, child in iter_fp4_lora_modules(module):
+            child.clear_lora_up_zero_fast_path()
         clear_fused_lora_forward_caches(module)
         clear_fused_lora_dx_caches(module)
     return missing, unexpected
@@ -1001,6 +1010,7 @@ def prepare_fp4_lora_finetuning(
     reuse_fused_dy_up_for_d_lora_down: bool = False,
     overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
+    zero_lora_up_fast_path: bool = True,
     target_modules: Iterable[str] | None = DEFAULT_FP4_LORA_TARGET_MODULES,
     exclude_modules: Iterable[str] | None = DEFAULT_FP4_LORA_EXCLUDE_MODULES,
     config_overrides: Mapping[str, FP4LoRAConfig] | None = None,
@@ -1052,6 +1062,7 @@ def prepare_fp4_lora_finetuning(
             reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
             overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
             fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
+            zero_lora_up_fast_path=zero_lora_up_fast_path,
         )
     else:
         train_bias = cfg.train_bias

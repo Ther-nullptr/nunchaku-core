@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     p.add_argument("--fp4-activation-cache-d-lora-down", action="store_true")
     p.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
+    p.add_argument("--disable-zero-lora-up-fast-path", action="store_true")
     p.add_argument("--results-dir", type=str, default="results")
     return p.parse_args()
 
@@ -95,7 +96,9 @@ def main() -> None:
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         fp4_activation_cache_d_lora_down=args.fp4_activation_cache_d_lora_down,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+        zero_lora_up_fast_path=not args.disable_zero_lora_up_fast_path,
     )
+    zero_lora_up_fast_path_active_before_update = op._lora_up_zero_fast_path_active()
 
     cache_refresh_check = True
     backward_weight_cache_check = True
@@ -111,6 +114,7 @@ def main() -> None:
             op.lora_up.add_(1e-4)
         cache_refresh_check = old_down_version != op.lora_down._version and old_up_version != op.lora_up._version
 
+    zero_lora_up_fast_path_active_for_forward = op._lora_up_zero_fast_path_active()
     y = op(x)
     loss = (y.float() * dy.float()).sum()
     loss.backward()
@@ -134,7 +138,9 @@ def main() -> None:
         y_lora = torch.matmul(lora_act, up_lr.t()).mul(op.scaling).to(dtype)
         lowrank_out = y_lora
         separate_lowrank_out = y_lora if args.fuse_lowrank_forward else None
-        native_fused_forward = bool(args.fuse_lowrank_forward and dtype == lowrank_dtype)
+        native_fused_forward = bool(
+            args.fuse_lowrank_forward and dtype == lowrank_dtype and not zero_lora_up_fast_path_active_for_forward
+        )
         sequential_y_ref = None
 
         dy_up = torch.matmul(dy_lr, up_lr)
@@ -267,6 +273,10 @@ def main() -> None:
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_d_lora_down": args.fp4_activation_cache_d_lora_down,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
+            "zero_lora_up_fast_path": not args.disable_zero_lora_up_fast_path,
+            "zero_lora_up_fast_path_active_before_update": zero_lora_up_fast_path_active_before_update,
+            "zero_lora_up_fast_path_active_for_forward": zero_lora_up_fast_path_active_for_forward,
+            "zero_lora_up_fast_path_active": op._lora_up_zero_fast_path_active(),
             "native_fused_forward": native_fused_forward,
         },
         "tolerances": {

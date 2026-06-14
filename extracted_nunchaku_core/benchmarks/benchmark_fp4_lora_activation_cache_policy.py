@@ -210,7 +210,7 @@ def main() -> None:
                 "dequant_gemm": "materializes dense x_hat transiently, then uses torch GEMM for dA",
             },
             "fp4_cache_fused_d_lora_down": (
-                "cuda_rank_tiled_kvec3_rvec16_rank_le_32"
+                "cuda_rank_tiled_kvec4_rvec16_threads128_rank_le_32"
                 if rank <= 32
                 else (
                     "cuda_rank_tiled_kvec3_rvec32_threads128_rank_le_512"

@@ -33,16 +33,18 @@ Rank32，RTX 5090，BF16，`benchmark_fp4_lora_activation_cache_policy.py --warm
 | baseline `kVec=2,rVec=16` | 0.1294 | 0.3913 | replaced | stable but CTA count is higher on large K |
 | `kVec=1,rVec=32` | 0.2083 | 0.6562 | rejected | avoids one rank split but doubles dy/rank loads per two columns |
 | `kVec=2,rVec=32` | n/a | n/a | rejected | ptxas reports static shared memory `0x10000` > `0xc000` |
-| `kVec=3,rVec=16` | 0.1296 | 0.3478 | promoted | keeps rank tiling, reduces CTA count, stays within 48KB static smem |
+| `kVec=3,rVec=16` | 0.1296 | 0.3478 | replaced | keeps rank tiling, reduces CTA count, stays within 48KB static smem |
+| `kVec=3,rVec=32,threads=128` | n/a | 0.3612 | rejected | one rank tile but higher accumulator pressure and lower row parallelism |
+| `kVec=4,rVec=16,threads=128` | 0.1126 | 0.3060 | promoted | reduces column CTA count while preserving narrow rank tiling |
 
 Stabler 30-iter promoted result:
 
 | shape | fused dA ms | fused vs dequant+GEMM | dA fused vs dequant rel_l2 |
 | --- | ---: | ---: | ---: |
-| 2048^2, rank32 | 0.1281 | 0.528x | 2.86e-3 |
-| 4096^2, rank32 | 0.3460 | 0.585x | 7.84e-5 |
+| 2048^2, rank32 | 0.1126 | 0.604x | 2.86e-3 |
+| 4096^2, rank32 | 0.3060 | 0.659x | 7.84e-5 |
 
-结论：`kVec=3,rVec=16` 对 2048 基本持平，对 4096 相比旧 `kVec=2,rVec=16` 约 `1.13x`。这仍慢于 `dequant -> GEMM`，但能减少 dense `x_hat` 物化，是显存压力模式的局部改进。
+结论：`kVec=4,rVec=16,threads=128` 对 2048 和 4096 都优于旧 rank32 fast path；4096 相比旧 `kVec=2,rVec=16` 约 `1.28x`，相比上一版 `kVec=3,rVec=16` 约 `1.13x`。这仍慢于 `dequant -> GEMM`，但能减少 dense `x_hat` 物化，是显存压力模式的局部改进。
 
 Rank64，RTX 5090，BF16：
 

@@ -286,11 +286,11 @@ void fp4_activation_cache_lora_down_grad_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (rank <= 32) {
-        // Rank-32 LoRA is the common finetuning case. kVec=3 reduces CTA count
-        // without changing rank tiling and stays within the 48KB static smem cap.
-        constexpr int kVec = 3;
+        // Rank-32 LoRA is the common finetuning case. Reduce column CTA count
+        // while keeping rank tiling narrow enough to avoid high accumulator pressure.
+        constexpr int kVec = 4;
         constexpr int rVec = 16;
-        constexpr int kThreads = 256;
+        constexpr int kThreads = 128;
         const dim3 blocks((cols + kVec - 1) / kVec, (rank + rVec - 1) / rVec);
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::kHalf,

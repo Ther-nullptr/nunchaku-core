@@ -53,6 +53,7 @@ Rank64，RTX 5090，BF16：
 | baseline `kVec=2,rVec=16,threads=256` | 0.4176 | 1.5043 | replaced | repeats activation decode across four rank tiles |
 | `kVec=2,rVec=32,threads=128` | 0.3943 | 1.3416 | rejected | reduces rank tiles but keeps the same column tile count |
 | `kVec=3,rVec=32,threads=128` | 0.3206 | 0.9876 | promoted | reduces both rank and column tile counts while staying within 48KB static smem |
+| `kVec=4,rVec=32,threads=64` | 0.3267 | 0.9804 | rejected | marginal 4096 gain is noise-level and 2048 regresses due to lower row parallelism |
 
 Correctness gate:
 

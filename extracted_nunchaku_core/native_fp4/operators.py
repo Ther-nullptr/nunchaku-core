@@ -192,6 +192,25 @@ def fp4_activation_cache_lora_down_grad(
     return output
 
 
+def lora_up_grad(dy: torch.Tensor, lora_act: torch.Tensor, scaling: float = 1.0) -> torch.Tensor:
+    if dy.dim() != 2:
+        raise ValueError(f"Expected dy to be 2D, got shape={tuple(dy.shape)}")
+    if lora_act.dim() != 2:
+        raise ValueError(f"Expected lora_act to be 2D, got shape={tuple(lora_act.shape)}")
+    if dy.shape[0] != lora_act.shape[0]:
+        raise ValueError("dy and lora_act must have the same row count")
+    if dy.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("dy dtype must be float16, bfloat16, or float32")
+    if lora_act.dtype != dy.dtype:
+        raise ValueError("dy and lora_act dtype must match")
+    if not dy.is_cuda or not lora_act.is_cuda:
+        raise ValueError("dy and lora_act must be CUDA tensors")
+
+    output = torch.empty(dy.shape[1], lora_act.shape[1], dtype=dy.dtype, device=dy.device)
+    _OPS.lora_up_grad(dy.contiguous(), lora_act.contiguous(), output, float(scaling))
+    return output
+
+
 class NunchakuFP4GemmOp(torch.nn.Module):
     """Native nunchaku FP4 GEMM operator (main branch only)."""
 

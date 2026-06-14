@@ -648,6 +648,8 @@ python benchmarks/benchmark_fp4_lora_lowrank_grad.py \
 
 - `results/latest_fp4_lora_lowrank_grad.json`
 
+该脚本也会测 `native_fp4.lora_up_grad`：这是 `dB=dY.T@lora_act` 的 scalar-reduction CUDA 原型，只用于拒绝/对照实验，不接入默认训练路径。
+
 如果要判断 overlap helper 的 Python-side stream/event 分配是否值得缓存，跑：
 
 ```bash
@@ -702,6 +704,8 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16 | 0.0855 | 0.0623 | 1.37x | 0.0928 | 0.92x |
 | FP16 | 0.0536 | 0.0390 | 1.37x | 0.0748 | 0.72x |
+
+新增 scalar-reduction `native_fp4.lora_up_grad` 原型后复测，rank32 BF16 `dB` 为 `0.488ms` vs torch GEMM `0.0295ms`（`0.06x`），rank32 FP16 为 `0.493ms` vs `0.0226ms`（`0.046x`）。因此普通 block reduction 不是可行方向；dense `dB` 要么继续用 cuBLAS，要么后续做 Tensor Core/CUTLASS grouped 或直接融合进读取 `dY` 的 FP4 dX quantize pipeline。
 
 FP4 dX pipeline 短测，`M=N=K=4096, rank=32`：
 
@@ -1355,6 +1359,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 反解 native `qact/ascales` activation layout；`return_scales=False` 时走 CUDA fast path，供 FP4 activation cache 消融和后续 fused `dA` kernel 使用
 - `native_fp4.fp4_activation_cache_lora_down_grad`
   - 直接从 native FP4 activation cache 计算 LoRA `dA` 的 fused CUDA 原型；rank<=32 使用 `kVec=4,rVec=16,threads=128` fast path，rank<=512 使用 `kVec=3,rVec=32,threads=128` fast path，rank>512 回落 `kVec=2,rVec=16`；用于显存/近似训练消融，当前不建议默认开启
+- `native_fp4.lora_up_grad`
+  - `dB=dY.T@lora_act` 的 dense scalar-reduction CUDA 原型；只用于 `benchmark_fp4_lora_lowrank_grad.py` 对照，4096/rank32 上显著慢于 torch/cuBLAS，不建议默认使用
 - `native_fp4.FP4LoRAConfig`
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`reuse_fused_dy_up_for_d_lora_down`、`zero_lora_up_fast_path`、`fp4_activation_cache_d_lora_down`、`fp4_activation_cache_d_lora_down_backend` 和 FP16-only `fuse_frozen_residual_dx`
 - `native_fp4.convert_linear_to_fp4_lora`

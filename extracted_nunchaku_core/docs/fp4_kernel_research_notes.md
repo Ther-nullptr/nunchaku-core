@@ -211,6 +211,15 @@ RTX 5090 BF16，`m=in=out=4096, rank=32, warmup=5, iters=10`：
 
 结论：复用 Python `torch.cuda.Stream/Event` 对象不是当前瓶颈，且会在 4096 形状引入轻微负收益；默认仍保持 helper 内临时创建资源。下一步真正值得做的是一次读 `dY` 的融合 kernel 或 rank-specialized low-rank gradient kernel，而不是继续堆多 stream 调度。
 
+本轮继续按 Kernel Design Agents 的“候选实现-验证-拒绝”流程尝试了 rank-small dense `dB=dY.T@lora_act` scalar-reduction CUDA 原型，接口为 `native_fp4.lora_up_grad`，只供 benchmark 调用：
+
+| dtype/rank | torch `dB` ms | CUDA scalar `dB` ms | CUDA speedup | rel_l2 vs torch |
+| --- | ---: | ---: | ---: | ---: |
+| BF16/rank32 | 0.0295 | 0.4878 | 0.060x | 1.60e-4 |
+| FP16/rank32 | 0.0226 | 0.4931 | 0.046x | 3.29e-4 |
+
+结论：普通 block-level scalar reduction 无法替代 cuBLAS/Tensor Core GEMM；即使 rank 很小，也会因为重复读取 `lora_act` 和没有 Tensor Core 路径而大幅落后。后续低秩梯度优化应转向 CUTLASS grouped/small-N GEMM、或把 `dB` 规约融合进 FP4 dX quantize 读取 `dY` 的路径。
+
 ## Zero-init LoRA-up fast path
 
 本轮尝试继续扩大 rank32 fused `dA` 的 rank tile，结果不如已推广的 `kVec=4,rVec=16,threads=128`：

@@ -3,10 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from typing import Any
 
 import torch
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from native_fp4 import lora_up_grad  # noqa: E402
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -78,6 +85,9 @@ def benchmark_one(
     def d_lora_up_fn() -> torch.Tensor:
         return torch.matmul(dy.t(), lora_act).mul(scaling)
 
+    def d_lora_up_cuda_fn() -> torch.Tensor:
+        return lora_up_grad(dy, lora_act, scaling=scaling)
+
     def d_lora_down_fn() -> torch.Tensor:
         return torch.matmul(dy_up.t(), x).mul(scaling)
 
@@ -112,12 +122,15 @@ def benchmark_one(
 
     ref_down, ref_up = grad_pair_sequential_fn()
     overlap_down, overlap_up = grad_pair_overlap_fn()
+    cuda_up = d_lora_up_cuda_fn()
+    exact_up = torch.matmul(dy.float().t(), lora_act.float()).mul(float(scaling))
     torch.cuda.synchronize()
 
     latency = {
         "lora_act_build": time_cuda(lora_act_build_fn, warmup, iters),
         "dy_up": time_cuda(dy_up_fn, warmup, iters),
         "d_lora_up": time_cuda(d_lora_up_fn, warmup, iters),
+        "d_lora_up_cuda": time_cuda(d_lora_up_cuda_fn, warmup, iters),
         "d_lora_down_reuse_dy_up": time_cuda(d_lora_down_fn, warmup, iters),
         "grad_pair_reuse_dy_up": time_cuda(grad_pair_reuse_dy_up_fn, warmup, iters),
         "grad_pair_sequential": time_cuda(grad_pair_sequential_fn, warmup, iters),
@@ -137,14 +150,19 @@ def benchmark_one(
             "overlap_speedup_vs_sequential": latency["grad_pair_sequential"] / latency["grad_pair_overlap"],
             "reuse_dy_up_speedup_vs_sequential": latency["grad_pair_sequential"]
             / latency["grad_pair_reuse_dy_up"],
+            "d_lora_up_cuda_speedup_vs_torch": latency["d_lora_up"] / latency["d_lora_up_cuda"],
             "dy_up_share_of_sequential": latency["dy_up"] / latency["grad_pair_sequential"],
             "d_lora_up_share_of_sequential": latency["d_lora_up"] / latency["grad_pair_sequential"],
+            "d_lora_up_cuda_share_of_sequential": latency["d_lora_up_cuda"] / latency["grad_pair_sequential"],
             "d_lora_down_reuse_share_of_sequential": latency["d_lora_down_reuse_dy_up"]
             / latency["grad_pair_sequential"],
         },
         "correctness": {
             "overlap_d_lora_down_rel_l2": rel_l2(overlap_down, ref_down),
             "overlap_d_lora_up_rel_l2": rel_l2(overlap_up, ref_up),
+            "cuda_d_lora_up_rel_l2": rel_l2(cuda_up, ref_up),
+            "torch_d_lora_up_vs_fp32_exact_rel_l2": rel_l2(ref_up, exact_up),
+            "cuda_d_lora_up_vs_fp32_exact_rel_l2": rel_l2(cuda_up, exact_up),
         },
     }
 
@@ -190,6 +208,7 @@ def main() -> None:
             "grad_pair_sequential": "dy_up=dY@B, dB=dY^T@lora_act, dA=dy_up^T@X on the current stream",
             "grad_pair_overlap": "dB overlaps with the dy_up+dA chain on a second CUDA stream",
             "grad_pair_reuse_dy_up": "measures only dA+dB when dy_up is already available from fused dX",
+            "d_lora_up_cuda": "experimental scalar-reduction CUDA prototype for dB=dY^T@lora_act; not used by default training",
         },
         "shape": {
             "m": args.m,

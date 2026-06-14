@@ -5,6 +5,7 @@ from .operators import (
     NunchakuFP4LowRankOp,
     NunchakuFP4LowRankUnfusedOp,
     fp4_activation_cache_lora_down_grad,
+    lora_up_grad,
 )
 from .layout import dequantize_fp4_activation, unpack_fp4_activation_codes, unpack_fp4_activation_scales
 from .modeling import (
@@ -88,4 +89,5 @@ __all__ = [
     "unpack_fp4_activation_codes",
     "unpack_fp4_activation_scales",
     "fp4_activation_cache_lora_down_grad",
+    "lora_up_grad",
 ]

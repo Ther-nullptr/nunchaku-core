@@ -401,6 +401,8 @@ RTX 5090 短测，`M=N=K=4096, rank=32`：
 | BF16 | 0.0855 | 0.0623 | 1.37x | 0.0928 | 0.92x |
 | FP16 | 0.0536 | 0.0390 | 1.37x | 0.0748 | 0.72x |
 
+`dB=dY.T@lora_act` 的 scalar-reduction CUDA 原型已加入 `native_fp4.lora_up_grad` 作为消融，但不进默认训练路径。4096/rank32 BF16 短测为 `0.488ms` vs torch GEMM `0.0295ms`（`0.06x`），FP16 为 `0.493ms` vs `0.0226ms`（`0.046x`）。结论是普通 block reduction 明显不如 cuBLAS/Tensor Core；低秩梯度优化不应继续沿这个方向做。
+
 FP4 dX pipeline 短测，`M=N=K=4096, rank=32`：
 
 | dtype | full dX ms | quantize dY ms | repack W^T ms | prequantized GEMM ms | cached-qweight upper bound | fused LoRA dX ms |
@@ -460,7 +462,7 @@ P1：optimizer post-step eager refresh 接口已落地；后续需要在多层�
 
 P2：BF16 下 packed `dY @ B` decode 精度问题已有可用绕法：`reuse_fused_dy_up_for_d_lora_down=True` 在 BF16 使用 dual quantize 输出 dense `dy_up`，`dA` 与手写 BF16 matmul 对齐为 `rel_l2=0`；FP16 仍可用 decoded packed 路径作为小误差 opt-in。后续只需继续评估真实训练 loop 里的收益和是否值得默认开启。
 
-P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。`benchmark_fp4_lora_lowrank_grad.py` 已给出基线：rank32 下复用已有 `dy_up` 可让低秩梯度 pair 快约 `1.37x`，但单独双 stream overlap 会退化。因此下一版 kernel 不应只做 stream overlap，而应尝试把 `dy_up=dY@B` 与 `dA=dy_up^T@X` 的中间量复用/压缩，或做 CUTLASS grouped/specialized small-N GEMM 对照。
+P3：把 `dA/dB` 的低秩 GEMM 改成小 rank 专用 CUDA kernel，减少 PyTorch kernel launch 和中间张量开销。`benchmark_fp4_lora_lowrank_grad.py` 已给出基线：rank32 下复用已有 `dy_up` 可让低秩梯度 pair 快约 `1.37x`，但单独双 stream overlap 会退化；新增 scalar-reduction `lora_up_grad` 原型在 rank32 BF16/FP16 都显著慢于 torch GEMM。因此下一版 kernel 不应做普通 block reduction，而应尝试把 `dy_up=dY@B` 与 `dA=dy_up^T@X` 的中间量复用/压缩、做 CUTLASS grouped/specialized small-N GEMM，或把 `dB` 规约融合进 FP4 dX 的 `dY` 读取路径。
 
 P4：加入 activation cache policy：
 

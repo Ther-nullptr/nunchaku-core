@@ -19,6 +19,7 @@ void fp4_activation_cache_lora_down_grad_cuda(
     torch::Tensor ascales,
     torch::Tensor dy_up,
     torch::Tensor output);
+void lora_up_grad_cuda(torch::Tensor dy, torch::Tensor lora_act, torch::Tensor output, double scaling);
 
 void gemm_w4a4(
     std::optional<torch::Tensor> act,
@@ -247,6 +248,31 @@ void fp4_activation_cache_lora_down_grad(
     fp4_activation_cache_lora_down_grad_cuda(qact, ascales, dy_up, output);
 }
 
+void lora_up_grad(torch::Tensor dy, torch::Tensor lora_act, torch::Tensor output, double scaling) {
+    TORCH_CHECK(dy.is_cuda(), "dy must be a CUDA tensor");
+    TORCH_CHECK(dy.is_contiguous(), "dy must be contiguous");
+    TORCH_CHECK(dy.dim() == 2, "dy must be 2D [M, out_features]");
+
+    TORCH_CHECK(lora_act.is_cuda(), "lora_act must be a CUDA tensor");
+    TORCH_CHECK(lora_act.is_contiguous(), "lora_act must be contiguous");
+    TORCH_CHECK(lora_act.dim() == 2, "lora_act must be 2D [M, rank]");
+
+    TORCH_CHECK(output.is_cuda(), "output must be a CUDA tensor");
+    TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(output.dim() == 2, "output must be 2D [out_features, rank]");
+    TORCH_CHECK(output.size(0) == dy.size(1), "output rows must match dy out_features");
+    TORCH_CHECK(output.size(1) == lora_act.size(1), "output cols must match lora_act rank");
+    TORCH_CHECK(lora_act.size(0) == dy.size(0), "lora_act rows must match dy rows");
+    TORCH_CHECK(
+        output.scalar_type() == torch::kHalf || output.scalar_type() == torch::kBFloat16 ||
+            output.scalar_type() == torch::kFloat,
+        "output dtype must be float16, bfloat16, or float32");
+    TORCH_CHECK(dy.scalar_type() == output.scalar_type(), "dy and output dtype must match");
+    TORCH_CHECK(lora_act.scalar_type() == output.scalar_type(), "lora_act and output dtype must match");
+
+    lora_up_grad_cuda(dy, lora_act, output, scaling);
+}
+
 } // namespace nunchaku_core::ops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -258,4 +284,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pack_lowrank_weight", nunchaku_core::ops::pack_lowrank_weight);
     m.def("dequantize_fp4_activation", nunchaku_core::ops::dequantize_fp4_activation);
     m.def("fp4_activation_cache_lora_down_grad", nunchaku_core::ops::fp4_activation_cache_lora_down_grad);
+    m.def("lora_up_grad", nunchaku_core::ops::lora_up_grad);
 }

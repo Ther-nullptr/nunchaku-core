@@ -225,6 +225,97 @@ __global__ void fp4_activation_cache_lora_down_grad_tiled_kernel(
     }
 }
 
+template <typename scalar_t, int nVec, int rVec, int kThreads>
+__global__ void lora_up_grad_tiled_kernel(
+    const scalar_t* __restrict__ dy,
+    const scalar_t* __restrict__ lora_act,
+    scalar_t* __restrict__ output,
+    int rows,
+    int out_features,
+    int rank,
+    float scaling) {
+    static_assert(kThreads == 128 || kThreads == 256);
+    const int out_base = blockIdx.x * nVec;
+    const int rank_base = blockIdx.y * rVec;
+    const int tid = threadIdx.x;
+
+    float accum[rVec][nVec];
+#pragma unroll
+    for (int r = 0; r < rVec; ++r) {
+#pragma unroll
+        for (int n = 0; n < nVec; ++n) {
+            accum[r][n] = 0.0f;
+        }
+    }
+
+    for (int row = tid; row < rows; row += blockDim.x) {
+        float dy_values[nVec];
+#pragma unroll
+        for (int n = 0; n < nVec; ++n) {
+            const int out_idx = out_base + n;
+            dy_values[n] =
+                out_idx < out_features ? static_cast<float>(dy[static_cast<int64_t>(row) * out_features + out_idx]) : 0.0f;
+        }
+
+        float act_values[rVec];
+#pragma unroll
+        for (int r = 0; r < rVec; ++r) {
+            const int rank_idx = rank_base + r;
+            act_values[r] =
+                rank_idx < rank ? static_cast<float>(lora_act[static_cast<int64_t>(row) * rank + rank_idx]) : 0.0f;
+        }
+
+#pragma unroll
+        for (int r = 0; r < rVec; ++r) {
+#pragma unroll
+            for (int n = 0; n < nVec; ++n) {
+                accum[r][n] += act_values[r] * dy_values[n];
+            }
+        }
+    }
+
+    __shared__ float smem[kThreads * nVec * rVec];
+#pragma unroll
+    for (int r = 0; r < rVec; ++r) {
+#pragma unroll
+        for (int n = 0; n < nVec; ++n) {
+            smem[(r * nVec + n) * blockDim.x + tid] = accum[r][n];
+        }
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int r = 0; r < rVec; ++r) {
+#pragma unroll
+                for (int n = 0; n < nVec; ++n) {
+                    const int offset = (r * nVec + n) * blockDim.x + tid;
+                    smem[offset] += smem[offset + stride];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+#pragma unroll
+        for (int n = 0; n < nVec; ++n) {
+            const int out_idx = out_base + n;
+            if (out_idx < out_features) {
+#pragma unroll
+                for (int r = 0; r < rVec; ++r) {
+                    const int rank_idx = rank_base + r;
+                    if (rank_idx < rank) {
+                        output[static_cast<int64_t>(out_idx) * rank + rank_idx] =
+                            static_cast<scalar_t>(smem[(r * nVec + n) * blockDim.x] * scaling);
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 namespace nunchaku_core::ops {
@@ -354,6 +445,63 @@ void fp4_activation_cache_lora_down_grad_cuda(
                         cols,
                         rank,
                         static_cast<int>(padded_cols / kWarpK));
+            });
+    }
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void lora_up_grad_cuda(torch::Tensor dy, torch::Tensor lora_act, torch::Tensor output, double scaling) {
+    const c10::cuda::CUDAGuard device_guard(dy.device());
+
+    const int rows = static_cast<int>(dy.size(0));
+    const int out_features = static_cast<int>(dy.size(1));
+    const int rank = static_cast<int>(lora_act.size(1));
+    TORCH_CHECK(lora_act.size(0) == rows, "lora_act rows must match dy rows");
+    TORCH_CHECK(output.size(0) == out_features, "output rows must match dy out_features");
+    TORCH_CHECK(output.size(1) == rank, "output cols must match lora_act rank");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (rank <= 64) {
+        constexpr int nVec = 4;
+        constexpr int rVec = 16;
+        constexpr int kThreads = 128;
+        const dim3 blocks((out_features + nVec - 1) / nVec, (rank + rVec - 1) / rVec);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf,
+            at::kBFloat16,
+            output.scalar_type(),
+            "lora_up_grad_cuda_rank64",
+            [&] {
+                lora_up_grad_tiled_kernel<scalar_t, nVec, rVec, kThreads><<<blocks, kThreads, 0, stream>>>(
+                    dy.data_ptr<scalar_t>(),
+                    lora_act.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    rows,
+                    out_features,
+                    rank,
+                    static_cast<float>(scaling));
+            });
+    } else {
+        constexpr int nVec = 2;
+        constexpr int rVec = 16;
+        constexpr int kThreads = 256;
+        const dim3 blocks((out_features + nVec - 1) / nVec, (rank + rVec - 1) / rVec);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf,
+            at::kBFloat16,
+            output.scalar_type(),
+            "lora_up_grad_cuda",
+            [&] {
+                lora_up_grad_tiled_kernel<scalar_t, nVec, rVec, kThreads><<<blocks, kThreads, 0, stream>>>(
+                    dy.data_ptr<scalar_t>(),
+                    lora_act.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    rows,
+                    out_features,
+                    rank,
+                    static_cast<float>(scaling));
             });
     }
 

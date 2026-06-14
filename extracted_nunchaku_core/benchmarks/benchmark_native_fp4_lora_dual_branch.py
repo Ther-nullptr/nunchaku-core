@@ -140,22 +140,20 @@ def main() -> None:
         overlap_lora_grad=True,
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
     )
-    fused_residual_dx = None
-    if dtype == torch.float16:
-        fused_residual_dx = NunchakuFP4LoRALinear(
-            weight=weight,
-            bias=bias,
-            rank=args.rank,
-            lowrank_dtype=lowrank_dtype,
-            init="gaussian",
-            frozen_residual_rank=args.frozen_residual_rank,
-            frozen_residual_init="residual_svd",
-            cache_lora_act=True,
-            fuse_lowrank_forward=args.fuse_lowrank_forward,
-            fuse_lora_dx=True,
-            fuse_frozen_residual_dx=True,
-            cache_fused_lora_dx=True,
-        )
+    fused_residual_dx = NunchakuFP4LoRALinear(
+        weight=weight,
+        bias=bias,
+        rank=args.rank,
+        lowrank_dtype=lowrank_dtype,
+        init="gaussian",
+        frozen_residual_rank=args.frozen_residual_rank,
+        frozen_residual_init="residual_svd",
+        cache_lora_act=True,
+        fuse_lowrank_forward=args.fuse_lowrank_forward,
+        fuse_lora_dx=True,
+        fuse_frozen_residual_dx=True,
+        cache_fused_lora_dx=True,
+    )
     with torch.no_grad():
         task_only.lora_down.copy_(dense_residual_dx.lora_down)
         task_only.lora_up.copy_(dense_residual_dx.lora_up)
@@ -163,17 +161,15 @@ def main() -> None:
         dense_residual_dx_overlap.lora_up.copy_(dense_residual_dx.lora_up)
         dense_residual_dx_overlap.frozen_residual_down.copy_(dense_residual_dx.frozen_residual_down)
         dense_residual_dx_overlap.frozen_residual_up.copy_(dense_residual_dx.frozen_residual_up)
-        if fused_residual_dx is not None:
-            fused_residual_dx.lora_down.copy_(dense_residual_dx.lora_down)
-            fused_residual_dx.lora_up.copy_(dense_residual_dx.lora_up)
-            fused_residual_dx.frozen_residual_down.copy_(dense_residual_dx.frozen_residual_down)
-            fused_residual_dx.frozen_residual_up.copy_(dense_residual_dx.frozen_residual_up)
+        fused_residual_dx.lora_down.copy_(dense_residual_dx.lora_down)
+        fused_residual_dx.lora_up.copy_(dense_residual_dx.lora_up)
+        fused_residual_dx.frozen_residual_down.copy_(dense_residual_dx.frozen_residual_down)
+        fused_residual_dx.frozen_residual_up.copy_(dense_residual_dx.frozen_residual_up)
 
     task_only.refresh_fused_lora_dx_cache()
     dense_residual_dx.refresh_fused_lora_dx_cache()
     dense_residual_dx_overlap.refresh_fused_lora_dx_cache()
-    if fused_residual_dx is not None:
-        fused_residual_dx.refresh_fused_lora_dx_cache()
+    fused_residual_dx.refresh_fused_lora_dx_cache()
 
     y_dense = dense_residual_dx(x_dense)
     loss_dense = (y_dense.float() * dy.float()).sum()
@@ -196,21 +192,19 @@ def main() -> None:
             ),
         }
     }
-    if fused_residual_dx is not None:
-        y_fused = fused_residual_dx(x_fused)
-        loss_fused = (y_fused.float() * dy.float()).sum()
-        loss_fused.backward()
+    y_fused = fused_residual_dx(x_fused)
+    loss_fused = (y_fused.float() * dy.float()).sum()
+    loss_fused.backward()
 
-        errors["fused_residual_dx"] = {
-            "forward": tensor_error(y_fused, y_dense),
-            "dx": tensor_error(x_fused.grad, x_dense.grad),
-            "lora_down_grad": tensor_error(fused_residual_dx.lora_down.grad, dense_residual_dx.lora_down.grad),
-            "lora_up_grad": tensor_error(fused_residual_dx.lora_up.grad, dense_residual_dx.lora_up.grad),
-        }
+    errors["fused_residual_dx"] = {
+        "forward": tensor_error(y_fused, y_dense),
+        "dx": tensor_error(x_fused.grad, x_dense.grad),
+        "lora_down_grad": tensor_error(fused_residual_dx.lora_down.grad, dense_residual_dx.lora_down.grad),
+        "lora_up_grad": tensor_error(fused_residual_dx.lora_up.grad, dense_residual_dx.lora_up.grad),
+    }
     zero_grads(dense_residual_dx, x_dense)
     zero_grads(dense_residual_dx_overlap, x_overlap)
-    if fused_residual_dx is not None:
-        zero_grads(fused_residual_dx, x_fused)
+    zero_grads(fused_residual_dx, x_fused)
 
     task_only_train_step_ms = train_step_ms(task_only, x_task, dy, args.warmup, args.iters)
     dense_residual_dx_train_step_ms = train_step_ms(dense_residual_dx, x_dense, dy, args.warmup, args.iters)
@@ -221,9 +215,7 @@ def main() -> None:
         args.warmup,
         args.iters,
     )
-    fused_residual_dx_train_step_ms = None
-    if fused_residual_dx is not None:
-        fused_residual_dx_train_step_ms = train_step_ms(fused_residual_dx, x_fused, dy, args.warmup, args.iters)
+    fused_residual_dx_train_step_ms = train_step_ms(fused_residual_dx, x_fused, dy, args.warmup, args.iters)
 
     payload = {
         "shape": {
@@ -239,7 +231,7 @@ def main() -> None:
             "fuse_lowrank_forward": args.fuse_lowrank_forward,
             "overlap_residual_dx_available": True,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
-            "fused_residual_dx_available": fused_residual_dx is not None,
+            "fused_residual_dx_available": True,
         },
         "latency_ms": {
             "task_only_fused_dx_train_step": task_only_train_step_ms,
@@ -252,9 +244,7 @@ def main() -> None:
                 dense_residual_dx_train_step_ms / task_only_train_step_ms
             ),
             "fused_residual_dx_vs_dense_residual_dx_train_step": (
-                None
-                if fused_residual_dx_train_step_ms is None
-                else dense_residual_dx_train_step_ms / fused_residual_dx_train_step_ms
+                dense_residual_dx_train_step_ms / fused_residual_dx_train_step_ms
             ),
             "overlap_residual_dx_vs_dense_residual_dx_train_step": (
                 dense_residual_dx_train_step_ms / overlap_residual_dx_train_step_ms
@@ -265,6 +255,7 @@ def main() -> None:
     }
     overlap_errors = errors["overlap_residual_dx"]
     lora_up_grad_tol = 5e-4 if args.fuse_lowrank_forward else 1e-6
+    fused_dx_tol = 5e-3 if dtype == torch.bfloat16 else 5e-4
     payload["checks"].update(
         {
             "overlap_forward_rel_l2_lt_tol": overlap_errors["forward"]["rel_l2"]
@@ -274,19 +265,21 @@ def main() -> None:
             "overlap_lora_up_grad_rel_l2_lt_tol": overlap_errors["lora_up_grad"]["rel_l2"] < lora_up_grad_tol,
         }
     )
-    if fused_residual_dx is None:
-        payload["checks"]["fused_residual_dx_unavailable_for_bf16"] = args.dtype == "bf16"
-    else:
-        fused_errors = errors["fused_residual_dx"]
-        payload["checks"].update(
-            {
-                "fused_forward_rel_l2_lt_tol": fused_errors["forward"]["rel_l2"]
-                < (5e-4 if args.fuse_lowrank_forward else 1e-6),
-                "fused_dx_rel_l2_lt_5e-4": fused_errors["dx"]["rel_l2"] < 5e-4,
-                "fused_lora_down_grad_rel_l2_lt_1e-6": fused_errors["lora_down_grad"]["rel_l2"] < 1e-6,
-                "fused_lora_up_grad_rel_l2_lt_tol": fused_errors["lora_up_grad"]["rel_l2"] < lora_up_grad_tol,
-            }
-        )
+    fused_errors = errors["fused_residual_dx"]
+    payload["checks"].update(
+        {
+            "fused_forward_rel_l2_lt_tol": fused_errors["forward"]["rel_l2"]
+            < (5e-4 if args.fuse_lowrank_forward else 1e-6),
+            "fused_dx_rel_l2_lt_tol": fused_errors["dx"]["rel_l2"] < fused_dx_tol,
+            "fused_lora_down_grad_rel_l2_lt_1e-6": fused_errors["lora_down_grad"]["rel_l2"] < 1e-6,
+            "fused_lora_up_grad_rel_l2_lt_tol": fused_errors["lora_up_grad"]["rel_l2"] < lora_up_grad_tol,
+        }
+    )
+    payload["tolerances"] = {
+        "fused_dx_rel_l2": fused_dx_tol,
+        "overlap_dx_rel_l2": 5e-4,
+        "lora_up_grad_rel_l2": lora_up_grad_tol,
+    }
     payload["all_passed"] = bool(all(payload["checks"].values()))
 
     os.makedirs(args.results_dir, exist_ok=True)

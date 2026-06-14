@@ -92,7 +92,7 @@ def mode_expectations(
     backend: str,
     backward_weight_policy: str,
 ) -> dict[str, Any]:
-    fuse_frozen_residual_dx = mode == "throughput" and dtype == torch.float16 and lowrank_dtype == torch.float16
+    fuse_frozen_residual_dx = mode == "throughput" and dtype == lowrank_dtype
     return {
         "fuse_lora_dx": mode != "accuracy",
         "cache_fused_lora_dx": mode != "accuracy",

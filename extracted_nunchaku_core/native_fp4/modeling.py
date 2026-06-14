@@ -146,7 +146,7 @@ def fp4_lora_finetune_config(
     Modes:
       - ``accuracy``: exact BF16/FP16 LoRA gradients and dense LoRA dX.
       - ``balanced``: exact LoRA gradients with fused cached LoRA dX and auto-gated overlap.
-      - ``throughput``: balanced plus fused low-rank forward; FP16 also fuses frozen residual dX.
+      - ``throughput``: balanced plus fused low-rank forward and frozen residual dX.
       - ``memory_saving``: balanced dX, but stores FP4 activation cache for approximate dA.
 
     The returned config follows the SVDQuant-inspired training policy from the
@@ -210,8 +210,7 @@ def fp4_lora_finetune_config(
     fuse_frozen_residual_dx = (
         mode == "throughput"
         and effective_frozen_residual_rank > 0
-        and dtype == torch.float16
-        and lowrank_dtype == torch.float16
+        and dtype == lowrank_dtype
     )
     if fuse_frozen_residual_dx:
         # The exact overlap implementation keeps frozen residual dX on a dense

@@ -231,12 +231,13 @@ def main() -> None:
         errors["lora_down_grad_fp4_cache_vs_exact_manual"] = tensor_error(d_down_ref, d_down_exact_ref)
     if args.fuse_lowrank_forward and separate_y_ref is not None:
         errors["forward_vs_separate_lowrank_manual"] = tensor_error(y, separate_y_ref)
+    dx_tol = 5e-3 if args.fuse_frozen_residual_dx and dtype == torch.bfloat16 else 5e-4
     grad_tol = 5e-4 if args.fuse_lora_dx else 1e-6
     forward_tol = 5e-4 if native_fused_forward else 1e-6
     lora_up_grad_tol = 5e-4 if native_fused_forward and not args.no_cache_lora_act else 1e-6
     checks = {
         "forward_rel_l2_lt_tol": errors["forward_vs_manual"]["rel_l2"] < forward_tol,
-        "dx_rel_l2_lt_5e-4": errors["dx_vs_manual"]["rel_l2"] < 5e-4,
+        "dx_rel_l2_lt_tol": errors["dx_vs_manual"]["rel_l2"] < dx_tol,
         "lora_up_grad_rel_l2_lt_tol": errors["lora_up_grad_vs_manual"]["rel_l2"] < lora_up_grad_tol,
         "lora_down_grad_rel_l2_lt_tol": errors["lora_down_grad_vs_manual"]["rel_l2"] < grad_tol,
         "bias_grad_rel_l2_lt_1e-6": errors["bias_grad_vs_manual"]["rel_l2"] < 1e-6,
@@ -297,6 +298,7 @@ def main() -> None:
         },
         "tolerances": {
             "forward_rel_l2": forward_tol,
+            "dx_rel_l2": dx_tol,
             "fused_forward_separate_formula_rel_l2": 5e-4,
             "lora_up_grad_rel_l2": lora_up_grad_tol,
             "lora_down_grad_rel_l2": grad_tol,

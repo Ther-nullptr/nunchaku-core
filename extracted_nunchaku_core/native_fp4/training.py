@@ -1032,8 +1032,8 @@ class NunchakuFP4LoRALinear(torch.nn.Module):
             raise ValueError("fuse_frozen_residual_dx requires fuse_lora_dx=True")
         if fuse_frozen_residual_dx and frozen_residual_init == "none":
             raise ValueError("fuse_frozen_residual_dx requires frozen_residual_init='residual_svd'")
-        if fuse_frozen_residual_dx and (weight.dtype != torch.float16 or lowrank_dtype != torch.float16):
-            raise ValueError("fuse_frozen_residual_dx is currently only validated for FP16 weight and LoRA")
+        if fuse_frozen_residual_dx and weight.dtype != lowrank_dtype:
+            raise ValueError("fuse_frozen_residual_dx requires weight dtype to match lowrank_dtype")
         if reuse_fused_dy_up_for_d_lora_down and not fuse_lora_dx:
             raise ValueError("reuse_fused_dy_up_for_d_lora_down requires fuse_lora_dx=True")
         if reuse_fused_dy_up_for_d_lora_down and weight.dtype != lowrank_dtype:

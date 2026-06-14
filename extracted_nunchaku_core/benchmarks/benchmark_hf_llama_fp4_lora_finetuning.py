@@ -20,7 +20,9 @@ if ROOT_DIR not in sys.path:
 
 from native_fp4 import (  # noqa: E402
     DEFAULT_FP4_LORA_TARGET_MODULES,
+    FP4_LORA_TARGET_POLICY_MODULES,
     FP4LoRAConfig,
+    fp4_lora_target_modules_for_policy,
     iter_fp4_lora_modules,
     prepare_fp4_lora_finetuning,
 )
@@ -99,6 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=None)
     parser.add_argument("--variants", nargs="+", choices=VALID_VARIANTS, default=["dense_lora", "fp4_balanced"])
+    parser.add_argument("--target-policy", choices=tuple(FP4_LORA_TARGET_POLICY_MODULES), default=None)
     parser.add_argument("--target-modules", nargs="+", default=list(DEFAULT_FP4_LORA_TARGET_MODULES))
     parser.add_argument("--exclude-modules", nargs="+", default=list(DEFAULT_EXCLUDE_MODULES))
     parser.add_argument("--linear-prefix", type=str, default="model.layers.")
@@ -798,6 +801,8 @@ def run_fp4_variant(
 
 def main() -> None:
     args = parse_args()
+    if args.target_policy is not None:
+        args.target_modules = list(fp4_lora_target_modules_for_policy(args.target_policy))
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if args.iters <= 0:
@@ -839,6 +844,7 @@ def main() -> None:
         "lora_alpha": args.lora_alpha,
         "variants_requested": variants,
         "selection": {
+            "target_policy": args.target_policy,
             "target_modules": args.target_modules,
             "exclude_modules": list(effective_exclude_modules(args)),
             "linear_prefix": args.linear_prefix,

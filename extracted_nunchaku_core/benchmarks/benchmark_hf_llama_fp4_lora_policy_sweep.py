@@ -21,10 +21,12 @@ from benchmark_hf_llama_fp4_lora_finetuning import (  # noqa: E402
     DEFAULT_MODEL_DIR,
     DEFAULT_MODEL_ID,
     DEFAULT_FP4_LORA_TARGET_MODULES,
+    FP4_LORA_TARGET_POLICY_MODULES,
     build_batch_from_stream,
     dtype_from_name,
     effective_exclude_modules,
     ensure_model_downloaded,
+    fp4_lora_target_modules_for_policy,
     load_tokenizer,
     load_wikitext_token_stream,
     run_dense_lora_variant,
@@ -66,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=float, default=None)
     parser.add_argument("--fp4-variant", choices=FP4_VARIANTS, default="fp4_balanced")
     parser.add_argument("--policies", nargs="+", choices=POLICIES, default=list(POLICIES))
+    parser.add_argument("--target-policy", choices=tuple(FP4_LORA_TARGET_POLICY_MODULES), default=None)
     parser.add_argument("--target-modules", nargs="+", default=list(DEFAULT_FP4_LORA_TARGET_MODULES))
     parser.add_argument("--exclude-modules", nargs="+", default=list(DEFAULT_EXCLUDE_MODULES))
     parser.add_argument("--linear-prefix", type=str, default="model.layers.")
@@ -228,6 +231,8 @@ def add_relative_to_base(results: dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.target_policy is not None:
+        args.target_modules = list(fp4_lora_target_modules_for_policy(args.target_policy))
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if args.iters <= 0:
@@ -273,6 +278,7 @@ def main() -> None:
         "policies_requested": policies,
         "policy_metadata": {policy: policy_metadata(args, policy) for policy in policies},
         "selection": {
+            "target_policy": args.target_policy,
             "target_modules": args.target_modules,
             "exclude_modules": list(effective_exclude_modules(args)),
             "linear_prefix": args.linear_prefix,

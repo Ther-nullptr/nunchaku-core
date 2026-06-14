@@ -18,6 +18,7 @@ if ROOT_DIR not in sys.path:
 from native_fp4 import (  # noqa: E402
     NunchakuFP4LoRALinear,
     fp4_lora_finetune_config,
+    fp4_lora_target_modules_for_policy,
     fp4_lora_state_dict,
     iter_fp4_lora_modules,
     iter_fp4_lora_named_parameters,
@@ -249,6 +250,28 @@ def main() -> None:
         lr=args.lr,
     )
     outlier_residual_only_modules = dict(iter_fp4_lora_modules(outlier_residual_only_result.model))
+    target_policy_model = TinyModel(args.hidden, dtype).cuda()
+    target_policy_result = prepare_fp4_lora_finetuning(
+        target_policy_model,
+        mode=args.mode,
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        use_frozen_residual=not args.no_frozen_residual,
+        backward_weight_policy=args.backward_weight_policy,
+        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+        target_policy="attention_only",
+        exclude_modules=("lm_head",),
+        lr=args.lr,
+    )
+    expected_target_policy_replaced = {
+        "layers.0.q_proj",
+        "layers.0.k_proj",
+        "layers.1.q_proj",
+        "layers.1.k_proj",
+    }
     prepared = result.model
     fp4_modules = dict(iter_fp4_lora_modules(prepared))
     expected_replaced = {
@@ -422,6 +445,16 @@ def main() -> None:
             outlier_residual_only_modules["layers.1.down_proj"].fuse_frozen_residual_dx
             == expected_auto_fuse_frozen_residual_dx
         ),
+        "target_policy_attention_only_replaced_expected": (
+            set(target_policy_result.replaced_modules) == expected_target_policy_replaced
+        ),
+        "target_policy_attention_only_keeps_down_proj_dense": not isinstance(
+            target_policy_result.model.layers[0].down_proj,
+            NunchakuFP4LoRALinear,
+        ),
+        "target_policy_modules_recorded": (
+            target_policy_result.target_modules == fp4_lora_target_modules_for_policy("attention_only")
+        ),
         "trainable_names_match_lora_params": set(result.trainable_names) == set(named_lora_params),
         "all_non_lora_frozen": all_non_lora_frozen,
         "optimizer_param_groups_match_lora": optimizer_param_ids == expected_param_ids,
@@ -496,6 +529,7 @@ def main() -> None:
         "outlier_keep_dense_no_manual_exclude_modules": outlier_exclude_no_manual_result.exclude_modules,
         "outlier_bump_frozen_residual_replaced": outlier_residual_result.replaced_modules,
         "outlier_residual_only_replaced": outlier_residual_only_result.replaced_modules,
+        "target_policy_attention_only_replaced": target_policy_result.replaced_modules,
         "trainable": result.trainable_names,
         "trainable_param_count": result.trainable_param_count,
         "refreshed_forward_cache_count": result.refreshed_forward_cache_count,

@@ -20,16 +20,48 @@ from .training import (
 )
 
 FP4LoRAFinetuneMode = Literal["accuracy", "balanced", "throughput", "memory_saving"]
-DEFAULT_FP4_LORA_TARGET_MODULES = (
+FP4LoRATargetPolicy = Literal[
+    "all",
+    "attention_only",
+    "mlp_only",
+    "all_except_down_proj",
+    "attention_plus_up",
+]
+DEFAULT_FP4_LORA_ATTENTION_MODULES = (
     "q_proj",
     "k_proj",
     "v_proj",
     "o_proj",
+)
+DEFAULT_FP4_LORA_MLP_MODULES = (
     "gate_proj",
     "up_proj",
     "down_proj",
 )
+DEFAULT_FP4_LORA_TARGET_MODULES = (
+    *DEFAULT_FP4_LORA_ATTENTION_MODULES,
+    *DEFAULT_FP4_LORA_MLP_MODULES,
+)
 DEFAULT_FP4_LORA_EXCLUDE_MODULES = ("lm_head",)
+FP4_LORA_TARGET_POLICY_MODULES: dict[FP4LoRATargetPolicy, tuple[str, ...]] = {
+    "all": DEFAULT_FP4_LORA_TARGET_MODULES,
+    "attention_only": DEFAULT_FP4_LORA_ATTENTION_MODULES,
+    "mlp_only": DEFAULT_FP4_LORA_MLP_MODULES,
+    "all_except_down_proj": tuple(
+        module for module in DEFAULT_FP4_LORA_TARGET_MODULES if module != "down_proj"
+    ),
+    "attention_plus_up": (*DEFAULT_FP4_LORA_ATTENTION_MODULES, "up_proj"),
+}
+
+
+def fp4_lora_target_modules_for_policy(policy: FP4LoRATargetPolicy) -> tuple[str, ...]:
+    """Return projection-name targets for a built-in FP4 LoRA replacement policy."""
+
+    try:
+        return FP4_LORA_TARGET_POLICY_MODULES[policy]
+    except KeyError as exc:
+        valid = ", ".join(FP4_LORA_TARGET_POLICY_MODULES)
+        raise ValueError(f"Unknown FP4 LoRA target policy {policy!r}; expected one of: {valid}") from exc
 
 
 @dataclass(frozen=True)
@@ -1124,6 +1156,7 @@ def prepare_fp4_lora_finetuning(
     fp4_activation_cache_min_rows: int = 0,
     fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
     zero_lora_up_fast_path: bool = True,
+    target_policy: FP4LoRATargetPolicy | None = None,
     target_modules: Iterable[str] | None = DEFAULT_FP4_LORA_TARGET_MODULES,
     exclude_modules: Iterable[str] | None = DEFAULT_FP4_LORA_EXCLUDE_MODULES,
     config_overrides: Mapping[str, FP4LoRAConfig] | None = None,
@@ -1187,6 +1220,8 @@ def prepare_fp4_lora_finetuning(
         )
     else:
         train_bias = cfg.train_bias
+    if target_policy is not None:
+        target_modules = fp4_lora_target_modules_for_policy(target_policy)
 
     merged_overrides: dict[str, FP4LoRAConfig] = {}
     manual_override_patterns: tuple[str, ...] = ()

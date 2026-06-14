@@ -808,6 +808,7 @@ sensitive_overrides.update(auto_overrides)
 prepared = prepare_fp4_lora_finetuning(
     model,
     config=cfg,
+    # 也可用 target_policy="attention_only" / "all_except_down_proj" 等内置策略。
     target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
     config_overrides=sensitive_overrides,
@@ -1000,7 +1001,7 @@ RTX 5090 验证结果：
 
 `prepare_fp4_lora_finetuning` 是推荐的真实微调入口，会一次性完成：
 
-- 按 `target_modules/exclude_modules/config_overrides/outlier_report/sensitivity_report` 替换模型 Linear。
+- 按 `target_policy/target_modules/exclude_modules/config_overrides/outlier_report/sensitivity_report` 替换模型 Linear。
 - 冻结所有非 LoRA 参数，只保留 LoRA A/B 和可选 bias 可训练。
 - 按需刷新 native fused forward cache 和 fused dX cache。
 - zero-init task LoRA 的首步不会预热 packed LoRA forward/dX cache；`optimizer.step()` 后版本失效，cache refresh hook 会按需生成新 cache。
@@ -1008,6 +1009,24 @@ RTX 5090 验证结果：
 - 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
 - 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA forward/dX cache；`hook.last_fused_lora_forward_refresh_count` 和 `hook.last_fused_lora_dx_refresh_count` 分别记录两类动态 cache，`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
+
+内置 `target_policy`：
+
+| policy | 替换模块 | 典型用途 |
+| --- | --- | --- |
+| `all` | q/k/v/o + gate/up/down | 默认完整 LoRA 目标 |
+| `attention_only` | q/k/v/o | 保守精度策略，避开 MLP 敏感层 |
+| `mlp_only` | gate/up/down | 只测 MLP 适配能力 |
+| `all_except_down_proj` | q/k/v/o + gate/up | down_proj 敏感时保持 16-bit dense |
+| `attention_plus_up` | q/k/v/o + up | 介于 attention-only 和 full MLP 之间的消融 |
+
+真实模型 benchmark 可直接传：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced \
+  --target-policy all_except_down_proj
+```
 
 验证 prepare 接口：
 
@@ -1593,6 +1612,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - `dB=dY.T@lora_act` 的 dense scalar-reduction CUDA 原型；只用于 `benchmark_fp4_lora_lowrank_grad.py` 对照，4096/rank32 上显著慢于 torch/cuBLAS，不建议默认使用
 - `native_fp4.FP4LoRAConfig`
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`reuse_fused_dy_up_for_d_lora_down`、`zero_lora_up_fast_path`、`fp4_activation_cache_d_lora_down`、`fp4_activation_cache_min_rows`、`fp4_activation_cache_d_lora_down_backend` 和 FP16/BF16 `fuse_frozen_residual_dx`
+- `native_fp4.fp4_lora_target_modules_for_policy`
+  - 返回内置 target policy 对应的 projection 列表；高层 `prepare_fp4_lora_finetuning(..., target_policy=...)` 和 HF benchmark 的 `--target-policy` 共用同一套策略
 - `native_fp4.convert_linear_to_fp4_lora`
   - 按完整路径/后缀/子模块名匹配并替换 `torch.nn.Linear`
 - `native_fp4.fp4_lora_config_overrides_from_outlier_report`

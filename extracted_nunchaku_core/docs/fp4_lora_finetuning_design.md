@@ -136,6 +136,7 @@ sensitive_overrides.update(auto_overrides)
 prepared = prepare_fp4_lora_finetuning(
     model.cuda().to(torch.bfloat16),
     config=cfg,
+    # 也可用 target_policy="attention_only" / "all_except_down_proj" 等内置策略。
     target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     exclude_modules=("lm_head",),
     config_overrides=sensitive_overrides,
@@ -215,6 +216,7 @@ optimizer 边界：
 
 - `target_modules=None`：替换所有 `torch.nn.Linear`。
 - `target_modules=("q_proj",)`：匹配完整路径、子模块名或完整路径后缀。
+- `target_policy="attention_only"` 等内置策略会覆盖高层默认 target 列表；当前包括 `all`、`attention_only`、`mlp_only`、`all_except_down_proj`、`attention_plus_up`，用于快速复现实验中的模块敏感性消融。
 - `exclude_modules` 使用同样的匹配规则，优先排除。
 - `config_overrides` 使用同样匹配规则，第一条匹配生效；用于对敏感层单独提高 rank、切换 init、关闭实验 fusion 或改 residual branch。
 
@@ -240,7 +242,7 @@ optimizer 边界：
 - `fuse_lowrank_forward`：opt-in forward 消融选项。当 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable task LoRA forward 并入 FP4 主分支；有 frozen residual 时，residual 仍作为 dense side branch 追加。该路径会改变低秩分支的累加/量化侧调度，验证脚本用 `native_fused_forward` 标记并用 `5e-4` rel_l2 tolerance 报告相对当前 BF16/FP16 调度公式的差异；默认关闭。
 - `zero_lora_up_fast_path`：默认开启的 zero-init 首步优化。仅当 `init="zero"` 后 `lora_up` 的 parameter version 仍匹配初始化零张量时触发；forward 跳过 LoRA out/native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只计算 `dB=dY.T@(x@A.T)`。初始 cache refresh 不生成 packed LoRA forward/dX cache；`optimizer.step()` 或 adapter load 改变版本后自动回到常规路径。若 `overlap_lora_grad=True` 且行数达到门槛，则 zero-up backward 会把 FP4 main dX、`dB` 和可选 frozen residual dX 分流到多 CUDA stream。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
-- `target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
+- `target_policy/target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
 
 ## 当前 backward 边界
 

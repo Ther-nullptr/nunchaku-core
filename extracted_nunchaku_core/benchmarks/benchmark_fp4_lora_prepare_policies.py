@@ -472,6 +472,70 @@ def run_dense_lora_baseline(
     }
 
 
+def _summary_row(record: dict[str, Any], dense_lora: dict[str, Any] | None = None) -> dict[str, Any]:
+    latency_ms = float(record["latency_ms"]["train_step_with_optimizer"])
+    peak_delta = int(record["peak_memory_bytes"]["train_step_delta"])
+    initial_rel_l2 = float(record["initial_forward_vs_dense"]["rel_l2"])
+    cache_summary = record.get("cache_summary", {})
+    row = {
+        "record": record["record"],
+        "mode": record.get("mode", "dense_lora"),
+        "backend": record.get("backend"),
+        "reuse_fused_dy_up_for_d_lora_down": bool(record.get("reuse_fused_dy_up_for_d_lora_down", False)),
+        "train_step_ms": latency_ms,
+        "peak_delta_bytes": peak_delta,
+        "initial_forward_rel_l2": initial_rel_l2,
+        "total_cache_bytes": int(cache_summary.get("total_cache_bytes", 0)),
+        "total_cache_vs_dense_weight": cache_summary.get("total_cache_vs_dense_weight"),
+        "fp4_activation_cache_d_lora_down": bool(
+            record.get("config", {}).get("fp4_activation_cache_d_lora_down", False)
+        ),
+        "fuse_lowrank_forward": bool(record.get("config", {}).get("fuse_lowrank_forward", False)),
+        "overlap_lora_grad": bool(record.get("config", {}).get("overlap_lora_grad", False)),
+    }
+    if "relative_to_baseline" in record:
+        row["speedup_vs_baseline"] = float(record["relative_to_baseline"]["train_step_speedup"])
+    if "relative_to_dense_lora" in record:
+        row["speedup_vs_dense_lora"] = float(record["relative_to_dense_lora"]["train_step_speedup"])
+        row["peak_delta_ratio_vs_dense_lora"] = record["relative_to_dense_lora"]["peak_delta_ratio"]
+    elif dense_lora is not None and record["record"] != "dense_lora":
+        dense_latency = float(dense_lora["latency_ms"]["train_step_with_optimizer"])
+        dense_peak = int(dense_lora["peak_memory_bytes"]["train_step_delta"])
+        row["speedup_vs_dense_lora"] = dense_latency / latency_ms
+        row["peak_delta_ratio_vs_dense_lora"] = None if dense_peak <= 0 else peak_delta / dense_peak
+    return row
+
+
+def _is_pareto_dominated(row: dict[str, Any], other: dict[str, Any]) -> bool:
+    metrics = ("train_step_ms", "peak_delta_bytes", "initial_forward_rel_l2")
+    no_worse = all(float(other[key]) <= float(row[key]) for key in metrics)
+    strictly_better = any(float(other[key]) < float(row[key]) for key in metrics)
+    return bool(no_worse and strictly_better)
+
+
+def build_strategy_summary(
+    records: list[dict[str, Any]],
+    dense_lora: dict[str, Any],
+) -> dict[str, Any]:
+    fp4_rows = [_summary_row(record, dense_lora=dense_lora) for record in records]
+    dense_row = _summary_row(dense_lora)
+    pareto_rows = [
+        row
+        for row in fp4_rows
+        if not any(_is_pareto_dominated(row, other) for other in fp4_rows if other["record"] != row["record"])
+    ]
+    return {
+        "dense_lora": dense_row,
+        "records_by_train_step_ms": sorted(fp4_rows, key=lambda row: row["train_step_ms"]),
+        "records_by_peak_delta_bytes": sorted(fp4_rows, key=lambda row: row["peak_delta_bytes"]),
+        "records_by_initial_forward_rel_l2": sorted(fp4_rows, key=lambda row: row["initial_forward_rel_l2"]),
+        "pareto_frontier": sorted(
+            pareto_rows,
+            key=lambda row: (row["train_step_ms"], row["peak_delta_bytes"], row["initial_forward_rel_l2"]),
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark model-level FP4 LoRA prepare() policy presets.")
     p.add_argument("--batch", type=int, default=8)
@@ -596,6 +660,7 @@ def main() -> None:
         },
         "dense_lora_baseline": dense_lora,
         "records": {record["record"]: record for record in records},
+        "strategy_summary": build_strategy_summary(records, dense_lora),
         "all_passed": bool(dense_lora["all_passed"] and all(record["all_passed"] for record in records)),
     }
 

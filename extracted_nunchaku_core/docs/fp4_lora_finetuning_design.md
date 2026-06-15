@@ -166,7 +166,9 @@ model = prepared.model
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、`config.init`、初始 forward 误差和相对 dense LoRA speedup 消融。`cache_summary` 记录 prepare 后/首步前的 resident cache，`post_step_cache_summary` 记录 optimizer step 后的 steady-state resident cache；`strategy_summary` 同步输出按速度、峰值显存、初始误差排序的策略简表和三指标 Pareto frontier，其中 `total_cache_bytes` 使用 steady-state cache，避免每次手工解析 records。传 `--init pissa` 可直接做 QPiSSA-style preset 消融。
 
-`benchmark_hf_llama_fp4_lora_init_sweep.py` 复用真实 HF/LLaMA + WikiText-2 加载和 `prepare_fp4_lora_finetuning` 路径，在同一批 token 上比较 `--inits zero pissa residual_svd` 等初始化策略；输出 `latest_hf_llama_fp4_lora_init_sweep.json`，并为每个 init 记录初始 logits 误差、train-step latency、峰值显存、post-step steady-state cache 和相对 zero-init 的比值。
+`benchmark_hf_llama_fp4_lora_finetuning.py` 会在真实 HF/LLaMA + WikiText-2 结果中额外输出 `variant_summary`，按 train-step latency、峰值显存、accuracy metric 和 Pareto frontier 汇总 FP4 variants。若有 dense LoRA baseline，accuracy metric 使用 `initial_logits_rel_l2_vs_dense_lora`；否则回落到同 batch `initial_loss`。
+
+`benchmark_hf_llama_fp4_lora_init_sweep.py` 复用真实 HF/LLaMA + WikiText-2 加载和 `prepare_fp4_lora_finetuning` 路径，在同一批 token 上比较 `--inits zero pissa residual_svd` 等初始化策略；输出 `latest_hf_llama_fp4_lora_init_sweep.json`，并为每个 init 记录初始 logits 误差、train-step latency、峰值显存、post-step steady-state cache 和相对 zero-init 的比值。`init_summary` 使用同一套排序/Pareto 逻辑汇总不同 init。
 
 追加 `--include-reuse-policies` 后，benchmark 会为支持的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
 

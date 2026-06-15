@@ -806,6 +806,95 @@ def run_fp4_variant(
     return record
 
 
+def _summary_accuracy_metric(row: dict[str, Any]) -> float:
+    value = row.get("accuracy_metric")
+    return float("inf") if value is None else float(value)
+
+
+def _summary_row(record_name: str, record: dict[str, Any]) -> dict[str, Any]:
+    latency_ms = float(record["latency_ms"]["train_step_with_optimizer"])
+    peak_delta = int(record["peak_memory_bytes"]["train_step_delta"])
+    logits_error = record.get("initial_logits_vs_dense_lora")
+    logits_rel_l2 = None if logits_error is None else float(logits_error["rel_l2"])
+    initial_loss = record.get("initial_loss")
+    initial_loss = None if initial_loss is None else float(initial_loss)
+    accuracy_metric = logits_rel_l2 if logits_rel_l2 is not None else initial_loss
+    accuracy_metric_name = (
+        "initial_logits_rel_l2_vs_dense_lora" if logits_rel_l2 is not None else "initial_loss"
+    )
+    cache_summary = record.get("cache_summary", {})
+    post_step_cache_summary = record.get("post_step_cache_summary", cache_summary)
+    row = {
+        "record": record_name,
+        "variant": record.get("variant", record_name),
+        "mode": record.get("mode"),
+        "init": record.get("init"),
+        "backend": record.get("fp4_activation_cache_d_lora_down_backend"),
+        "train_step_ms": latency_ms,
+        "tokens_per_second": float(record["throughput"]["tokens_per_second"])
+        if "tokens_per_second" in record.get("throughput", {})
+        else None,
+        "peak_delta_bytes": peak_delta,
+        "initial_loss": initial_loss,
+        "initial_logits_rel_l2_vs_dense_lora": logits_rel_l2,
+        "accuracy_metric": accuracy_metric,
+        "accuracy_metric_name": accuracy_metric_name,
+        "replaced_count": int(record.get("replaced_count", 0)),
+        "initial_total_cache_bytes": int(cache_summary.get("total_cache_bytes", 0)),
+        "initial_total_cache_vs_dense_weight": cache_summary.get("total_cache_vs_dense_weight"),
+        "steady_state_total_cache_bytes": int(post_step_cache_summary.get("total_cache_bytes", 0)),
+        "steady_state_total_cache_vs_dense_weight": post_step_cache_summary.get("total_cache_vs_dense_weight"),
+        "total_cache_bytes": int(post_step_cache_summary.get("total_cache_bytes", 0)),
+        "total_cache_vs_dense_weight": post_step_cache_summary.get("total_cache_vs_dense_weight"),
+    }
+    relative_to_dense = record.get("relative_to_dense_lora")
+    if relative_to_dense:
+        row["speedup_vs_dense_lora"] = float(relative_to_dense["train_step_speedup"])
+        row["peak_delta_ratio_vs_dense_lora"] = relative_to_dense["peak_delta_ratio"]
+    return row
+
+
+def _is_summary_row_dominated(row: dict[str, Any], other: dict[str, Any]) -> bool:
+    metrics = ("train_step_ms", "peak_delta_bytes", "accuracy_metric")
+    row_values = {
+        "train_step_ms": float(row["train_step_ms"]),
+        "peak_delta_bytes": float(row["peak_delta_bytes"]),
+        "accuracy_metric": _summary_accuracy_metric(row),
+    }
+    other_values = {
+        "train_step_ms": float(other["train_step_ms"]),
+        "peak_delta_bytes": float(other["peak_delta_bytes"]),
+        "accuracy_metric": _summary_accuracy_metric(other),
+    }
+    no_worse = all(other_values[key] <= row_values[key] for key in metrics)
+    strictly_better = any(other_values[key] < row_values[key] for key in metrics)
+    return bool(no_worse and strictly_better)
+
+
+def build_hf_benchmark_summary(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    rows = [_summary_row(name, record) for name, record in records.items()]
+    dense_rows = [row for row in rows if row["record"] == "dense_lora" or row["variant"] == "dense_lora"]
+    fp4_rows = [row for row in rows if row not in dense_rows]
+    pareto_rows = [
+        row
+        for row in fp4_rows
+        if not any(_is_summary_row_dominated(row, other) for other in fp4_rows if other["record"] != row["record"])
+    ]
+    return {
+        "dense_lora": dense_rows[0] if dense_rows else None,
+        "records_by_train_step_ms": sorted(fp4_rows, key=lambda row: row["train_step_ms"]),
+        "records_by_peak_delta_bytes": sorted(fp4_rows, key=lambda row: row["peak_delta_bytes"]),
+        "records_by_accuracy_metric": sorted(
+            fp4_rows,
+            key=lambda row: (_summary_accuracy_metric(row), row["train_step_ms"]),
+        ),
+        "pareto_frontier": sorted(
+            pareto_rows,
+            key=lambda row: (row["train_step_ms"], row["peak_delta_bytes"], _summary_accuracy_metric(row)),
+        ),
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.target_policy is not None:
@@ -952,6 +1041,7 @@ def main() -> None:
         )
         results["records"][variant] = record
 
+    results["variant_summary"] = build_hf_benchmark_summary(results["records"])
     results["all_passed"] = bool(all(record["all_passed"] for record in results["records"].values()))
 
     stamp = time.strftime("%Y%m%d_%H%M%S")

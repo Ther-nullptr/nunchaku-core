@@ -23,6 +23,7 @@ from benchmark_hf_llama_fp4_lora_finetuning import (  # noqa: E402
     DEFAULT_MODEL_ID,
     FP4_LORA_TARGET_POLICY_MODULES,
     VALID_VARIANTS,
+    build_hf_benchmark_summary,
     build_batch_from_stream,
     dtype_from_name,
     effective_exclude_modules,
@@ -316,6 +317,7 @@ def main() -> None:
         results["records"][init] = record
 
     add_relative_to_base_init(results, base_init="zero")
+    results["init_summary"] = build_hf_benchmark_summary(results["records"])
     results["all_passed"] = bool(all(record["all_passed"] for record in results["records"].values()))
 
     stamp = time.strftime("%Y%m%d_%H%M%S")

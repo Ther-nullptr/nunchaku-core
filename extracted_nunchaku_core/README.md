@@ -959,6 +959,8 @@ python benchmarks/benchmark_hf_llama_fp4_lora_init_sweep.py \
 - `records.<init>.initial_logits_vs_dense_lora.rel_l2`
 - `records.<init>.relative_to_dense_lora.train_step_speedup`
 - `records.<init>.relative_to_base_init.latency_ratio_vs_base_init`
+- `init_summary.records_by_accuracy_metric`
+- `init_summary.pareto_frontier`
 - `records.<init>.fp4_module_configs.*.init`
 
 如果只想继续查敏感模块，可以用同一个脚本缩小替换范围：
@@ -993,6 +995,9 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
 - `records.fp4_balanced.cache_summary.total_cache_bytes`
 - `records.fp4_balanced.post_step_cache_summary.total_cache_bytes`
 - `records.fp4_balanced.initial_logits_vs_dense_lora`
+- `variant_summary.records_by_train_step_ms`
+- `variant_summary.records_by_accuracy_metric`
+- `variant_summary.pareto_frontier`
 - `records.*.selected_modules`
 - `records.*.excluded_selected_modules`
 - `records.*.fp4_module_configs`

@@ -128,6 +128,7 @@ def run_policy(
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         frozen_residual_rank=None if args.frozen_residual_rank is None else args.frozen_residual_rank,
         train_bias=args.train_bias,
@@ -181,6 +182,7 @@ def run_policy(
         )
         lora_down_changed = bool((module.lora_down.detach().float() - lora_down_before.float()).norm().item() > 0.0)
         lora_up_changed = bool((module.lora_up.detach().float() - lora_up_before.float()).norm().item() > 0.0)
+        lora_down_change_expected = not (cfg.init == "zero" and args.steps == 1)
 
     trainable_names = [name for name, param in module.named_parameters() if param.requires_grad]
     expected_trainable = {"lora_down", "lora_up"}
@@ -214,10 +216,11 @@ def run_policy(
         and torch.isfinite(module.lora_up.grad).all()
     )
     checks = {
+        "init_matches": module.init_mode == args.init,
         "expected_flags": actual_flags == expected_flags,
         "loss_finite": bool(torch.isfinite(initial_loss) and torch.isfinite(final_loss)),
         "grads_finite": grads_finite,
-        "lora_params_changed": lora_down_changed and lora_up_changed,
+        "lora_params_changed": lora_up_changed and (lora_down_changed or not lora_down_change_expected),
         "frozen_residual_unchanged": frozen_unchanged,
         "only_expected_params_trainable": set(trainable_names) == expected_trainable,
         "cache_hook_ran_if_needed": hook is None or hook.last_refresh_count > 0,
@@ -240,6 +243,11 @@ def run_policy(
             "initial": float(initial_loss.detach().item()),
             "after_steps": float(final_loss.detach().item()),
         },
+        "param_change": {
+            "lora_down_changed": lora_down_changed,
+            "lora_up_changed": lora_up_changed,
+            "lora_down_change_expected": lora_down_change_expected,
+        },
         "output_change_after_step": tensor_error(final_y, y.detach()),
         "trainable_params": trainable_names,
         "checks": checks,
@@ -254,6 +262,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-features", type=int, default=768)
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--frozen-residual-rank", type=int, default=None)
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="zero")
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
@@ -300,6 +309,7 @@ def main() -> None:
             "in_features": args.in_features,
             "out_features": args.out_features,
             "rank": args.rank,
+            "init": args.init,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "modes": args.modes,

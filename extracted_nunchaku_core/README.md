@@ -877,6 +877,7 @@ cfg = fp4_lora_finetune_config(
 
 ```bash
 python benchmarks/validate_fp4_lora_training_policies.py
+python benchmarks/validate_fp4_lora_training_policies.py --init pissa --modes accuracy balanced --steps 1
 python benchmarks/validate_fp4_lora_training_policies.py --dtype fp16 --lowrank-dtype fp16 --modes throughput --steps 2
 python benchmarks/validate_fp4_lora_training_policies.py --modes balanced memory_saving --backward-weight-policy cache --steps 2
 ```

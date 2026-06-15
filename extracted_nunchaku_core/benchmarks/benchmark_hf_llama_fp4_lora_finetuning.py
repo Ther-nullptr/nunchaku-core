@@ -24,6 +24,7 @@ from native_fp4 import (  # noqa: E402
     FP4LoRAConfig,
     fp4_lora_cache_summary,
     fp4_lora_runtime_state_summary,
+    fp4_lora_sequence_finetune_config,
     fp4_lora_target_modules_for_policy,
     iter_fp4_lora_modules,
     prepare_fp4_lora_finetuning,
@@ -40,9 +41,11 @@ VALID_VARIANTS = (
     "fp4_balanced_reuse_dy_up",
     "fp4_throughput",
     "fp4_throughput_reuse_dy_up",
+    "fp4_auto_seq_policy",
     "fp4_memory_saving",
     "fp4_memory_saving_dequant",
 )
+VALID_AUTO_SEQ_MODES = ("accuracy", "balanced", "throughput", "memory_saving")
 REUSE_DY_UP_VARIANTS = {
     "fp4_balanced_reuse_dy_up": "fp4_balanced",
     "fp4_throughput_reuse_dy_up": "fp4_throughput",
@@ -149,6 +152,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
     parser.add_argument("--include-reuse-policies", action="store_true")
     parser.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
+    parser.add_argument("--auto-seq-policy-threshold-rows", type=int, default=4096)
+    parser.add_argument("--auto-seq-policy-short-mode", choices=VALID_AUTO_SEQ_MODES, default="balanced")
+    parser.add_argument("--auto-seq-policy-long-mode", choices=VALID_AUTO_SEQ_MODES, default="memory_saving")
     parser.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     parser.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
     parser.add_argument("--no-zero-lora-up-fast-path", action="store_true")
@@ -654,10 +660,46 @@ def run_fp4_variant(
         cleanup_model(model)
         raise RuntimeError(f"No nn.Linear modules selected for {variant}")
 
-    mode, backend = variant_to_mode_backend(variant, args.fp4_activation_cache_d_lora_down_backend)
+    sequence_policy_decision = None
+    auto_config = None
+    if variant == "fp4_auto_seq_policy":
+        auto_config, sequence_policy_decision = fp4_lora_sequence_finetune_config(
+            flattened_rows=args.batch_size * args.seq_len,
+            threshold_rows=args.auto_seq_policy_threshold_rows,
+            short_mode=args.auto_seq_policy_short_mode,
+            long_mode=args.auto_seq_policy_long_mode,
+            rank=args.rank,
+            lora_alpha=args.lora_alpha,
+            dtype=dtype,
+            lowrank_dtype=lowrank_dtype,
+            init=args.init,
+            use_frozen_residual=not args.no_frozen_residual,
+            frozen_residual_rank=args.frozen_residual_rank,
+            residual_svd_method=args.residual_svd_method,
+            residual_svd_lowrank_oversample=args.residual_svd_lowrank_oversample,
+            residual_svd_lowrank_niter=args.residual_svd_lowrank_niter,
+            train_bias=args.train_bias,
+            cache_lora_act=not args.no_cache_lora_act,
+            activation_checkpoint=args.activation_checkpoint,
+            backward_weight_policy=args.backward_weight_policy,
+            reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+            overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+            fp4_activation_cache_min_rows=(
+                args.fp4_activation_cache_min_rows
+                if args.fp4_activation_cache_min_rows > 0
+                else None
+            ),
+            fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+            zero_lora_up_fast_path=not args.no_zero_lora_up_fast_path,
+        )
+        mode = sequence_policy_decision.selected_mode
+        backend = auto_config.fp4_activation_cache_d_lora_down_backend
+    else:
+        mode, backend = variant_to_mode_backend(variant, args.fp4_activation_cache_d_lora_down_backend)
     convert_start = time.perf_counter()
     result = prepare_fp4_lora_finetuning(
         model,
+        config=auto_config,
         mode=mode,
         rank=args.rank,
         lora_alpha=args.lora_alpha,
@@ -745,8 +787,13 @@ def run_fp4_variant(
         for param in group["params"]
     )
     all_module_backends_match = all(child.fp4_activation_cache_d_lora_down_backend == backend for child in fp4_modules.values())
+    expected_activation_cache_min_rows = (
+        auto_config.fp4_activation_cache_min_rows
+        if auto_config is not None
+        else args.fp4_activation_cache_min_rows
+    )
     all_module_activation_cache_min_rows_match = all(
-        child.fp4_activation_cache_min_rows == args.fp4_activation_cache_min_rows
+        child.fp4_activation_cache_min_rows == expected_activation_cache_min_rows
         for child in fp4_modules.values()
     )
     all_module_backward_weight_policies_match = all(
@@ -764,6 +811,7 @@ def run_fp4_variant(
     record: dict[str, Any] = {
         "variant": variant,
         "mode": mode,
+        "sequence_policy": None if sequence_policy_decision is None else asdict(sequence_policy_decision),
         "fp4_activation_cache_d_lora_down_backend": backend,
         "reuse_fused_dy_up_for_d_lora_down": bool(result.config.reuse_fused_dy_up_for_d_lora_down),
         "config": jsonable_config(result.config),
@@ -879,6 +927,9 @@ def _summary_row(record_name: str, record: dict[str, Any]) -> dict[str, Any]:
         "mode": record.get("mode"),
         "init": record.get("init"),
         "backend": record.get("fp4_activation_cache_d_lora_down_backend"),
+        "sequence_policy_selected_mode": None
+        if record.get("sequence_policy") is None
+        else record["sequence_policy"].get("selected_mode"),
         "reuse_fused_dy_up_for_d_lora_down": bool(record.get("reuse_fused_dy_up_for_d_lora_down", False)),
         "train_step_ms": latency_ms,
         "tokens_per_second": float(record["throughput"]["tokens_per_second"])
@@ -1049,6 +1100,9 @@ def main() -> None:
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
             "include_reuse_policies": args.include_reuse_policies,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
+            "auto_seq_policy_threshold_rows": args.auto_seq_policy_threshold_rows,
+            "auto_seq_policy_short_mode": args.auto_seq_policy_short_mode,
+            "auto_seq_policy_long_mode": args.auto_seq_policy_long_mode,
             "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
             "zero_lora_up_fast_path": not args.no_zero_lora_up_fast_path,

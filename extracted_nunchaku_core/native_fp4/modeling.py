@@ -93,6 +93,21 @@ class FP4LoRAConfig:
 
 
 @dataclass(frozen=True)
+class FP4LoRASequencePolicyDecision:
+    """Shape-based policy decision for one fixed fine-tuning batch shape."""
+
+    flattened_rows: int
+    threshold_rows: int
+    short_mode: FP4LoRAFinetuneMode
+    long_mode: FP4LoRAFinetuneMode
+    selected_mode: FP4LoRAFinetuneMode
+    fp4_activation_cache_min_rows: int
+    fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend
+    fp4_activation_cache_active_for_rows: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class FP4LoRACacheSummary:
     """Resident cache footprint for converted FP4 LoRA modules."""
 
@@ -305,6 +320,105 @@ def fp4_lora_finetune_config(
         fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
         zero_lora_up_fast_path=bool(zero_lora_up_fast_path),
     )
+
+
+def fp4_lora_sequence_finetune_config(
+    *,
+    batch_size: int | None = None,
+    seq_len: int | None = None,
+    flattened_rows: int | None = None,
+    threshold_rows: int = 4096,
+    short_mode: FP4LoRAFinetuneMode = "balanced",
+    long_mode: FP4LoRAFinetuneMode = "memory_saving",
+    rank: int = 32,
+    lora_alpha: float | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    lowrank_dtype: torch.dtype | None = None,
+    init: LoRAInitMode = "zero",
+    use_frozen_residual: bool = True,
+    frozen_residual_rank: int | None = None,
+    residual_svd_method: ResidualSVDMethod | None = None,
+    residual_svd_lowrank_oversample: int = 8,
+    residual_svd_lowrank_niter: int = 2,
+    train_bias: bool = False,
+    cache_lora_act: bool = True,
+    activation_checkpoint: bool = False,
+    backward_weight_policy: FP4BackwardWeightPolicy = "repack",
+    reuse_fused_dy_up_for_d_lora_down: bool = False,
+    overlap_lora_grad_min_rows: int = DEFAULT_OVERLAP_LORA_GRAD_MIN_ROWS,
+    fp4_activation_cache_min_rows: int | None = None,
+    fp4_activation_cache_d_lora_down_backend: FP4ActivationCacheDLoRADownBackend = "fused",
+    zero_lora_up_fast_path: bool = True,
+) -> tuple[FP4LoRAConfig, FP4LoRASequencePolicyDecision]:
+    """Return a shape-aware FP4 LoRA config and the policy decision.
+
+    This is the high-level dispatcher counterpart to the lower-level kernel
+    shape gates: short/decode-like batches can stay on an exact preset, while
+    long/prefill-like batches can opt into ``memory_saving`` or another long
+    preset. ``flattened_rows`` is ``batch_size * seq_len`` for transformer
+    token batches.
+    """
+
+    if flattened_rows is None:
+        if batch_size is None or seq_len is None:
+            raise ValueError("Provide flattened_rows or both batch_size and seq_len")
+        if batch_size <= 0 or seq_len <= 0:
+            raise ValueError("batch_size and seq_len must be positive")
+        rows = int(batch_size) * int(seq_len)
+    else:
+        if batch_size is not None or seq_len is not None:
+            raise ValueError("Provide either flattened_rows or batch_size/seq_len, not both")
+        rows = int(flattened_rows)
+    if rows <= 0:
+        raise ValueError("flattened_rows must be positive")
+    if threshold_rows < 0:
+        raise ValueError("threshold_rows must be non-negative")
+    if short_mode not in ("accuracy", "balanced", "throughput", "memory_saving"):
+        raise ValueError("short_mode must be one of: accuracy, balanced, throughput, memory_saving")
+    if long_mode not in ("accuracy", "balanced", "throughput", "memory_saving"):
+        raise ValueError("long_mode must be one of: accuracy, balanced, throughput, memory_saving")
+
+    threshold = int(threshold_rows)
+    selected_mode = long_mode if rows >= threshold else short_mode
+    activation_cache_min_rows = threshold if fp4_activation_cache_min_rows is None else int(
+        fp4_activation_cache_min_rows
+    )
+    cfg = fp4_lora_finetune_config(
+        mode=selected_mode,
+        rank=rank,
+        lora_alpha=lora_alpha,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        init=init,
+        use_frozen_residual=use_frozen_residual,
+        frozen_residual_rank=frozen_residual_rank,
+        residual_svd_method=residual_svd_method,
+        residual_svd_lowrank_oversample=residual_svd_lowrank_oversample,
+        residual_svd_lowrank_niter=residual_svd_lowrank_niter,
+        train_bias=train_bias,
+        cache_lora_act=cache_lora_act,
+        activation_checkpoint=activation_checkpoint,
+        backward_weight_policy=backward_weight_policy,
+        reuse_fused_dy_up_for_d_lora_down=reuse_fused_dy_up_for_d_lora_down,
+        overlap_lora_grad_min_rows=overlap_lora_grad_min_rows,
+        fp4_activation_cache_min_rows=activation_cache_min_rows,
+        fp4_activation_cache_d_lora_down_backend=fp4_activation_cache_d_lora_down_backend,
+        zero_lora_up_fast_path=zero_lora_up_fast_path,
+    )
+    fp4_cache_active = bool(cfg.fp4_activation_cache_d_lora_down and rows >= cfg.fp4_activation_cache_min_rows)
+    comparator = ">=" if rows >= threshold else "<"
+    decision = FP4LoRASequencePolicyDecision(
+        flattened_rows=rows,
+        threshold_rows=threshold,
+        short_mode=short_mode,
+        long_mode=long_mode,
+        selected_mode=selected_mode,
+        fp4_activation_cache_min_rows=cfg.fp4_activation_cache_min_rows,
+        fp4_activation_cache_d_lora_down_backend=cfg.fp4_activation_cache_d_lora_down_backend,
+        fp4_activation_cache_active_for_rows=fp4_cache_active,
+        reason=f"flattened_rows {comparator} threshold_rows",
+    )
+    return cfg, decision
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:

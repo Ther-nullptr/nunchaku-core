@@ -20,6 +20,7 @@ from native_fp4 import (  # noqa: E402
     NunchakuFP4LoRALinear,
     fp4_lora_finetune_config,
     fp4_lora_parameter_groups,
+    fp4_lora_sequence_finetune_config,
     register_fp4_lora_cache_refresh_hook,
 )
 
@@ -284,6 +285,68 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def validate_sequence_policy(
+    args: argparse.Namespace,
+    *,
+    dtype: torch.dtype,
+    lowrank_dtype: torch.dtype,
+) -> dict[str, Any]:
+    threshold = max(2, int(args.m) + 1)
+    short_cfg, short_decision = fp4_lora_sequence_finetune_config(
+        flattened_rows=threshold - 1,
+        threshold_rows=threshold,
+        short_mode="balanced",
+        long_mode="memory_saving",
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        init=args.init,
+        use_frozen_residual=not args.no_frozen_residual,
+        frozen_residual_rank=args.frozen_residual_rank,
+        train_bias=args.train_bias,
+        backward_weight_policy=args.backward_weight_policy,
+        overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+    )
+    long_cfg, long_decision = fp4_lora_sequence_finetune_config(
+        flattened_rows=threshold,
+        threshold_rows=threshold,
+        short_mode="balanced",
+        long_mode="memory_saving",
+        rank=args.rank,
+        dtype=dtype,
+        lowrank_dtype=lowrank_dtype,
+        init=args.init,
+        use_frozen_residual=not args.no_frozen_residual,
+        frozen_residual_rank=args.frozen_residual_rank,
+        train_bias=args.train_bias,
+        backward_weight_policy=args.backward_weight_policy,
+        overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
+        fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
+    )
+    checks = {
+        "short_selects_balanced": short_decision.selected_mode == "balanced",
+        "short_keeps_exact_d_lora_down": not short_cfg.fp4_activation_cache_d_lora_down,
+        "long_selects_memory_saving": long_decision.selected_mode == "memory_saving",
+        "long_enables_fp4_activation_cache": long_cfg.fp4_activation_cache_d_lora_down,
+        "long_uses_threshold_as_activation_cache_gate": long_cfg.fp4_activation_cache_min_rows == threshold,
+        "long_policy_marks_cache_active": long_decision.fp4_activation_cache_active_for_rows,
+        "backend_is_forwarded": (
+            long_cfg.fp4_activation_cache_d_lora_down_backend
+            == args.fp4_activation_cache_d_lora_down_backend
+        ),
+    }
+    return {
+        "threshold_rows": threshold,
+        "short_config": jsonable_config(short_cfg),
+        "short_decision": asdict(short_decision),
+        "long_config": jsonable_config(long_cfg),
+        "long_decision": asdict(long_decision),
+        "checks": checks,
+        "all_passed": bool(all(checks.values())),
+    }
+
+
 def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
@@ -302,6 +365,7 @@ def main() -> None:
         )
         for mode in args.modes
     ]
+    sequence_policy = validate_sequence_policy(args, dtype=dtype, lowrank_dtype=lowrank_dtype)
 
     payload = {
         "shape": {
@@ -322,7 +386,8 @@ def main() -> None:
             "steps": args.steps,
         },
         "policies": {record["mode"]: record for record in records},
-        "all_passed": bool(all(record["all_passed"] for record in records)),
+        "sequence_policy": sequence_policy,
+        "all_passed": bool(all(record["all_passed"] for record in records) and sequence_policy["all_passed"]),
     }
 
     os.makedirs(args.results_dir, exist_ok=True)

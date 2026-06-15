@@ -967,6 +967,31 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --prime-steps 1
 ```
 
+如果希望按当前 batch/seq 的 flattened row 数自动选择短序列/长序列策略，可以加入 `fp4_auto_seq_policy`：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_auto_seq_policy \
+  --batch-size 1 \
+  --seq-len 4096 \
+  --rank 32 \
+  --dtype bf16 \
+  --lowrank-dtype bf16 \
+  --auto-seq-policy-threshold-rows 4096 \
+  --auto-seq-policy-short-mode balanced \
+  --auto-seq-policy-long-mode memory_saving \
+  --fp4-activation-cache-d-lora-down-backend dequant_gemm \
+  --warmup 1 \
+  --iters 3 \
+  --prime-steps 1
+```
+
+该变体内部调用 `fp4_lora_sequence_finetune_config`：当 `batch_size * seq_len < threshold_rows` 时使用 `short_mode`，否则使用 `long_mode`。如果 long mode 是 `memory_saving`，默认把 `fp4_activation_cache_min_rows` 设为同一个阈值，因此同一策略在短序列上会自动回 exact saved-x，长序列上才启用 FP4 activation-cache `dA`。JSON 中看：
+
+- `records.fp4_auto_seq_policy.sequence_policy`
+- `records.fp4_auto_seq_policy.mode`
+- `records.fp4_auto_seq_policy.config.fp4_activation_cache_min_rows`
+
 要把真实模型 FP4 LoRA 初始化切到 QPiSSA-style，可以改用 `--init pissa`；结果 JSON 会在 `fp4_options.init` 和 `records.*.fp4_module_configs.*.init` 里记录实际策略。
 
 如果要在同一批 WikiText-2 token 上直接比较 zero/PiSSA/residual_svd 初始化，使用 init sweep：
@@ -1058,6 +1083,7 @@ RTX 5090 验证结果：
 
 - BF16 `accuracy/balanced/throughput/memory_saving`：全部通过，LoRA A/B 更新、frozen residual 不变、optimizer cache hook 按需运行；`throughput` 会自动配置 `fuse_frozen_residual_dx=True` 且 `overlap_lora_grad=False`。
 - FP16 `throughput`：自动配置 `fuse_frozen_residual_dx=True` 且 `overlap_lora_grad=False`，通过。
+- `fp4_lora_sequence_finetune_config`：短序列选择 `balanced`，长序列选择 `memory_saving`，并正确下发 `fp4_activation_cache_min_rows` 和 backend。
 
 `prepare_fp4_lora_finetuning` 是推荐的真实微调入口，会一次性完成：
 
@@ -1684,6 +1710,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`reuse_fused_dy_up_for_d_lora_down`、`zero_lora_up_fast_path`、`fp4_activation_cache_d_lora_down`、`fp4_activation_cache_min_rows`、`fp4_activation_cache_d_lora_down_backend` 和 FP16/BF16 `fuse_frozen_residual_dx`
 - `native_fp4.fp4_lora_finetune_config`
   - 生成 `accuracy/balanced/throughput/memory_saving` 训练 preset，默认 `init="zero"`，也支持 `init="pissa"` 用于 QPiSSA-style 真实模型初始化实验
+- `native_fp4.fp4_lora_sequence_finetune_config`
+  - 基于 `flattened_rows` 或 `batch_size * seq_len` 生成 shape-aware config；常用策略是短序列 `balanced`、长序列 `memory_saving`，用于 prefill/decode 或长短序列混合实验
 - `native_fp4.fp4_lora_target_modules_for_policy`
   - 返回内置 target policy 对应的 projection 列表；高层 `prepare_fp4_lora_finetuning(..., target_policy=...)` 和 HF benchmark 的 `--target-policy` 共用同一套策略
 - `native_fp4.convert_linear_to_fp4_lora`

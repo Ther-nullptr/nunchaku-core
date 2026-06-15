@@ -102,7 +102,32 @@ python -c "from native_fp4 import NunchakuFP4GemmOp, NunchakuFP4LowRankOp, Nunch
 
 如果这里失败，不要急着跑 benchmark，先回去重编译。
 
-## 5.1 Native FP8 最小验证
+## 5.1 长实验用 tmux 管理
+
+后续 LLaMA/WikiText 或 kernel sweep 这类长实验建议用内置 launcher，避免 SSH/终端断开导致实验丢失，并且每次都会保留日志和 metadata：
+
+```bash
+conda run -n triton python scripts/run_tmux_experiment.py start llama_lora_bench -- \
+  python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+    --variants dense_lora fp4_balanced fp4_throughput \
+    --batch-size 1 \
+    --seq-len 128 \
+    --warmup 2 \
+    --iters 5
+```
+
+常用管理命令：
+
+```bash
+conda run -n triton python scripts/run_tmux_experiment.py ls
+conda run -n triton python scripts/run_tmux_experiment.py status llama_lora_bench
+conda run -n triton python scripts/run_tmux_experiment.py tail llama_lora_bench -n 120
+conda run -n triton tmux attach -t nunchaku_llama_lora_bench
+```
+
+日志默认写到 `runs/tmux/`，该目录已加入 `.gitignore`。脚本默认用 `--conda-env triton` 包住实验命令；如果你已经手动处理环境，可以传 `--conda-env ""`。
+
+## 5.2 Native FP8 最小验证
 
 FP8 当前提供两个后端：
 

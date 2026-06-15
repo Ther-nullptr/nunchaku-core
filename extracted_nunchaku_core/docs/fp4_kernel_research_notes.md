@@ -10,8 +10,15 @@
 - `/home/wyj24/projects/personal-vault/wiki/projects/fp4-low-bit-finetuning/reference/qlora-efficient-finetuning-of-quantized-llms.md`
 - `/home/wyj24/projects/mlsys2026-flashinfer-contest/prompts/README.md`
 - `/home/wyj24/projects/kernel-design-agents/docs/agent-flow.md`
+- `/home/wyj24/projects/mlsys2026-flashinfer-contest-solution/README.md`
+- `/home/wyj24/projects/mlsys2026-flashinfer-contest-solution/verify.py`
+- `/home/wyj24/projects/mlsys2026-flashinfer-contest-solution/submissions/moe-fp8/solution/python/main.py`
+- `/home/wyj24/projects/mlsys2026-flashinfer-contest-solution/submissions/gdn-prefill/solution/python/main.py`
 - `/home/wyj24/projects/KernelWiki/wiki/kernels/nvfp4-gemm.md`
 - `/home/wyj24/projects/KernelWiki/wiki/hardware/nvfp4.md`
+- `/home/wyj24/projects/KernelWiki/wiki/techniques/kernel-fusion.md`
+- `/home/wyj24/projects/KernelWiki/wiki/techniques/epilogue-fusion.md`
+- `/home/wyj24/projects/KernelWiki/wiki/patterns/memory-bound.md`
 - `/home/wyj24/projects/KernelWiki/sources/prs/sglang/PR-10101.md`
 - `/home/wyj24/projects/KernelWiki/sources/prs/flashinfer/PR-2660.md`
 - `/home/wyj24/projects/KernelWiki/sources/prs/cutlass/PR-2995.md`
@@ -21,6 +28,8 @@
 - personal-vault 的核心假设是 SVDQuant 双分支扩展到可微调：冻结 FP4 backbone + BF16/FP16 trainable LoRA。当前 `NunchakuFP4LoRALinear` 已覆盖 autograd、optimizer 参数组、LoRA-only checkpoint、outlier overrides 和 activation-cache 显存模式。
 - KernelWiki 的 `kernel-nvfp4-gemm` 说明标准大 GEMM 的正确方向是 Blackwell tensor core / TMEM / TMA / block-scale pipeline；当前 forward/dX backbone 已经复用 Nunchaku 原生 FP4 GEMM 路径。
 - `fp4_activation_cache_lora_down_grad` 不是标准大 GEMM，而是 `rank x K` 的 skinny reduction：`dA = (dY @ B).T @ dequant(qact)`。因此本轮不直接迁移完整 tcgen05 GEMM，而是按 Kernel Design Agents 的流程做小候选、验证、benchmark、保留/拒绝。
+- `mlsys2026-flashinfer-contest-solution` 的可迁移工程模式不是直接复制某个 kernel，而是固定实验闭环：提交入口自包含、按 shape 分派、JIT/cache 只做一次、verification harness 固定 warmup/iters/容差并汇总 speedup。当前工程新增 `scripts/run_tmux_experiment.py`，把长实验统一成 tmux session + log + metadata，避免 benchmark 证据散落在临时 shell 中。
+- `moe-fp8` 的四路径分派和 `gdn-prefill` 的 short/long path dispatcher 对当前 FP4 LoRA 的启示是：不要把所有形状强行交给同一个 kernel。当前接口已经采用 `overlap_lora_grad_min_rows`、`fp4_activation_cache_min_rows`、`fp4_activation_cache_d_lora_down_backend`、target policy 和 sensitivity/outlier overrides 做 shape/policy 分派；后续新增 kernel 候选也应先接入这些 gate，再进入默认 preset。
 
 ## 本轮候选记录
 

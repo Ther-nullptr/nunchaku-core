@@ -377,8 +377,10 @@ void fp4_activation_cache_lora_down_grad_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (rank <= 32) {
-        // Rank-32 LoRA is the common finetuning case. Reduce column CTA count
-        // while keeping rank tiling narrow enough to avoid high accumulator pressure.
+        // Rank-32 LoRA is the common finetuning case. A full-rank tile
+        // (rVec=32) reduces repeated FP4 activation dequantization, but was
+        // slower on RTX 5090 because of higher dy traffic / lower occupancy.
+        // Keep the split-rank tile with a wider column vector.
         constexpr int kVec = 4;
         constexpr int rVec = 16;
         constexpr int kThreads = 128;

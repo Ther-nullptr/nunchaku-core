@@ -112,6 +112,7 @@ conda run -n triton python scripts/run_tmux_experiment.py start llama_lora_bench
     --variants dense_lora fp4_balanced fp4_throughput \
     --batch-size 1 \
     --seq-len 128 \
+    --grad-accum-steps 4 \
     --warmup 2 \
     --iters 5
 ```
@@ -958,6 +959,7 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --variants dense_lora fp4_balanced fp4_throughput fp4_memory_saving \
   --batch-size 1 \
   --seq-len 128 \
+  --grad-accum-steps 4 \
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16 \
@@ -991,6 +993,14 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
 - `records.fp4_auto_seq_policy.sequence_policy`
 - `records.fp4_auto_seq_policy.mode`
 - `records.fp4_auto_seq_policy.config.fp4_activation_cache_min_rows`
+
+如果要模拟真实微调里的多 micro-batch 梯度累积，使用 `--grad-accum-steps N`。脚本会从 WikiText-2 token stream 连续取 `N` 个 batch，在一次 `optimizer.step()` 前依次执行 `forward + backward` 并按 `1/N` 缩放 loss。结果口径如下：
+
+- `latency_ms.train_step_with_optimizer` 是一次 optimizer step 的端到端耗时，包含所有 micro-batch。
+- `throughput.tokens_per_second` 按 `batch_size * seq_len * grad_accum_steps` 计算。
+- `throughput.steps_per_second` 是 optimizer steps/s。
+- `throughput.micro_steps_per_second` 是 micro-batch steps/s。
+- `train.tokens_per_micro_step` 和 `train.tokens_per_optimizer_step` 分别记录单个 micro-batch 与一次 optimizer step 的 token 数。
 
 要把真实模型 FP4 LoRA 初始化切到 QPiSSA-style，可以改用 `--init pissa`；结果 JSON 会在 `fp4_options.init` 和 `records.*.fp4_module_configs.*.init` 里记录实际策略。
 

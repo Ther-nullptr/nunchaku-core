@@ -140,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--prime-steps", type=int, default=1)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--no-frozen-residual", action="store_true")
     parser.add_argument("--frozen-residual-rank", type=int, default=None)
     parser.add_argument("--residual-svd-method", choices=["full_svd", "svd_lowrank"], default=None)
@@ -300,6 +301,28 @@ def build_batch_from_stream(
         "attention_mask": torch.ones_like(input_ids),
         "labels": input_ids.clone(),
     }
+
+
+def build_batches_from_stream(
+    token_stream: torch.Tensor,
+    *,
+    seq_len: int,
+    batch_size: int,
+    offset_tokens: int,
+    grad_accum_steps: int,
+) -> list[dict[str, torch.Tensor]]:
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive")
+    stride = batch_size * seq_len
+    return [
+        build_batch_from_stream(
+            token_stream,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            offset_tokens=offset_tokens + step * stride,
+        )
+        for step in range(grad_accum_steps)
+    ]
 
 
 def module_name_matches(full_name: str, child_name: str, patterns: tuple[str, ...]) -> bool:
@@ -468,12 +491,21 @@ def forward_loss(model: nn.Module, batch: dict[str, torch.Tensor]) -> tuple[torc
     return outputs.loss, outputs.logits
 
 
-def train_step(model: nn.Module, batch: dict[str, torch.Tensor], optimizer: torch.optim.Optimizer) -> torch.Tensor:
+def train_step(
+    model: nn.Module,
+    batches: list[dict[str, torch.Tensor]],
+    optimizer: torch.optim.Optimizer,
+) -> torch.Tensor:
     zero_grads(model, optimizer)
-    loss, _ = forward_loss(model, batch)
-    loss.backward()
+    loss_sum: torch.Tensor | None = None
+    scale = 1.0 / float(len(batches))
+    for batch in batches:
+        loss, _ = forward_loss(model, batch)
+        loss.mul(scale).backward()
+        loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
     optimizer.step()
-    return loss.detach()
+    assert loss_sum is not None
+    return loss_sum / float(len(batches))
 
 
 def time_cuda(fn, *, warmup: int, iters: int) -> float:
@@ -535,13 +567,13 @@ def variant_uses_reuse_dy_up(variant: str, global_reuse: bool) -> bool:
 
 def run_prime_steps(
     model: nn.Module,
-    batch: dict[str, torch.Tensor],
+    batches: list[dict[str, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
     prime_steps: int,
 ) -> list[float]:
     losses: list[float] = []
     for _ in range(prime_steps):
-        loss = train_step(model, batch, optimizer)
+        loss = train_step(model, batches, optimizer)
         losses.append(float(loss.item()))
     torch.cuda.synchronize()
     return losses
@@ -553,7 +585,7 @@ def run_dense_lora_variant(
     model_dir: str,
     dtype: torch.dtype,
     lowrank_dtype: torch.dtype,
-    batch: dict[str, torch.Tensor],
+    batches: list[dict[str, torch.Tensor]],
 ) -> tuple[dict[str, Any], torch.Tensor]:
     torch.manual_seed(args.seed)
     model = load_model(model_dir, dtype=dtype, attn_implementation=args.attn_implementation)
@@ -582,18 +614,19 @@ def run_dense_lora_variant(
         lr=args.lr,
     )
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=args.adam_eps)
+    batch = batches[0]
 
     with torch.no_grad():
         initial_loss, initial_logits = forward_loss(model, batch)
     initial_logits_ref = initial_logits.detach().float().cpu()
-    prime_losses = run_prime_steps(model, batch, optimizer, args.prime_steps)
+    prime_losses = run_prime_steps(model, batches, optimizer, args.prime_steps)
 
     def fn() -> None:
-        train_step(model, batch, optimizer)
+        train_step(model, batches, optimizer)
 
     latency_ms = time_cuda(fn, warmup=args.warmup, iters=args.iters)
     peak_delta, peak_baseline, peak = measure_peak_delta(fn)
-    final_loss = train_step(model, batch, optimizer)
+    final_loss = train_step(model, batches, optimizer)
     grads_finite = all(
         param.grad is not None and bool(torch.isfinite(param.grad).all())
         for group in param_groups
@@ -614,8 +647,9 @@ def run_dense_lora_variant(
             "train_step_with_optimizer": latency_ms,
         },
         "throughput": {
-            "tokens_per_second": args.batch_size * args.seq_len * 1000.0 / latency_ms,
+            "tokens_per_second": args.batch_size * args.seq_len * args.grad_accum_steps * 1000.0 / latency_ms,
             "steps_per_second": 1000.0 / latency_ms,
+            "micro_steps_per_second": args.grad_accum_steps * 1000.0 / latency_ms,
         },
         "peak_memory_bytes": {
             "train_step_delta": peak_delta,
@@ -645,7 +679,7 @@ def run_fp4_variant(
     model_dir: str,
     dtype: torch.dtype,
     lowrank_dtype: torch.dtype,
-    batch: dict[str, torch.Tensor],
+    batches: list[dict[str, torch.Tensor]],
     dense_initial_logits: torch.Tensor | None,
     dense_latency_ms: float | None,
     dense_peak_delta: int | None,
@@ -757,6 +791,7 @@ def run_fp4_variant(
         else None
     )
     runtime_state_before_prime = fp4_lora_runtime_state_summary(result.model)
+    batch = batches[0]
 
     with torch.no_grad():
         initial_loss, initial_logits = forward_loss(result.model, batch)
@@ -764,18 +799,18 @@ def run_fp4_variant(
     if dense_initial_logits is not None:
         initial_error_vs_dense = tensor_error(initial_logits.detach().float().cpu(), dense_initial_logits)
 
-    prime_losses = run_prime_steps(result.model, batch, optimizer, args.prime_steps)
+    prime_losses = run_prime_steps(result.model, batches, optimizer, args.prime_steps)
     runtime_state_before_timing = fp4_lora_runtime_state_summary(result.model)
     zero_up_can_affect_measured_iters = bool(
         runtime_state_before_timing.zero_lora_up_fast_path_active_count > 0 and args.warmup == 0
     )
 
     def fn() -> None:
-        train_step(result.model, batch, optimizer)
+        train_step(result.model, batches, optimizer)
 
     latency_ms = time_cuda(fn, warmup=args.warmup, iters=args.iters)
     peak_delta, peak_baseline, peak = measure_peak_delta(fn)
-    final_loss = train_step(result.model, batch, optimizer)
+    final_loss = train_step(result.model, batches, optimizer)
     torch.cuda.synchronize()
     post_step_cache_summary = fp4_lora_cache_summary(result.model)
     runtime_state_after_final_step = fp4_lora_runtime_state_summary(result.model)
@@ -853,6 +888,7 @@ def run_fp4_variant(
             "prime_steps": int(args.prime_steps),
             "warmup": int(args.warmup),
             "iters": int(args.iters),
+            "grad_accum_steps": int(args.grad_accum_steps),
             "zero_lora_up_fast_path_active_at_timing_entry": int(
                 runtime_state_before_timing.zero_lora_up_fast_path_active_count
             ),
@@ -869,8 +905,9 @@ def run_fp4_variant(
             "train_step_with_optimizer": latency_ms,
         },
         "throughput": {
-            "tokens_per_second": args.batch_size * args.seq_len * 1000.0 / latency_ms,
+            "tokens_per_second": args.batch_size * args.seq_len * args.grad_accum_steps * 1000.0 / latency_ms,
             "steps_per_second": 1000.0 / latency_ms,
+            "micro_steps_per_second": args.grad_accum_steps * 1000.0 / latency_ms,
         },
         "peak_memory_bytes": {
             "train_step_delta": peak_delta,
@@ -1017,6 +1054,8 @@ def main() -> None:
         raise ValueError("--iters must be positive")
     if args.warmup < 0 or args.prime_steps < 0:
         raise ValueError("--warmup and --prime-steps must be non-negative")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("--grad-accum-steps must be positive")
 
     torch.manual_seed(args.seed)
     set_hf_mirror(args.hf_endpoint)
@@ -1034,11 +1073,12 @@ def main() -> None:
         dataset_split=args.dataset_split,
         dataset_max_docs=args.dataset_max_docs,
     )
-    batch = build_batch_from_stream(
+    batches = build_batches_from_stream(
         token_stream,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         offset_tokens=args.dataset_offset_tokens,
+        grad_accum_steps=args.grad_accum_steps,
     )
 
     variants = expand_variants_for_reuse(
@@ -1077,6 +1117,9 @@ def main() -> None:
             "warmup": args.warmup,
             "iters": args.iters,
             "prime_steps": args.prime_steps,
+            "grad_accum_steps": args.grad_accum_steps,
+            "tokens_per_micro_step": args.batch_size * args.seq_len,
+            "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
             "model_gradient_checkpointing": args.model_gradient_checkpointing,
         },
         "dataset": {
@@ -1140,7 +1183,7 @@ def main() -> None:
             model_dir=model_dir,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
-            batch=batch,
+            batches=batches,
         )
         results["records"]["dense_lora"] = dense_record
         dense_latency_ms = dense_record["latency_ms"]["train_step_with_optimizer"]
@@ -1155,7 +1198,7 @@ def main() -> None:
             model_dir=model_dir,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
-            batch=batch,
+            batches=batches,
             dense_initial_logits=dense_initial_logits,
             dense_latency_ms=dense_latency_ms,
             dense_peak_delta=dense_peak_delta,

@@ -942,6 +942,25 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
 
 要把真实模型 FP4 LoRA 初始化切到 QPiSSA-style，可以改用 `--init pissa`；结果 JSON 会在 `fp4_options.init` 和 `records.*.fp4_module_configs.*.init` 里记录实际策略。
 
+如果要在同一批 WikiText-2 token 上直接比较 zero/PiSSA/residual_svd 初始化，使用 init sweep：
+
+```bash
+python benchmarks/benchmark_hf_llama_fp4_lora_init_sweep.py \
+  --fp4-variant fp4_balanced \
+  --inits zero pissa \
+  --batch-size 1 \
+  --seq-len 64 \
+  --warmup 1 \
+  --iters 3
+```
+
+输出 `results/latest_hf_llama_fp4_lora_init_sweep.json`。重点字段：
+
+- `records.<init>.initial_logits_vs_dense_lora.rel_l2`
+- `records.<init>.relative_to_dense_lora.train_step_speedup`
+- `records.<init>.relative_to_base_init.latency_ratio_vs_base_init`
+- `records.<init>.fp4_module_configs.*.init`
+
 如果只想继续查敏感模块，可以用同一个脚本缩小替换范围：
 
 ```bash
@@ -1697,6 +1716,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 高层 `prepare_fp4_lora_finetuning` preset 相对 dense LoRA baseline 的模型级 train step、optimizer/cache hook、peak memory 和 forward 误差消融
 - `latest_hf_llama_fp4_lora_finetuning.json`
   - 真实 HF/LLaMA + WikiText-2 上 dense LoRA 与 FP4 LoRA preset 的 train step、初始 logits 误差、峰值显存和实际替换模块
+- `latest_hf_llama_fp4_lora_init_sweep.json`
+  - 真实 HF/LLaMA + WikiText-2 上 zero/PiSSA/residual_svd 等 FP4 LoRA init 的同 batch 对比
 - `latest_hf_llama_fp4_lora_policy_sweep.json`
   - 真实 HF/LLaMA + WikiText-2 上 base、task-rank bump、frozen-residual bump、residual-only 和 keep-dense outlier 策略的同 batch 对比
 - `latest_fp4_lora_initialization.json`

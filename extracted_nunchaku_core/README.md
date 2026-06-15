@@ -891,11 +891,12 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16 \
+  --init zero \
   --warmup 3 \
   --iters 5
 ```
 
-输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`cache_summary.total_cache_bytes`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。
+输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `config.init`、`latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`cache_summary.total_cache_bytes`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。要对比 QPiSSA-style 初始化，改用 `--init pissa`。
 
 真实 LLaMA/WikiText-2 训练 step benchmark 使用：
 
@@ -1123,7 +1124,7 @@ RTX 5090 BF16 `2048^2, rank32, weight_std=0.02` 短测：
 
 ### 10.5.2 单层微调收敛验证
 
-验证推荐训练形态是否真的可优化：冻结 FP4 backbone 和 frozen `residual_svd` 量化补偿，只训练 zero-init task LoRA。默认 `target_base=fp4_initial`，即 teacher 目标为初始 `FP4 + frozen residual` 输出再叠加一个低秩 task delta；这样不会要求 LoRA 去拟合高秩 FP4 量化误差，验证点集中在 LoRA 梯度、optimizer 和 fused dX cache 路径。
+验证推荐训练形态是否真的可优化：冻结 FP4 backbone 和 frozen `residual_svd` 量化补偿，只训练 task LoRA，默认 `--init zero`。默认 `target_base=fp4_initial`，即 teacher 目标为初始 `FP4 + frozen residual` 输出再叠加一个低秩 task delta；这样不会要求 LoRA 去拟合高秩 FP4 量化误差，验证点集中在 LoRA 梯度、optimizer 和 fused dX cache 路径。要做 PiSSA 收敛消融，可追加 `--init pissa`。
 
 ```bash
 python benchmarks/validate_fp4_lora_finetune_convergence.py

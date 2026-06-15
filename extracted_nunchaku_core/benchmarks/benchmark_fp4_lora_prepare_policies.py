@@ -275,6 +275,7 @@ def run_record(
         model,
         mode=mode,
         rank=args.rank,
+        init=args.init,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
         use_frozen_residual=not args.no_frozen_residual,
@@ -321,6 +322,7 @@ def run_record(
     all_module_backward_weight_policies_match = all(
         child.backward_weight_policy == args.backward_weight_policy for child in fp4_modules.values()
     )
+    all_module_init_match = all(child.init_mode == args.init for child in fp4_modules.values())
     grads_finite = all(
         param.grad is not None and bool(torch.isfinite(param.grad).all())
         for group in result.optimizer_param_groups
@@ -344,6 +346,7 @@ def run_record(
         "module_backends_match": all_module_backends_match,
         "module_activation_cache_min_rows_match": all_module_activation_cache_min_rows_match,
         "module_backward_weight_policies_match": all_module_backward_weight_policies_match,
+        "module_init_match": all_module_init_match,
         "latency_positive": latency_ms > 0.0,
         "peak_delta_nonnegative": peak_delta >= 0,
     }
@@ -475,6 +478,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=2)
     p.add_argument("--rank", type=int, default=32)
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="zero")
     p.add_argument("--frozen-residual-rank", type=int, default=None)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
@@ -574,6 +578,7 @@ def main() -> None:
             "hidden": args.hidden,
             "layers": args.layers,
             "rank": args.rank,
+            "init": args.init,
             "frozen_residual_rank": args.frozen_residual_rank,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,

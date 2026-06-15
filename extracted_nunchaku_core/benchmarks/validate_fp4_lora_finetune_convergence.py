@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Validate that a frozen FP4 backbone plus frozen residual-SVD compensation "
-            "can fine-tune a zero-init BF16/FP16 LoRA branch on a synthetic low-rank target."
+            "can fine-tune a BF16/FP16 LoRA branch on a synthetic low-rank target."
         )
     )
     p.add_argument("--m", type=int, default=256)
@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-features", type=int, default=768)
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--target-rank", type=int, default=8)
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="zero")
     p.add_argument("--frozen-residual-rank", type=int, default=32)
     p.add_argument("--frozen-residual-init", choices=["none", "residual_svd"], default="residual_svd")
     p.add_argument("--residual-svd-method", choices=["full_svd", "svd_lowrank"], default="svd_lowrank")
@@ -138,7 +139,7 @@ def main() -> None:
         bias=bias,
         rank=args.rank,
         lowrank_dtype=lowrank_dtype,
-        init="zero",
+        init=args.init,
         frozen_residual_rank=frozen_residual_rank,
         frozen_residual_init=args.frozen_residual_init,
         residual_svd_method=args.residual_svd_method,
@@ -248,6 +249,7 @@ def main() -> None:
             "rank": args.rank,
             "effective_rank": module.rank,
             "target_rank": args.target_rank,
+            "init": args.init,
             "frozen_residual_rank": args.frozen_residual_rank,
             "effective_requested_frozen_residual_rank": frozen_residual_rank,
             "effective_frozen_residual_rank": module.frozen_residual_rank,

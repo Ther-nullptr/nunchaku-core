@@ -164,7 +164,7 @@ model = prepared.model
 
 `prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary、`init` 下发和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
 
-`benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、初始 forward 误差和相对 dense LoRA speedup 消融。
+`benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、`config.init`、初始 forward 误差和相对 dense LoRA speedup 消融。传 `--init pissa` 可直接做 QPiSSA-style preset 消融。
 
 追加 `--include-reuse-policies` 后，benchmark 会为支持的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
 
@@ -342,7 +342,7 @@ Gradient accumulation 短测，`grad_accum_steps=4, warmup=5, iters=10`：
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | FP4 initial + teacher low-rank delta | 1.0753e-2 | 2.9362e-6 | 2.7307e-4 | 3.5572e-3 | 1.6525e-2 | pass |
 
-这个实验对应 personal-vault 中的“单层微调 loss 收敛曲线”待办。默认 `target_base=fp4_initial`，目标是初始 `FP4 + frozen residual` 输出加 teacher low-rank delta，避免把高秩量化误差混进 task LoRA 的低秩拟合目标。验证通过项包括 loss 显著下降、LoRA A/B 参数发生更新、梯度 finite、frozen residual buffer 不变、只有预期参数可训练，以及动态 packed cache 的 optimizer post-step refresh hook 已运行。
+这个实验对应 personal-vault 中的“单层微调 loss 收敛曲线”待办。默认 `target_base=fp4_initial`，目标是初始 `FP4 + frozen residual` 输出加 teacher low-rank delta，避免把高秩量化误差混进 task LoRA 的低秩拟合目标。验证通过项包括 loss 显著下降、LoRA A/B 参数发生更新、梯度 finite、frozen residual buffer 不变、只有预期参数可训练，以及动态 packed cache 的 optimizer post-step refresh hook 已运行。默认 `--init zero`；传 `--init pissa` 可做 PiSSA 收敛消融。
 
 ## 后续优化路线
 

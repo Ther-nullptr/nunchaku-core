@@ -27,7 +27,7 @@ from benchmark_hf_llama_fp4_lora_finetuning import (  # noqa: E402
     _is_summary_row_dominated,
     _summary_accuracy_metric,
     _summary_row,
-    build_batch_from_stream,
+    build_batches_from_stream,
     dtype_from_name,
     effective_exclude_modules,
     ensure_model_downloaded,
@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--prime-steps", type=int, default=1)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--no-frozen-residual", action="store_true")
     parser.add_argument("--frozen-residual-rank", type=int, default=None)
     parser.add_argument("--residual-svd-method", choices=["full_svd", "svd_lowrank"], default=None)
@@ -301,6 +302,8 @@ def main() -> None:
         raise ValueError("--iters must be positive")
     if args.warmup < 0 or args.prime_steps < 0:
         raise ValueError("--warmup and --prime-steps must be non-negative")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("--grad-accum-steps must be positive")
 
     policies = list(dict.fromkeys(args.policies))
     if args.include_reuse_policies and args.reuse_fused_dy_up_for_d_lora_down:
@@ -327,11 +330,12 @@ def main() -> None:
         dataset_split=args.dataset_split,
         dataset_max_docs=args.dataset_max_docs,
     )
-    batch = build_batch_from_stream(
+    batches = build_batches_from_stream(
         token_stream,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         offset_tokens=args.dataset_offset_tokens,
+        grad_accum_steps=args.grad_accum_steps,
     )
     record_plan = policy_record_plan(
         policies,
@@ -378,6 +382,9 @@ def main() -> None:
             "warmup": args.warmup,
             "iters": args.iters,
             "prime_steps": args.prime_steps,
+            "grad_accum_steps": args.grad_accum_steps,
+            "tokens_per_micro_step": args.batch_size * args.seq_len,
+            "tokens_per_optimizer_step": args.batch_size * args.seq_len * args.grad_accum_steps,
             "model_gradient_checkpointing": args.model_gradient_checkpointing,
         },
         "dataset": {
@@ -427,7 +434,7 @@ def main() -> None:
             model_dir=model_dir,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
-            batch=batch,
+            batches=batches,
         )
         dense_record["policy"] = "dense_lora"
         results["records"]["dense_lora"] = dense_record
@@ -446,7 +453,7 @@ def main() -> None:
             model_dir=model_dir,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
-            batch=batch,
+            batches=batches,
             dense_initial_logits=dense_initial_logits,
             dense_latency_ms=dense_latency_ms,
             dense_peak_delta=dense_peak_delta,

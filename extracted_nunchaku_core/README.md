@@ -1378,12 +1378,13 @@ python benchmarks/benchmark_hf_llama_fp4_lora_policy_sweep.py \
   --policies dense_lora fp4_base fp4_task_rank_bump fp4_residual_only fp4_residual_plus_task fp4_keep_dense \
   --batch-size 1 \
   --seq-len 64 \
+  --grad-accum-steps 4 \
   --outlier-report results/latest_hf_llama_activation_grad_outliers.json \
   --warmup 1 \
   --iters 3
 ```
 
-输出 `results/latest_hf_llama_fp4_lora_policy_sweep.json`。每个 FP4 policy 都复用 `benchmark_hf_llama_fp4_lora_finetuning.py` 的真实模型加载、Linear 选择、`prepare_fp4_lora_finetuning` 替换和 train-step 计时路径；JSON 中重点看：
+输出 `results/latest_hf_llama_fp4_lora_policy_sweep.json`。每个 FP4 policy 都复用 `benchmark_hf_llama_fp4_lora_finetuning.py` 的真实模型加载、Linear 选择、`prepare_fp4_lora_finetuning` 替换和 train-step 计时路径；`--grad-accum-steps` 的口径与主 HF benchmark 一致，`train_step_with_optimizer` 是一次 optimizer step，`tokens_per_second` 按累积后的 token 数计算。JSON 中重点看：
 
 - `records.<policy>.initial_logits_vs_dense_lora.rel_l2`
 - `records.<policy>.relative_to_dense_lora.train_step_speedup`
@@ -1403,6 +1404,7 @@ python benchmarks/benchmark_hf_llama_fp4_lora_policy_sweep.py \
   --policies fp4_base fp4_residual_only \
   --batch-size 1 \
   --seq-len 16 \
+  --grad-accum-steps 2 \
   --replace-layer-start 0 \
   --replace-layer-end 1 \
   --replace-name-substrings q_proj \

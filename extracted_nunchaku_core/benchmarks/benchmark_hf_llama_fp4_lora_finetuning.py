@@ -36,10 +36,20 @@ VALID_VARIANTS = (
     "dense_lora",
     "fp4_accuracy",
     "fp4_balanced",
+    "fp4_balanced_reuse_dy_up",
     "fp4_throughput",
+    "fp4_throughput_reuse_dy_up",
     "fp4_memory_saving",
     "fp4_memory_saving_dequant",
 )
+REUSE_DY_UP_VARIANTS = {
+    "fp4_balanced_reuse_dy_up": "fp4_balanced",
+    "fp4_throughput_reuse_dy_up": "fp4_throughput",
+}
+INCLUDE_REUSE_VARIANTS = {
+    "fp4_balanced": "fp4_balanced_reuse_dy_up",
+    "fp4_throughput": "fp4_throughput_reuse_dy_up",
+}
 
 
 class DenseLoRALinear(nn.Module):
@@ -136,6 +146,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-gradient-checkpointing", action="store_true")
     parser.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     parser.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
+    parser.add_argument("--include-reuse-policies", action="store_true")
     parser.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     parser.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     parser.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
@@ -487,6 +498,7 @@ def measure_peak_delta(fn) -> tuple[int, int, int]:
 
 
 def variant_to_mode_backend(variant: str, default_backend: str) -> tuple[str, str]:
+    variant = REUSE_DY_UP_VARIANTS.get(variant, variant)
     if variant == "fp4_accuracy":
         return "accuracy", default_backend
     if variant == "fp4_balanced":
@@ -498,6 +510,20 @@ def variant_to_mode_backend(variant: str, default_backend: str) -> tuple[str, st
     if variant == "fp4_memory_saving_dequant":
         return "memory_saving", "dequant_gemm"
     raise ValueError(f"Unsupported FP4 variant: {variant}")
+
+
+def expand_variants_for_reuse(variants: list[str], include_reuse_policies: bool) -> list[str]:
+    expanded = list(variants)
+    if include_reuse_policies:
+        for variant in variants:
+            reuse_variant = INCLUDE_REUSE_VARIANTS.get(variant)
+            if reuse_variant is not None:
+                expanded.append(reuse_variant)
+    return list(dict.fromkeys(expanded))
+
+
+def variant_uses_reuse_dy_up(variant: str, global_reuse: bool) -> bool:
+    return bool(global_reuse or variant in REUSE_DY_UP_VARIANTS)
 
 
 def run_prime_steps(
@@ -646,7 +672,10 @@ def run_fp4_variant(
         cache_lora_act=not args.no_cache_lora_act,
         activation_checkpoint=args.activation_checkpoint,
         backward_weight_policy=args.backward_weight_policy,
-        reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
+        reuse_fused_dy_up_for_d_lora_down=variant_uses_reuse_dy_up(
+            variant,
+            args.reuse_fused_dy_up_for_d_lora_down,
+        ),
         overlap_lora_grad_min_rows=args.overlap_lora_grad_min_rows,
         fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=backend,
@@ -729,6 +758,7 @@ def run_fp4_variant(
         "variant": variant,
         "mode": mode,
         "fp4_activation_cache_d_lora_down_backend": backend,
+        "reuse_fused_dy_up_for_d_lora_down": bool(result.config.reuse_fused_dy_up_for_d_lora_down),
         "config": jsonable_config(result.config),
         "selected_modules": selected_names,
         "excluded_selected_modules": excluded_selected_modules,
@@ -830,6 +860,7 @@ def _summary_row(record_name: str, record: dict[str, Any]) -> dict[str, Any]:
         "mode": record.get("mode"),
         "init": record.get("init"),
         "backend": record.get("fp4_activation_cache_d_lora_down_backend"),
+        "reuse_fused_dy_up_for_d_lora_down": bool(record.get("reuse_fused_dy_up_for_d_lora_down", False)),
         "train_step_ms": latency_ms,
         "tokens_per_second": float(record["throughput"]["tokens_per_second"])
         if "tokens_per_second" in record.get("throughput", {})
@@ -929,7 +960,12 @@ def main() -> None:
         offset_tokens=args.dataset_offset_tokens,
     )
 
-    variants = list(dict.fromkeys(args.variants))
+    variants = expand_variants_for_reuse(
+        list(dict.fromkeys(args.variants)),
+        include_reuse_policies=args.include_reuse_policies,
+    )
+    if any(variant in REUSE_DY_UP_VARIANTS for variant in variants) and dtype != lowrank_dtype:
+        raise ValueError("reuse dy_up variants require --dtype to match --lowrank-dtype")
     results: dict[str, Any] = {
         "experiment": "hf_causal_lm_fp4_lora_finetuning",
         "model_id": args.model_id,
@@ -981,6 +1017,7 @@ def main() -> None:
             "activation_checkpoint": args.activation_checkpoint,
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
+            "include_reuse_policies": args.include_reuse_policies,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,

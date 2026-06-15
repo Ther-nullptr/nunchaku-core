@@ -1006,24 +1006,26 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
 
 如果要测试第二份 compressed backward qweight 的上限收益，追加 `--backward-weight-policy cache`。默认仍是 `repack`，避免常驻第二份 backbone；cache 策略会在 `prepare_fp4_lora_finetuning(..., refresh_caches=True)` 时预热，并在结果中报告 `refreshed_backward_weight_count`。
 
-如果要把 BF16/FP16 `dy_up` 复用纳入模型级消融，追加 `--include-reuse-policies`：
+如果要把 BF16/FP16 `dy_up` 复用纳入真实模型消融，追加 `--include-reuse-policies`：
 
 ```bash
-python benchmarks/benchmark_fp4_lora_prepare_policies.py \
-  --batch 8 \
-  --hidden 256 \
-  --layers 2 \
+python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
+  --variants dense_lora fp4_balanced fp4_throughput \
+  --batch-size 1 \
+  --seq-len 64 \
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16 \
-  --modes balanced \
-  --include-reuse-policies \
+  --replace-layer-start 0 \
+  --replace-layer-end 1 \
+  --replace-name-substrings q_proj \
   --no-frozen-residual \
-  --warmup 3 \
-  --iters 5
+  --include-reuse-policies \
+  --warmup 1 \
+  --iters 3
 ```
 
-该选项会为 `balanced/throughput` 增加 `*_reuse_dy_up` 记录；当 frozen residual 开启时，高层 config 会自动关闭 reuse-based overlap，因此用 `--no-frozen-residual` 可以观察 reuse+overlap 的上限。RTX 5090 短测中，TinyTransformer 默认形状 `batch=8, hidden=256, layers=2` 的 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，说明小 M 场景额外同步/调度开销会压过收益；4096 单层 benchmark 中 BF16 reuse 与 reuse+overlap 分别为 `1.014x` 和 `1.032x`。因此该策略保持 opt-in，应按真实训练形状决定是否启用。
+该选项会为已请求的 `fp4_balanced/fp4_throughput` 增加 `fp4_balanced_reuse_dy_up/fp4_throughput_reuse_dy_up` 记录，并写入 `records.*.reuse_fused_dy_up_for_d_lora_down` 与 `variant_summary`。当 frozen residual 开启时，高层 config 会自动关闭 reuse-based overlap，因此用 `--no-frozen-residual` 可以观察 reuse+overlap 的上限。RTX 5090 短测中，TinyTransformer 默认形状 `batch=8, hidden=256, layers=2` 的 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，说明小 M 场景额外同步/调度开销会压过收益；4096 单层 benchmark 中 BF16 reuse 与 reuse+overlap 分别为 `1.014x` 和 `1.032x`。因此该策略保持 opt-in，应按真实训练形状决定是否启用。
 
 RTX 5090 验证结果：
 

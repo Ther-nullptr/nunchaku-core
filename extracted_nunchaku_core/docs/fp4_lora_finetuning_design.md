@@ -151,7 +151,7 @@ model = prepared.model
 
 `sensitivity_report` 直接消费真实模型 module sensitivity scan 的 `module_records[].perplexity_ratio_vs_fp16`：超过 `sensitivity_exclude_ratio` 的 projection 保持 BF16/FP16，超过 `sensitivity_rank_bump_ratio` 的 projection 自动提高 LoRA rank。策略优先级是手写 `config_overrides` > activation/grad outlier report > module sensitivity report；LlamaForCausalLM 报告里的 `model.` 前缀会自动生成去前缀 alias，便于同一份报告复用到裸 decoder 子模块。
 
-`fp4_lora_finetune_config(mode=...)` 是微调推荐入口，用来避免手动拼装不兼容开关：
+`fp4_lora_finetune_config(mode=...)` 是微调推荐入口，用来避免手动拼装不兼容开关。默认 `init="zero"`；显式传 `init="pissa"` 时，高层 prepare 和 HF benchmark 会把 QPiSSA-style 初始化下发到所有替换层和自动 rank-bump override：
 
 | mode | 目标 | 关键策略 |
 | --- | --- | --- |
@@ -162,7 +162,7 @@ model = prepared.model
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则；`memory_saving + fp4_activation_cache_d_lora_down_backend="dequant_gemm"` 也通过。验证脚本也覆盖 `backward_weight_policy="cache"`，确认 compressed backward qweight cache 预热后仍常驻。
 
-`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary 和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary、`init` 下发和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、初始 forward 误差和相对 dense LoRA speedup 消融。
 

@@ -839,7 +839,7 @@ load_fp4_lora_peft_state_dict(model, peft_state)
 如果只想跑单分支 task LoRA，把 `frozen_residual_rank=0` 且 `frozen_residual_init="none"`。
 如果已经通过 sensitivity scan 发现某些完整模块路径不适合 FP4，可以把 JSON 直接传给 `prepare_fp4_lora_finetuning(..., sensitivity_report=...)`：超过 `sensitivity_exclude_ratio` 的模块自动加入 `exclude_modules` 保持 BF16/FP16，超过 `sensitivity_rank_bump_ratio` 但未被排除的模块自动提高 LoRA rank。`model.` 前缀会自动补一个去前缀 alias，因此同一份 LlamaForCausalLM 报告也可用于裸 `model.model` 子模块。手写 `config_overrides` 优先级最高，其次 activation/grad outlier 报告，最后是 sensitivity 报告。
 
-`fp4_lora_finetune_config` 提供四种预设，均采用“frozen residual_svd 量化补偿 + zero-init task LoRA”的推荐形态：
+`fp4_lora_finetune_config` 提供四种预设，默认采用“frozen residual_svd 量化补偿 + zero-init task LoRA”的推荐形态；`init` 可显式改为 `pissa` 或 `residual_svd` 做初始化/收敛消融：
 
 | mode | 用途 | 关键开关 |
 | --- | --- | --- |
@@ -932,10 +932,13 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --rank 32 \
   --dtype bf16 \
   --lowrank-dtype bf16 \
+  --init zero \
   --warmup 2 \
   --iters 5 \
   --prime-steps 1
 ```
+
+要把真实模型 FP4 LoRA 初始化切到 QPiSSA-style，可以改用 `--init pissa`；结果 JSON 会在 `fp4_options.init` 和 `records.*.fp4_module_configs.*.init` 里记录实际策略。
 
 如果只想继续查敏感模块，可以用同一个脚本缩小替换范围：
 
@@ -1615,6 +1618,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - `dB=dY.T@lora_act` 的 dense scalar-reduction CUDA 原型；只用于 `benchmark_fp4_lora_lowrank_grad.py` 对照，4096/rank32 上显著慢于 torch/cuBLAS，不建议默认使用
 - `native_fp4.FP4LoRAConfig`
   - 批量替换 Linear 时使用的配置对象，支持 `frozen_residual_rank/init`、`residual_svd_method`、`activation_checkpoint`、`reuse_fused_dy_up_for_d_lora_down`、`zero_lora_up_fast_path`、`fp4_activation_cache_d_lora_down`、`fp4_activation_cache_min_rows`、`fp4_activation_cache_d_lora_down_backend` 和 FP16/BF16 `fuse_frozen_residual_dx`
+- `native_fp4.fp4_lora_finetune_config`
+  - 生成 `accuracy/balanced/throughput/memory_saving` 训练 preset，默认 `init="zero"`，也支持 `init="pissa"` 用于 QPiSSA-style 真实模型初始化实验
 - `native_fp4.fp4_lora_target_modules_for_policy`
   - 返回内置 target policy 对应的 projection 列表；高层 `prepare_fp4_lora_finetuning(..., target_policy=...)` 和 HF benchmark 的 `--target-policy` 共用同一套策略
 - `native_fp4.convert_linear_to_fp4_lora`

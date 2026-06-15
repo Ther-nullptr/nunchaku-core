@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto-rank", type=int, default=48)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="zero")
     p.add_argument("--mode", choices=["accuracy", "balanced", "throughput", "memory_saving"], default="balanced")
     p.add_argument("--no-frozen-residual", action="store_true")
     p.add_argument("--lr", type=float, default=1e-3)
@@ -93,6 +94,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
@@ -144,6 +146,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
@@ -166,6 +169,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
@@ -191,6 +195,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
@@ -214,6 +219,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
@@ -237,6 +243,7 @@ def main() -> None:
         rank=args.rank,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
+        init=args.init,
         use_frozen_residual=not args.no_frozen_residual,
         backward_weight_policy=args.backward_weight_policy,
         reuse_fused_dy_up_for_d_lora_down=args.reuse_fused_dy_up_for_d_lora_down,
@@ -355,6 +362,10 @@ def main() -> None:
         "result_config_backward_weight_policy_matches": (
             result.config.backward_weight_policy == args.backward_weight_policy
         ),
+        "result_config_init_matches": result.config.init == args.init,
+        "all_replaced_init_matches": all(
+            fp4_modules[name].init_mode == args.init for name in expected_replaced
+        ),
         "all_replaced_backend_matches": all(
             fp4_modules[name].fp4_activation_cache_d_lora_down_backend
             == args.fp4_activation_cache_d_lora_down_backend
@@ -379,6 +390,9 @@ def main() -> None:
         ),
         "sensitivity_rank_bump_applied": (
             fp4_modules["layers.0.q_proj"].requested_rank == expected_sensitivity_rank
+        ),
+        "sensitivity_rank_bump_preserves_init": (
+            fp4_modules["layers.0.q_proj"].init_mode == args.init
         ),
         "sensitivity_rank_bump_preserves_fused_residual_dx": (
             fp4_modules["layers.0.q_proj"].fuse_frozen_residual_dx == expected_auto_fuse_frozen_residual_dx
@@ -420,6 +434,9 @@ def main() -> None:
             == expected_outlier_residual_rank
             and outlier_residual_modules["layers.1.down_proj"].frozen_residual_rank
             == expected_outlier_residual_rank
+        ),
+        "outlier_bump_frozen_residual_preserves_init": (
+            outlier_residual_modules["layers.1.down_proj"].init_mode == args.init
         ),
         "outlier_bump_frozen_residual_init_applied": (
             outlier_residual_modules["layers.1.down_proj"].frozen_residual_init == "residual_svd"
@@ -513,6 +530,7 @@ def main() -> None:
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
             "mode": args.mode,
+            "init": args.init,
             "use_frozen_residual": not args.no_frozen_residual,
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,

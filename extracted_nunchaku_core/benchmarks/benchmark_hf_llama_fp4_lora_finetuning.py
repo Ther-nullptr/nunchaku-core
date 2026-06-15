@@ -100,6 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=None)
+    parser.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="zero")
     parser.add_argument("--variants", nargs="+", choices=VALID_VARIANTS, default=["dense_lora", "fp4_balanced"])
     parser.add_argument("--target-policy", choices=tuple(FP4_LORA_TARGET_POLICY_MODULES), default=None)
     parser.add_argument("--target-modules", nargs="+", default=list(DEFAULT_FP4_LORA_TARGET_MODULES))
@@ -632,6 +633,7 @@ def run_fp4_variant(
         mode=mode,
         rank=args.rank,
         lora_alpha=args.lora_alpha,
+        init=args.init,
         dtype=dtype,
         lowrank_dtype=lowrank_dtype,
         use_frozen_residual=not args.no_frozen_residual,
@@ -733,6 +735,7 @@ def run_fp4_variant(
             name: {
                 "requested_rank": int(child.requested_rank),
                 "effective_rank": int(child.rank),
+                "init": child.init_mode,
                 "requested_frozen_residual_rank": int(child.requested_frozen_residual_rank),
                 "effective_frozen_residual_rank": int(child.frozen_residual_rank),
                 "frozen_residual_init": child.frozen_residual_init,
@@ -876,6 +879,7 @@ def main() -> None:
         },
         "fp4_options": {
             "use_frozen_residual": not args.no_frozen_residual,
+            "init": args.init,
             "frozen_residual_rank": args.frozen_residual_rank,
             "residual_svd_method": args.residual_svd_method,
             "residual_svd_lowrank_oversample": args.residual_svd_lowrank_oversample,

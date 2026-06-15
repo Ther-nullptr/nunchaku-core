@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=None)
+    parser.add_argument("--init", choices=["zero", "gaussian", "residual_svd", "pissa"], default="zero")
     parser.add_argument("--fp4-variant", choices=FP4_VARIANTS, default="fp4_balanced")
     parser.add_argument("--policies", nargs="+", choices=POLICIES, default=list(POLICIES))
     parser.add_argument("--target-policy", choices=tuple(FP4_LORA_TARGET_POLICY_MODULES), default=None)
@@ -173,6 +174,7 @@ def policy_metadata(args: argparse.Namespace, policy: str) -> dict[str, Any]:
     p_args = policy_args(args, policy)
     return {
         "fp4_variant": args.fp4_variant,
+        "init": p_args.init,
         "outlier_report": p_args.outlier_report,
         "outlier_bump_task_rank": not p_args.outlier_no_task_rank_bump,
         "outlier_bump_frozen_residual": p_args.outlier_bump_frozen_residual,
@@ -310,6 +312,7 @@ def main() -> None:
         },
         "fp4_options": {
             "use_frozen_residual": not args.no_frozen_residual,
+            "init": args.init,
             "frozen_residual_rank": args.frozen_residual_rank,
             "residual_svd_method": args.residual_svd_method,
             "residual_svd_lowrank_oversample": args.residual_svd_lowrank_oversample,

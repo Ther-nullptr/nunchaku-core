@@ -160,6 +160,7 @@ def fp4_lora_finetune_config(
     lora_alpha: float | None = None,
     dtype: torch.dtype = torch.bfloat16,
     lowrank_dtype: torch.dtype | None = None,
+    init: LoRAInitMode = "zero",
     use_frozen_residual: bool = True,
     frozen_residual_rank: int | None = None,
     residual_svd_method: ResidualSVDMethod | None = None,
@@ -185,7 +186,7 @@ def fp4_lora_finetune_config(
 
     The returned config follows the SVDQuant-inspired training policy from the
     project notes: freeze the residual-SVD quantization compensation and train a
-    separate zero-init task LoRA branch.
+    separate task LoRA branch. The default task LoRA init remains zero.
     """
 
     if mode not in ("accuracy", "balanced", "throughput", "memory_saving"):
@@ -198,6 +199,8 @@ def fp4_lora_finetune_config(
         lowrank_dtype = dtype
     if lowrank_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("lowrank_dtype must be torch.float16 or torch.bfloat16")
+    if init not in ("zero", "gaussian", "residual_svd", "pissa"):
+        raise ValueError("init must be one of: zero, gaussian, residual_svd, pissa")
     if fp4_activation_cache_d_lora_down_backend not in ("fused", "dequant_gemm"):
         raise ValueError("fp4_activation_cache_d_lora_down_backend must be one of: fused, dequant_gemm")
     if backward_weight_policy not in ("repack", "cache"):
@@ -258,7 +261,7 @@ def fp4_lora_finetune_config(
         rank=rank,
         lora_alpha=lora_alpha,
         lowrank_dtype=lowrank_dtype,
-        init="zero",
+        init=init,
         frozen_residual_rank=effective_frozen_residual_rank,
         frozen_residual_init=frozen_residual_init,
         residual_svd_method=residual_svd_method,
@@ -1142,6 +1145,7 @@ def prepare_fp4_lora_finetuning(
     lora_alpha: float | None = None,
     dtype: torch.dtype = torch.bfloat16,
     lowrank_dtype: torch.dtype | None = None,
+    init: LoRAInitMode = "zero",
     use_frozen_residual: bool = True,
     frozen_residual_rank: int | None = None,
     residual_svd_method: ResidualSVDMethod | None = None,
@@ -1203,6 +1207,7 @@ def prepare_fp4_lora_finetuning(
             lora_alpha=lora_alpha,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
+            init=init,
             use_frozen_residual=use_frozen_residual,
             frozen_residual_rank=frozen_residual_rank,
             residual_svd_method=residual_svd_method,
@@ -1246,7 +1251,7 @@ def prepare_fp4_lora_finetuning(
             rank_multiple=outlier_rank_multiple,
             min_rank=outlier_min_rank,
             max_rank=outlier_max_rank,
-            force_init="zero",
+            force_init=cfg.init,
             disable_fuse_frozen_residual_dx=outlier_disable_fuse_frozen_residual_dx,
             exclude_keep_dense=outlier_exclude_keep_dense,
             keep_dense_candidates_key=outlier_keep_dense_candidates_key,
@@ -1271,7 +1276,7 @@ def prepare_fp4_lora_finetuning(
             rank_multiple=sensitivity_rank_multiple,
             min_rank=sensitivity_min_rank,
             max_rank=sensitivity_max_rank,
-            force_init="zero",
+            force_init=cfg.init,
             disable_fuse_frozen_residual_dx=sensitivity_disable_fuse_frozen_residual_dx,
         )
         for key, value in sensitivity_policy.config_overrides.items():

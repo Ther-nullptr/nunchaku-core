@@ -5,7 +5,7 @@ import json
 import math
 import os
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any
 
@@ -18,6 +18,7 @@ if ROOT_DIR not in sys.path:
 from native_fp4 import (  # noqa: E402
     NunchakuFP4LoRALinear,
     fp4_lora_finetune_config,
+    fp4_lora_runtime_state_summary,
     fp4_lora_target_modules_for_policy,
     fp4_lora_state_dict,
     iter_fp4_lora_modules,
@@ -281,6 +282,7 @@ def main() -> None:
     }
     prepared = result.model
     fp4_modules = dict(iter_fp4_lora_modules(prepared))
+    runtime_state_before_step = fp4_lora_runtime_state_summary(prepared)
     expected_replaced = {
         "layers.0.q_proj",
         "layers.1.q_proj",
@@ -306,6 +308,7 @@ def main() -> None:
     hook_forward_refresh_count = hook.last_fused_lora_forward_refresh_count
     hook_dx_refresh_count = hook.last_fused_lora_dx_refresh_count
     hook_backward_weight_cache_count = hook.last_backward_weight_cache_count
+    runtime_state_after_step = fp4_lora_runtime_state_summary(prepared)
     hook.remove()
 
     adapter_state = fp4_lora_state_dict(prepared)
@@ -499,6 +502,24 @@ def main() -> None:
             + expected_cache_summary.backward_weight_cache_bytes
         ),
         "cache_summary_dense_weight_bytes_positive": expected_cache_summary.dense_weight_bytes > 0,
+        "runtime_state_module_count_matches": runtime_state_before_step.module_count == len(expected_replaced),
+        "runtime_state_zero_active_initial_matches": (
+            runtime_state_before_step.zero_lora_up_fast_path_active_count
+            == (len(expected_replaced) if zero_fast_path_initial else 0)
+        ),
+        "runtime_state_zero_active_after_step_cleared": (
+            runtime_state_after_step.zero_lora_up_fast_path_active_count == 0
+        ),
+        "runtime_state_reuse_count_matches": (
+            runtime_state_before_step.reuse_fused_dy_up_for_d_lora_down_enabled_count
+            == (len(expected_replaced) if args.reuse_fused_dy_up_for_d_lora_down else 0)
+        ),
+        "runtime_state_dx_cache_count_matches_hook": (
+            runtime_state_after_step.fused_lora_dx_cache_resident_count == hook_dx_refresh_count
+        ),
+        "runtime_state_backward_cache_count_matches": (
+            runtime_state_after_step.backward_weight_cache_resident_count == expected_backward_weight_count
+        ),
         "backward_weight_cache_state_matches": all(
             (fp4_modules[name].fp4_backward._cached_qweight_bwd is not None)
             == (args.backward_weight_policy == "cache")
@@ -575,6 +596,8 @@ def main() -> None:
             ),
             "total_cache_vs_dense_weight": result.cache_summary.total_cache_vs_dense_weight,
         },
+        "runtime_state_before_step": asdict(runtime_state_before_step),
+        "runtime_state_after_step": asdict(runtime_state_after_step),
         "hook_refresh_count": hook_refresh_count,
         "hook_forward_refresh_count": hook_forward_refresh_count,
         "hook_dx_refresh_count": hook_dx_refresh_count,

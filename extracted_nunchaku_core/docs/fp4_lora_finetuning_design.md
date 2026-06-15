@@ -108,6 +108,7 @@ from native_fp4 import (
     convert_linear_to_fp4_lora,
     fp4_lora_config_overrides_from_outlier_report,
     fp4_lora_finetune_config,
+    fp4_lora_runtime_state_summary,
     fp4_lora_sensitivity_policy_from_report,
     prepare_fp4_lora_finetuning,
 )
@@ -147,6 +148,7 @@ prepared = prepare_fp4_lora_finetuning(
     lr=1e-4,
 )
 model = prepared.model
+runtime_state = fp4_lora_runtime_state_summary(model)
 ```
 
 `sensitivity_report` 直接消费真实模型 module sensitivity scan 的 `module_records[].perplexity_ratio_vs_fp16`：超过 `sensitivity_exclude_ratio` 的 projection 保持 BF16/FP16，超过 `sensitivity_rank_bump_ratio` 的 projection 自动提高 LoRA rank。策略优先级是手写 `config_overrides` > activation/grad outlier report > module sensitivity report；LlamaForCausalLM 报告里的 `model.` 前缀会自动生成去前缀 alias，便于同一份报告复用到裸 decoder 子模块。
@@ -162,7 +164,7 @@ model = prepared.model
 
 `validate_fp4_lora_training_policies.py` 已验证这些预设能实际运行 forward/backward/optimizer step：BF16 四模式全部通过；FP16 `throughput` 覆盖 `fuse_frozen_residual_dx=True, overlap_lora_grad=False` 的自动规则；`memory_saving + fp4_activation_cache_d_lora_down_backend="dequant_gemm"` 也通过。验证脚本也覆盖 `--init pissa`、`backward_weight_policy="cache"`，确认 init 下发和 compressed backward qweight cache 预热后仍常驻。
 
-`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary、`init` 下发和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
+`prepare_fp4_lora_finetuning` 是真实微调推荐入口：它包装 `convert_linear_to_fp4_lora + freeze_non_fp4_lora_parameters + refresh_fused_lora_forward_caches + refresh_fused_lora_dx_caches + fp4_lora_parameter_groups`，返回 `FP4LoRAPrepareResult`。验证脚本 `validate_fp4_lora_prepare.py` 覆盖了替换层、manual override 优先级、sensitivity 自动 rank bump/exclude、LoRA-only 冻结、optimizer 参数组、cache hook、cache summary、runtime state summary、`init` 下发和一次 backward/optimizer step；BF16 balanced、FP16 throughput、BF16 memory_saving/dequant_gemm 均通过。`backward_weight_policy="cache"` 是显式 opt-in，prepare 会预热 compressed backward qweight 并报告 `refreshed_backward_weight_count`；`cache_summary` 记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；`fp4_lora_runtime_state_summary(model)` 记录 zero-up fast path 是否 active、是否掩盖 fused forward / fused dX / `dy_up` reuse、packed cache 是否已常驻、backward qweight cache 是否常驻；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache；optimizer hook 会刷新随 LoRA 参数变化的 packed forward/dX cache，并用 `last_fused_lora_forward_refresh_count`、`last_fused_lora_dx_refresh_count` 和 `last_backward_weight_cache_count` 区分三类状态，默认 `repack` 仍不常驻第二份 FP4 backbone。
 
 `benchmark_fp4_lora_prepare_policies.py` 使用同一个 high-level prepare 入口构建 TinyTransformer，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并把 optimizer step 与 cache refresh hook 计入 train-step latency；输出 `latest_fp4_lora_prepare_policies.json`，用于模型级 preset 速度、峰值显存、cache summary、`config.init`、初始 forward 误差和相对 dense LoRA speedup 消融。`cache_summary` 记录 prepare 后/首步前的 resident cache，`post_step_cache_summary` 记录 optimizer step 后的 steady-state resident cache；`strategy_summary` 同步输出按速度、峰值显存、初始误差排序的策略简表和三指标 Pareto frontier，其中 `total_cache_bytes` 使用 steady-state cache，避免每次手工解析 records。传 `--init pissa` 可直接做 QPiSSA-style preset 消融。
 
@@ -170,7 +172,7 @@ model = prepared.model
 
 `benchmark_hf_llama_fp4_lora_init_sweep.py` 复用真实 HF/LLaMA + WikiText-2 加载和 `prepare_fp4_lora_finetuning` 路径，在同一批 token 上比较 `--inits zero pissa residual_svd` 等初始化策略；输出 `latest_hf_llama_fp4_lora_init_sweep.json`，并为每个 init 记录初始 logits 误差、train-step latency、峰值显存、post-step steady-state cache 和相对 zero-init 的比值。`init_summary` 使用同一套排序/Pareto 逻辑汇总不同 init。
 
-追加 `--include-reuse-policies` 后，TinyTransformer prepare benchmark 和真实 HF/LLaMA benchmark 都会为已请求的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`。HF outlier policy sweep 也支持同一开关：它会为每个 FP4 policy 增加 `<policy>_reuse_dy_up` 记录，例如 `fp4_base_reuse_dy_up`，并在 `policy_summary` 中统一排序。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
+追加 `--include-reuse-policies` 后，TinyTransformer prepare benchmark 和真实 HF/LLaMA benchmark 都会为已请求的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`、`runtime_state_before_timing` 和 `timing_context`。HF outlier policy sweep 也支持同一开关：它会为每个 FP4 policy 增加 `<policy>_reuse_dy_up` 记录，例如 `fp4_base_reuse_dy_up`，并在 `policy_summary` 中统一排序。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。若 `timing_context.zero_lora_up_fast_path_can_affect_measured_iters=true`，zero-init 首步 fast path 进入了计时区，reuse/fusion 对比应增加 warmup/prime step 或关闭 zero fast path 后复测。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
 
 Adapter checkpoint 示例：
 

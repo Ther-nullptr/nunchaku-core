@@ -772,6 +772,7 @@ from native_fp4 import (
     fp4_lora_outlier_policy_from_report,
     fp4_lora_parameter_groups,
     fp4_lora_peft_state_dict,
+    fp4_lora_runtime_state_summary,
     fp4_lora_sensitivity_policy_from_report,
     fp4_lora_state_dict,
     freeze_non_fp4_lora_parameters,
@@ -821,6 +822,7 @@ prepared = prepare_fp4_lora_finetuning(
     lr=1e-4,
 )
 model = prepared.model
+runtime_state = fp4_lora_runtime_state_summary(model)
 
 optimizer = torch.optim.AdamW(prepared.optimizer_param_groups, eps=1e-4)
 cache_hook = prepared.register_cache_refresh_hook(optimizer)
@@ -1025,7 +1027,7 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
   --iters 3
 ```
 
-该选项会为已请求的 `fp4_balanced/fp4_throughput` 增加 `fp4_balanced_reuse_dy_up/fp4_throughput_reuse_dy_up` 记录，并写入 `records.*.reuse_fused_dy_up_for_d_lora_down` 与 `variant_summary`。当 frozen residual 开启时，高层 config 会自动关闭 reuse-based overlap，因此用 `--no-frozen-residual` 可以观察 reuse+overlap 的上限。RTX 5090 短测中，TinyTransformer 默认形状 `batch=8, hidden=256, layers=2` 的 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，说明小 M 场景额外同步/调度开销会压过收益；4096 单层 benchmark 中 BF16 reuse 与 reuse+overlap 分别为 `1.014x` 和 `1.032x`。因此该策略保持 opt-in，应按真实训练形状决定是否启用。
+该选项会为已请求的 `fp4_balanced/fp4_throughput` 增加 `fp4_balanced_reuse_dy_up/fp4_throughput_reuse_dy_up` 记录，并写入 `records.*.reuse_fused_dy_up_for_d_lora_down`、`records.*.runtime_state_before_timing`、`records.*.timing_context` 与 `variant_summary`。当 frozen residual 开启时，高层 config 会自动关闭 reuse-based overlap，因此用 `--no-frozen-residual` 可以观察 reuse+overlap 的上限。若 `timing_context.zero_lora_up_fast_path_can_affect_measured_iters=true`，说明 zero-init 首步 fast path 进入了计时区，本次 reuse/fusion 消融没有完全覆盖 steady-state；增加 `--warmup`、`--prime-steps` 或关闭 zero fast path 后再比较。RTX 5090 短测中，TinyTransformer 默认形状 `batch=8, hidden=256, layers=2` 的 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，说明小 M 场景额外同步/调度开销会压过收益；4096 单层 benchmark 中 BF16 reuse 与 reuse+overlap 分别为 `1.014x` 和 `1.032x`。因此该策略保持 opt-in，应按真实训练形状决定是否启用。
 
 RTX 5090 验证结果：
 
@@ -1040,6 +1042,7 @@ RTX 5090 验证结果：
 - zero-init task LoRA 的首步不会预热 packed LoRA forward/dX cache；`optimizer.step()` 后版本失效，cache refresh hook 会按需生成新 cache。
 - opt-in `backward_weight_policy="cache"` 时预热 compressed backward qweight；默认 `repack` 不额外常驻第二份 backbone。
 - 返回 `FP4LoRAPrepareResult.cache_summary`，记录当前实际常驻的 packed LoRA forward cache、packed LoRA dX cache、backward qweight cache 和相对 dense weight 的字节比例；native fused forward 会在 `prepare(..., refresh_caches=True)` 时预热 forward cache。
+- 可用 `fp4_lora_runtime_state_summary(model)` 诊断实际快路径状态：zero-up fast path 是否仍 active、是否暂时掩盖 fused forward / fused dX / `dy_up` reuse、packed cache 是否已常驻、backward qweight cache 是否常驻。
 - 返回 LoRA-only `optimizer_param_groups`，可直接传给 AdamW/ZeRO/FSDP 外层 optimizer。
 - 返回 `FP4LoRAPrepareResult.register_cache_refresh_hook(optimizer)`，用于 optimizer step 后 eager refresh packed LoRA forward/dX cache；`hook.last_fused_lora_forward_refresh_count` 和 `hook.last_fused_lora_dx_refresh_count` 分别记录两类动态 cache，`hook.last_backward_weight_cache_count` 只报告静态 backward qweight cache 是否常驻，不在每步重复 repack。
 
@@ -1672,6 +1675,8 @@ conda run -n triton python benchmarks/benchmark_native_fp4_lora_training.py \
   - 枚举 LoRA-only 参数，默认不包含 bias
 - `native_fp4.fp4_lora_parameter_groups`
   - 生成只含 LoRA adapter 的 optimizer 参数组
+- `native_fp4.fp4_lora_runtime_state_summary`
+  - 低开销统计 FP4 LoRA 模块的实际快路径状态，包括 zero-up fast path、被 zero-up 掩盖的 fused/reuse 路径、packed LoRA cache 和 backward qweight cache 是否常驻
 - `native_fp4.register_fp4_lora_cache_refresh_hook`
   - 在 `optimizer.step()` 后 eager refresh native fused forward 和 fused dX packed LoRA cache
 - `native_fp4.fp4_lora_state_dict`

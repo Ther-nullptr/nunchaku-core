@@ -112,6 +112,28 @@ class FP4LoRACacheSummary:
     total_cache_vs_dense_weight: float
 
 
+@dataclass(frozen=True)
+class FP4LoRARuntimeStateSummary:
+    """Cheap path-state counters for converted FP4 LoRA modules."""
+
+    module_count: int
+    zero_lora_up_fast_path_enabled_count: int
+    zero_lora_up_fast_path_active_count: int
+    zero_lora_up_fast_path_masked_fused_forward_count: int
+    zero_lora_up_fast_path_masked_fused_lora_dx_count: int
+    zero_lora_up_fast_path_masked_reuse_dy_up_count: int
+    fuse_lowrank_forward_enabled_count: int
+    fused_lora_forward_cache_resident_count: int
+    fuse_lora_dx_enabled_count: int
+    cache_fused_lora_dx_enabled_count: int
+    fused_lora_dx_cache_resident_count: int
+    reuse_fused_dy_up_for_d_lora_down_enabled_count: int
+    overlap_lora_grad_enabled_count: int
+    fp4_activation_cache_d_lora_down_enabled_count: int
+    backward_weight_cache_policy_count: int
+    backward_weight_cache_resident_count: int
+
+
 @dataclass
 class FP4LoRAPrepareResult:
     """Artifacts returned by ``prepare_fp4_lora_finetuning``."""
@@ -745,6 +767,83 @@ def fp4_lora_cache_summary(module: torch.nn.Module) -> FP4LoRACacheSummary:
         fused_lora_dx_cache_vs_dense_weight=fused_ratio,
         backward_weight_cache_vs_dense_weight=backward_ratio,
         total_cache_vs_dense_weight=total_ratio,
+    )
+
+
+def fp4_lora_runtime_state_summary(module: torch.nn.Module) -> FP4LoRARuntimeStateSummary:
+    """Return cheap counters that explain which FP4 LoRA paths are active.
+
+    This intentionally avoids inspecting tensor values, so it does not trigger
+    CUDA synchronization. It is meant for benchmark metadata and training
+    sanity checks, especially around zero-init LoRA-up fast path masking.
+    """
+
+    module_count = 0
+    zero_enabled = 0
+    zero_active = 0
+    zero_masked_forward = 0
+    zero_masked_dx = 0
+    zero_masked_reuse = 0
+    fuse_forward = 0
+    forward_cache_resident = 0
+    fuse_dx = 0
+    cache_dx = 0
+    dx_cache_resident = 0
+    reuse_dy_up = 0
+    overlap = 0
+    fp4_act_cache = 0
+    backward_cache_policy = 0
+    backward_cache_resident = 0
+
+    for _, child in iter_fp4_lora_modules(module):
+        module_count += 1
+        zero_is_enabled = bool(child.zero_lora_up_fast_path)
+        zero_is_active = bool(child._lora_up_zero_fast_path_active())
+        forward_cache_is_resident = (
+            child._cached_lora_down_fwd_packed is not None
+            and child._cached_lora_up_fwd_packed is not None
+        )
+        dx_cache_is_resident = (
+            child._cached_lora_down_bwd_packed is not None
+            and child._cached_lora_up_bwd_packed is not None
+        )
+        backward_cache_is_resident = child.fp4_backward._cached_qweight_bwd is not None
+
+        zero_enabled += int(zero_is_enabled)
+        zero_active += int(zero_is_active)
+        fuse_forward += int(child.fuse_lowrank_forward)
+        forward_cache_resident += int(forward_cache_is_resident)
+        fuse_dx += int(child.fuse_lora_dx)
+        cache_dx += int(child.cache_fused_lora_dx)
+        dx_cache_resident += int(dx_cache_is_resident)
+        reuse_dy_up += int(child.reuse_fused_dy_up_for_d_lora_down)
+        overlap += int(child.overlap_lora_grad)
+        fp4_act_cache += int(child.fp4_activation_cache_d_lora_down)
+        backward_cache_policy += int(child.backward_weight_policy == "cache")
+        backward_cache_resident += int(backward_cache_is_resident)
+
+        if zero_is_active:
+            zero_masked_forward += int(child.fuse_lowrank_forward)
+            zero_masked_dx += int(child.fuse_lora_dx)
+            zero_masked_reuse += int(child.reuse_fused_dy_up_for_d_lora_down)
+
+    return FP4LoRARuntimeStateSummary(
+        module_count=module_count,
+        zero_lora_up_fast_path_enabled_count=zero_enabled,
+        zero_lora_up_fast_path_active_count=zero_active,
+        zero_lora_up_fast_path_masked_fused_forward_count=zero_masked_forward,
+        zero_lora_up_fast_path_masked_fused_lora_dx_count=zero_masked_dx,
+        zero_lora_up_fast_path_masked_reuse_dy_up_count=zero_masked_reuse,
+        fuse_lowrank_forward_enabled_count=fuse_forward,
+        fused_lora_forward_cache_resident_count=forward_cache_resident,
+        fuse_lora_dx_enabled_count=fuse_dx,
+        cache_fused_lora_dx_enabled_count=cache_dx,
+        fused_lora_dx_cache_resident_count=dx_cache_resident,
+        reuse_fused_dy_up_for_d_lora_down_enabled_count=reuse_dy_up,
+        overlap_lora_grad_enabled_count=overlap,
+        fp4_activation_cache_d_lora_down_enabled_count=fp4_act_cache,
+        backward_weight_cache_policy_count=backward_cache_policy,
+        backward_weight_cache_resident_count=backward_cache_resident,
     )
 
 

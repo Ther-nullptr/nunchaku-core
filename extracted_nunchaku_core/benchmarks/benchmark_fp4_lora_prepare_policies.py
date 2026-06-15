@@ -18,6 +18,7 @@ if ROOT_DIR not in sys.path:
 from native_fp4 import (  # noqa: E402
     FP4LoRAConfig,
     fp4_lora_cache_summary,
+    fp4_lora_runtime_state_summary,
     iter_fp4_lora_modules,
     prepare_fp4_lora_finetuning,
 )
@@ -302,6 +303,10 @@ def run_record(
         if result.config.fuse_lowrank_forward or result.config.cache_fused_lora_dx
         else None
     )
+    runtime_state_before_timing = fp4_lora_runtime_state_summary(result.model)
+    zero_up_can_affect_measured_iters = bool(
+        runtime_state_before_timing.zero_lora_up_fast_path_active_count > 0 and args.warmup == 0
+    )
     x, target = make_inputs(args, dtype)
 
     with torch.no_grad():
@@ -316,6 +321,7 @@ def run_record(
     y, loss = train_step(result.model, x, target, optimizer)
     torch.cuda.synchronize()
     post_step_cache_summary = fp4_lora_cache_summary(result.model)
+    runtime_state_after_final_step = fp4_lora_runtime_state_summary(result.model)
 
     fp4_modules = dict(iter_fp4_lora_modules(result.model))
     all_module_backends_match = all(
@@ -370,6 +376,16 @@ def run_record(
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_summary": asdict(result.cache_summary),
         "post_step_cache_summary": asdict(post_step_cache_summary),
+        "runtime_state_before_timing": asdict(runtime_state_before_timing),
+        "runtime_state_after_final_step": asdict(runtime_state_after_final_step),
+        "timing_context": {
+            "warmup": int(args.warmup),
+            "iters": int(args.iters),
+            "zero_lora_up_fast_path_active_at_timing_entry": int(
+                runtime_state_before_timing.zero_lora_up_fast_path_active_count
+            ),
+            "zero_lora_up_fast_path_can_affect_measured_iters": zero_up_can_affect_measured_iters,
+        },
         "cache_hook_refresh_count": cache_hook_count,
         "cache_hook_forward_refresh_count": cache_hook_forward_count,
         "cache_hook_dx_refresh_count": cache_hook_dx_count,
@@ -485,6 +501,8 @@ def _summary_row(record: dict[str, Any], dense_lora: dict[str, Any] | None = Non
     initial_rel_l2 = float(record["initial_forward_vs_dense"]["rel_l2"])
     cache_summary = record.get("cache_summary", {})
     post_step_cache_summary = record.get("post_step_cache_summary", cache_summary)
+    runtime_state = record.get("runtime_state_before_timing", {})
+    timing_context = record.get("timing_context", {})
     row = {
         "record": record["record"],
         "mode": record.get("mode", "dense_lora"),
@@ -501,6 +519,15 @@ def _summary_row(record: dict[str, Any], dense_lora: dict[str, Any] | None = Non
         "total_cache_vs_dense_weight": post_step_cache_summary.get("total_cache_vs_dense_weight"),
         "fp4_activation_cache_d_lora_down": bool(
             record.get("config", {}).get("fp4_activation_cache_d_lora_down", False)
+        ),
+        "zero_lora_up_fast_path_active_count": int(
+            runtime_state.get("zero_lora_up_fast_path_active_count", 0)
+        ),
+        "zero_lora_up_fast_path_masked_reuse_dy_up_count": int(
+            runtime_state.get("zero_lora_up_fast_path_masked_reuse_dy_up_count", 0)
+        ),
+        "zero_lora_up_fast_path_can_affect_measured_iters": bool(
+            timing_context.get("zero_lora_up_fast_path_can_affect_measured_iters", False)
         ),
         "fuse_lowrank_forward": bool(record.get("config", {}).get("fuse_lowrank_forward", False)),
         "overlap_lora_grad": bool(record.get("config", {}).get("overlap_lora_grad", False)),

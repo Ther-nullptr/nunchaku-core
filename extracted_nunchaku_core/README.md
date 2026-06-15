@@ -1327,6 +1327,10 @@ python benchmarks/benchmark_hf_llama_fp4_lora_policy_sweep.py \
 - `records.<policy>.fp4_module_configs.*.requested_rank`
 - `records.<policy>.fp4_module_configs.*.requested_frozen_residual_rank`
 - `records.<policy>.excluded_selected_modules`
+- `policy_summary.records_by_train_step_ms`
+- `policy_summary.pareto_frontier`
+
+如果要在同一 outlier policy 内直接比较 BF16/FP16 `dy_up` 复用，追加 `--include-reuse-policies`。该选项会为 `fp4_balanced` 或 `fp4_throughput` 下的每个 FP4 policy 增加 `<policy>_reuse_dy_up` 记录，例如 `fp4_base_reuse_dy_up`，并要求 `--dtype` 与 `--lowrank-dtype` 一致。不要同时使用全局 `--reuse-fused-dy-up-for-d-lora-down`，否则 base/reuse 不再是可比较的成对消融。
 
 最小 smoke 测试可以只替换第 0 层 `q_proj`，并把输出写到 `/tmp`，避免污染仓库结果：
 

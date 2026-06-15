@@ -170,7 +170,7 @@ model = prepared.model
 
 `benchmark_hf_llama_fp4_lora_init_sweep.py` 复用真实 HF/LLaMA + WikiText-2 加载和 `prepare_fp4_lora_finetuning` 路径，在同一批 token 上比较 `--inits zero pissa residual_svd` 等初始化策略；输出 `latest_hf_llama_fp4_lora_init_sweep.json`，并为每个 init 记录初始 logits 误差、train-step latency、峰值显存、post-step steady-state cache 和相对 zero-init 的比值。`init_summary` 使用同一套排序/Pareto 逻辑汇总不同 init。
 
-追加 `--include-reuse-policies` 后，TinyTransformer prepare benchmark 和真实 HF/LLaMA benchmark 都会为已请求的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
+追加 `--include-reuse-policies` 后，TinyTransformer prepare benchmark 和真实 HF/LLaMA benchmark 都会为已请求的 `balanced/throughput` preset 增加 `*_reuse_dy_up` 记录，并在 JSON 中写出 `reuse_fused_dy_up_for_d_lora_down`。HF outlier policy sweep 也支持同一开关：它会为每个 FP4 policy 增加 `<policy>_reuse_dy_up` 记录，例如 `fp4_base_reuse_dy_up`，并在 `policy_summary` 中统一排序。该策略要求 `dtype == lowrank_dtype`；如果 frozen residual 开启，高层 config 会自动关闭 reuse-based overlap，避免当前不支持的 frozen-residual overlap 组合。需要看 reuse+overlap 上限时应同时使用 `--no-frozen-residual`。RTX 5090 短测显示，TinyTransformer 小 M 形状下 `balanced_reuse_dy_up` 相对 `balanced` 为 `0.968x`，而 4096 单层 kernel benchmark 中 BF16 reuse/reuse+overlap 分别为 `1.014x/1.032x`，因此该项是形状相关的 opt-in 消融，不作为默认 preset。
 
 Adapter checkpoint 示例：
 

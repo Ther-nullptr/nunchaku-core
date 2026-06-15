@@ -22,6 +22,11 @@ from benchmark_hf_llama_fp4_lora_finetuning import (  # noqa: E402
     DEFAULT_MODEL_ID,
     DEFAULT_FP4_LORA_TARGET_MODULES,
     FP4_LORA_TARGET_POLICY_MODULES,
+    INCLUDE_REUSE_VARIANTS,
+    REUSE_DY_UP_VARIANTS,
+    _is_summary_row_dominated,
+    _summary_accuracy_metric,
+    _summary_row,
     build_batch_from_stream,
     dtype_from_name,
     effective_exclude_modules,
@@ -102,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-gradient-checkpointing", action="store_true")
     parser.add_argument("--backward-weight-policy", choices=["repack", "cache"], default="repack")
     parser.add_argument("--reuse-fused-dy-up-for-d-lora-down", action="store_true")
+    parser.add_argument("--include-reuse-policies", action="store_true")
     parser.add_argument("--overlap-lora-grad-min-rows", type=int, default=4096)
     parser.add_argument("--fp4-activation-cache-min-rows", type=int, default=0)
     parser.add_argument("--fp4-activation-cache-d-lora-down-backend", choices=["fused", "dequant_gemm"], default="fused")
@@ -168,12 +174,35 @@ def policy_args(base_args: argparse.Namespace, policy: str) -> argparse.Namespac
     return args
 
 
-def policy_metadata(args: argparse.Namespace, policy: str) -> dict[str, Any]:
+def policy_record_plan(
+    policies: list[str],
+    fp4_variant: str,
+    *,
+    include_reuse_policies: bool,
+) -> list[tuple[str, str, str | None]]:
+    plan: list[tuple[str, str, str | None]] = []
+    reuse_variant = INCLUDE_REUSE_VARIANTS.get(fp4_variant) if include_reuse_policies else None
+    for policy in policies:
+        if policy == "dense_lora":
+            plan.append(("dense_lora", policy, None))
+            continue
+        plan.append((policy, policy, fp4_variant))
+        if reuse_variant is not None:
+            plan.append((f"{policy}_reuse_dy_up", policy, reuse_variant))
+    return plan
+
+
+def policy_metadata(args: argparse.Namespace, policy: str, fp4_variant: str | None = None) -> dict[str, Any]:
     if policy == "dense_lora":
         return {"dense_lora_baseline": True}
     p_args = policy_args(args, policy)
+    variant = fp4_variant or args.fp4_variant
     return {
-        "fp4_variant": args.fp4_variant,
+        "fp4_variant": variant,
+        "base_fp4_variant": REUSE_DY_UP_VARIANTS.get(variant, variant),
+        "reuse_fused_dy_up_for_d_lora_down": bool(
+            p_args.reuse_fused_dy_up_for_d_lora_down or variant in REUSE_DY_UP_VARIANTS
+        ),
         "init": p_args.init,
         "outlier_report": p_args.outlier_report,
         "outlier_bump_task_rank": not p_args.outlier_no_task_rank_bump,
@@ -187,6 +216,37 @@ def policy_metadata(args: argparse.Namespace, policy: str) -> dict[str, Any]:
         "outlier_disable_fuse_frozen_residual_dx": p_args.outlier_disable_fuse_frozen_residual_dx,
         "sensitivity_disable_fuse_frozen_residual_dx": p_args.sensitivity_disable_fuse_frozen_residual_dx,
         "fp4_activation_cache_min_rows": p_args.fp4_activation_cache_min_rows,
+    }
+
+
+def build_policy_summary(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for record_name, record in records.items():
+        row = _summary_row(record_name, record)
+        row["policy"] = record.get("policy")
+        row["policy_record"] = record.get("policy_record", record_name)
+        row["outlier_policy"] = record.get("outlier_policy")
+        rows.append(row)
+
+    dense_rows = [row for row in rows if row["record"] == "dense_lora" or row["variant"] == "dense_lora"]
+    fp4_rows = [row for row in rows if row not in dense_rows]
+    pareto_rows = [
+        row
+        for row in fp4_rows
+        if not any(_is_summary_row_dominated(row, other) for other in fp4_rows if other["record"] != row["record"])
+    ]
+    return {
+        "dense_lora": dense_rows[0] if dense_rows else None,
+        "records_by_train_step_ms": sorted(fp4_rows, key=lambda row: row["train_step_ms"]),
+        "records_by_peak_delta_bytes": sorted(fp4_rows, key=lambda row: row["peak_delta_bytes"]),
+        "records_by_accuracy_metric": sorted(
+            fp4_rows,
+            key=lambda row: (_summary_accuracy_metric(row), row["train_step_ms"]),
+        ),
+        "pareto_frontier": sorted(
+            pareto_rows,
+            key=lambda row: (row["train_step_ms"], row["peak_delta_bytes"], _summary_accuracy_metric(row)),
+        ),
     }
 
 
@@ -243,6 +303,10 @@ def main() -> None:
         raise ValueError("--warmup and --prime-steps must be non-negative")
 
     policies = list(dict.fromkeys(args.policies))
+    if args.include_reuse_policies and args.reuse_fused_dy_up_for_d_lora_down:
+        raise ValueError("--include-reuse-policies should not be combined with global --reuse-fused-dy-up-for-d-lora-down")
+    if args.include_reuse_policies and args.fp4_variant not in INCLUDE_REUSE_VARIANTS:
+        raise ValueError("--include-reuse-policies only supports fp4_balanced or fp4_throughput")
     torch.manual_seed(args.seed)
     os.makedirs(args.results_dir, exist_ok=True)
 
@@ -252,6 +316,8 @@ def main() -> None:
     model_dir = ensure_model_downloaded(args.model_id, args.model_dir)
     dtype = dtype_from_name(args.dtype)
     lowrank_dtype = dtype_from_name(args.lowrank_dtype)
+    if args.include_reuse_policies and dtype != lowrank_dtype:
+        raise ValueError("--include-reuse-policies requires --dtype to match --lowrank-dtype")
 
     tokenizer = load_tokenizer(model_dir)
     token_stream = load_wikitext_token_stream(
@@ -267,6 +333,11 @@ def main() -> None:
         batch_size=args.batch_size,
         offset_tokens=args.dataset_offset_tokens,
     )
+    record_plan = policy_record_plan(
+        policies,
+        args.fp4_variant,
+        include_reuse_policies=args.include_reuse_policies,
+    )
 
     results: dict[str, Any] = {
         "experiment": "hf_causal_lm_fp4_lora_outlier_policy_sweep",
@@ -278,7 +349,14 @@ def main() -> None:
         "lora_alpha": args.lora_alpha,
         "fp4_variant": args.fp4_variant,
         "policies_requested": policies,
-        "policy_metadata": {policy: policy_metadata(args, policy) for policy in policies},
+        "policy_records_requested": [
+            {"record": record_name, "policy": policy, "fp4_variant": variant}
+            for record_name, policy, variant in record_plan
+        ],
+        "policy_metadata": {
+            record_name: policy_metadata(args, policy, variant)
+            for record_name, policy, variant in record_plan
+        },
         "selection": {
             "target_policy": args.target_policy,
             "target_modules": args.target_modules,
@@ -321,6 +399,7 @@ def main() -> None:
             "activation_checkpoint": args.activation_checkpoint,
             "backward_weight_policy": args.backward_weight_policy,
             "reuse_fused_dy_up_for_d_lora_down": args.reuse_fused_dy_up_for_d_lora_down,
+            "include_reuse_policies": args.include_reuse_policies,
             "overlap_lora_grad_min_rows": args.overlap_lora_grad_min_rows,
             "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
@@ -355,13 +434,15 @@ def main() -> None:
         dense_latency_ms = dense_record["latency_ms"]["train_step_with_optimizer"]
         dense_peak_delta = dense_record["peak_memory_bytes"]["train_step_delta"]
 
-    for policy in policies:
+    for record_name, policy, variant in record_plan:
         if policy == "dense_lora":
             continue
+        if variant is None:
+            raise RuntimeError(f"Missing FP4 variant for policy record {record_name}")
         p_args = policy_args(args, policy)
         record = run_fp4_variant(
             p_args,
-            variant=args.fp4_variant,
+            variant=variant,
             model_dir=model_dir,
             dtype=dtype,
             lowrank_dtype=lowrank_dtype,
@@ -371,12 +452,14 @@ def main() -> None:
             dense_peak_delta=dense_peak_delta,
         )
         record["policy"] = policy
-        record["fp4_variant"] = args.fp4_variant
-        record["outlier_policy"] = policy_metadata(args, policy)
-        results["records"][policy] = record
+        record["policy_record"] = record_name
+        record["fp4_variant"] = variant
+        record["outlier_policy"] = policy_metadata(args, policy, variant)
+        results["records"][record_name] = record
 
     add_relative_to_base(results)
     results["all_passed"] = bool(all(record["all_passed"] for record in results["records"].values()))
+    results["policy_summary"] = build_policy_summary(results["records"])
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(args.results_dir, f"hf_llama_fp4_lora_policy_sweep_{stamp}.json")

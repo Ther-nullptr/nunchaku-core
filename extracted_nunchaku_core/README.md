@@ -897,7 +897,7 @@ python benchmarks/benchmark_fp4_lora_prepare_policies.py \
   --iters 5
 ```
 
-输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `config.init`、`latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`cache_summary.total_cache_bytes`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。`strategy_summary` 会额外给出按 train step、峰值显存、初始 forward rel_l2 排序的简表，以及三指标 Pareto frontier，便于直接选择速度/显存/精度策略。要对比 QPiSSA-style 初始化，改用 `--init pissa`。
+输出 `results/latest_fp4_lora_prepare_policies.json`，默认比较 dense LoRA baseline 与 `accuracy/balanced/throughput/memory_saving_fused/memory_saving_dequant_gemm`，并报告每个 FP4 preset 的 `config.init`、`latency_ms.train_step_with_optimizer`、`throughput.samples_per_second`、`peak_memory_bytes.train_step_delta`、`cache_summary.total_cache_bytes`、`post_step_cache_summary.total_cache_bytes`、`initial_forward_vs_dense`、相对 `balanced` 的 speedup 和 `relative_to_dense_lora.train_step_speedup`。`cache_summary` 是 prepare 后/首步前的 resident cache；`post_step_cache_summary` 是 optimizer step 后的 steady-state resident cache。`strategy_summary` 会额外给出按 train step、峰值显存、初始 forward rel_l2 排序的简表，以及三指标 Pareto frontier；其中 `total_cache_bytes` 使用 steady-state cache，便于直接选择速度/显存/精度策略。要对比 QPiSSA-style 初始化，改用 `--init pissa`。
 
 真实 LLaMA/WikiText-2 训练 step benchmark 使用：
 
@@ -991,6 +991,7 @@ python benchmarks/benchmark_hf_llama_fp4_lora_finetuning.py \
 - `records.fp4_balanced.relative_to_dense_lora.train_step_speedup`
 - `records.fp4_balanced.peak_memory_bytes.train_step_delta`
 - `records.fp4_balanced.cache_summary.total_cache_bytes`
+- `records.fp4_balanced.post_step_cache_summary.total_cache_bytes`
 - `records.fp4_balanced.initial_logits_vs_dense_lora`
 - `records.*.selected_modules`
 - `records.*.excluded_selected_modules`

@@ -22,6 +22,7 @@ from native_fp4 import (  # noqa: E402
     DEFAULT_FP4_LORA_TARGET_MODULES,
     FP4_LORA_TARGET_POLICY_MODULES,
     FP4LoRAConfig,
+    fp4_lora_cache_summary,
     fp4_lora_target_modules_for_policy,
     iter_fp4_lora_modules,
     prepare_fp4_lora_finetuning,
@@ -698,6 +699,8 @@ def run_fp4_variant(
     latency_ms = time_cuda(fn, warmup=args.warmup, iters=args.iters)
     peak_delta, peak_baseline, peak = measure_peak_delta(fn)
     final_loss = train_step(result.model, batch, optimizer)
+    torch.cuda.synchronize()
+    post_step_cache_summary = fp4_lora_cache_summary(result.model)
 
     fp4_modules = dict(iter_fp4_lora_modules(result.model))
     grads_finite = all(
@@ -757,6 +760,7 @@ def run_fp4_variant(
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_summary": asdict(result.cache_summary),
+        "post_step_cache_summary": asdict(post_step_cache_summary),
         "cache_hook_refresh_count": cache_hook_count,
         "cache_hook_forward_refresh_count": cache_hook_forward_count,
         "cache_hook_dx_refresh_count": cache_hook_dx_count,

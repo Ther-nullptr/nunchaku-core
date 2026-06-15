@@ -15,7 +15,12 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from native_fp4 import FP4LoRAConfig, iter_fp4_lora_modules, prepare_fp4_lora_finetuning  # noqa: E402
+from native_fp4 import (  # noqa: E402
+    FP4LoRAConfig,
+    fp4_lora_cache_summary,
+    iter_fp4_lora_modules,
+    prepare_fp4_lora_finetuning,
+)
 
 
 MODES = ("accuracy", "balanced", "throughput", "memory_saving")
@@ -310,6 +315,7 @@ def run_record(
     peak_delta, peak_baseline, peak = measure_peak_delta(fn)
     y, loss = train_step(result.model, x, target, optimizer)
     torch.cuda.synchronize()
+    post_step_cache_summary = fp4_lora_cache_summary(result.model)
 
     fp4_modules = dict(iter_fp4_lora_modules(result.model))
     all_module_backends_match = all(
@@ -363,6 +369,7 @@ def run_record(
         "refreshed_cache_count": result.refreshed_cache_count,
         "refreshed_backward_weight_count": result.refreshed_backward_weight_count,
         "cache_summary": asdict(result.cache_summary),
+        "post_step_cache_summary": asdict(post_step_cache_summary),
         "cache_hook_refresh_count": cache_hook_count,
         "cache_hook_forward_refresh_count": cache_hook_forward_count,
         "cache_hook_dx_refresh_count": cache_hook_dx_count,
@@ -477,6 +484,7 @@ def _summary_row(record: dict[str, Any], dense_lora: dict[str, Any] | None = Non
     peak_delta = int(record["peak_memory_bytes"]["train_step_delta"])
     initial_rel_l2 = float(record["initial_forward_vs_dense"]["rel_l2"])
     cache_summary = record.get("cache_summary", {})
+    post_step_cache_summary = record.get("post_step_cache_summary", cache_summary)
     row = {
         "record": record["record"],
         "mode": record.get("mode", "dense_lora"),
@@ -485,8 +493,12 @@ def _summary_row(record: dict[str, Any], dense_lora: dict[str, Any] | None = Non
         "train_step_ms": latency_ms,
         "peak_delta_bytes": peak_delta,
         "initial_forward_rel_l2": initial_rel_l2,
-        "total_cache_bytes": int(cache_summary.get("total_cache_bytes", 0)),
-        "total_cache_vs_dense_weight": cache_summary.get("total_cache_vs_dense_weight"),
+        "initial_total_cache_bytes": int(cache_summary.get("total_cache_bytes", 0)),
+        "initial_total_cache_vs_dense_weight": cache_summary.get("total_cache_vs_dense_weight"),
+        "steady_state_total_cache_bytes": int(post_step_cache_summary.get("total_cache_bytes", 0)),
+        "steady_state_total_cache_vs_dense_weight": post_step_cache_summary.get("total_cache_vs_dense_weight"),
+        "total_cache_bytes": int(post_step_cache_summary.get("total_cache_bytes", 0)),
+        "total_cache_vs_dense_weight": post_step_cache_summary.get("total_cache_vs_dense_weight"),
         "fp4_activation_cache_d_lora_down": bool(
             record.get("config", {}).get("fp4_activation_cache_d_lora_down", False)
         ),

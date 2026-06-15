@@ -258,10 +258,16 @@ class _FP4LoRALinearFunction(torch.autograd.Function):
         else:
             saved_lora_act = torch.empty(0, device=x.device, dtype=lowrank_dtype)
         saved_x = torch.empty(0, device=x.device, dtype=x.dtype) if use_fp4_act_cache else x
+        if use_fp4_act_cache and lora_up_zero_fast_path_active:
+            saved_qact = torch.empty(0, device=x.device, dtype=torch.uint8)
+            saved_ascales = torch.empty(0, device=x.device, dtype=torch.float8_e4m3fn)
+        else:
+            saved_qact = qact
+            saved_ascales = ascales
         ctx.save_for_backward(
             saved_x,
-            qact,
-            ascales,
+            saved_qact,
+            saved_ascales,
             lora_down,
             lora_up,
             frozen_residual_down,

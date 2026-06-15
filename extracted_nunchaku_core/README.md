@@ -470,7 +470,7 @@ FP4 activation-cache `dA` 接入训练接口后的 BF16 短测，`fuse_lora_dx=T
 - `fuse_lora_dx=True` 会把 `dX_lora = (dY @ B) @ A` 的第二段并入 FP4 dX epilogue，但 LoRA 参数梯度仍用 dense BF16/FP16 matmul 保精度。
 - `fuse_lowrank_forward=True` 是 opt-in forward 消融选项：当 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable task LoRA 和可选 frozen residual forward 一起并入 FP4 主分支；zero-init 首步 fast path 仍会跳过 task LoRA，并把 residual 保留为 dense side branch。验证脚本用 `native_fused_forward` 标记原生路径；BF16 task-only rel_l2 约 `1.5e-4`，BF16 task+frozen-residual rel_l2 约 `2.8e-3`，后者定位为 throughput 近似快路径。默认关闭。
 - `cache_fused_lora_dx=True` 只缓存 LoRA packed A/B，不缓存第二份 FP4 backbone；参数 version 变化时会自动刷新。
-- `zero_lora_up_fast_path=True` 是默认开启的 zero-init 首步优化：当 `init="zero"` 且 `lora_up` 的版本仍等于初始化后的零张量版本时，forward 跳过 LoRA out / native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只保留 `dB=dY.T@(x@A.T)`；同时初始 `refresh_fused_lora_forward_caches/refresh_fused_lora_dx_caches` 不生成 packed LoRA cache。`optimizer.step()` 或 adapter load 改变 `lora_up` 后该 fast path 自动失效，post-step hook 再刷新 packed cache。若 `overlap_lora_grad=True` 且行数达到门槛，zero-up backward 会把 FP4 main dX、`dB` 和可选 residual dX 放到多 stream 并行。
+- `zero_lora_up_fast_path=True` 是默认开启的 zero-init 首步优化：当 `init="zero"` 且 `lora_up` 的版本仍等于初始化后的零张量版本时，forward 跳过 LoRA out / native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只保留 `dB=dY.T@(x@A.T)`；同时初始 `refresh_fused_lora_forward_caches/refresh_fused_lora_dx_caches` 不生成 packed LoRA cache。若同时打开 `fp4_activation_cache_d_lora_down=True`，zero-up 首步也不会把 `qact/ascales` 存进 autograd context，因为 backward 不需要近似 `dA`。`optimizer.step()` 或 adapter load 改变 `lora_up` 后该 fast path 自动失效，post-step hook 再刷新 packed cache。若 `overlap_lora_grad=True` 且行数达到门槛，zero-up backward 会把 FP4 main dX、`dB` 和可选 residual dX 放到多 stream 并行。
 - `init="pissa"` 是 QPiSSA 风格初始化：LoRA 保存 `W0` 的 principal SVD component，FP4 backbone 则量化 `W0 - BA`。它用于精度/收敛实验；若同时打开 fused LoRA dX，需要把 `dX` 视作 throughput 近似路径。
 - `backward_weight_policy="repack"` 是默认策略：每次 backward transient repack 出 `W^T` 的 packed FP4 权重，只预存转置后的 scale，不额外常驻第二份 backbone。`"cache"` 是显式 opt-in：常驻一份 compressed backward qweight，用显存换掉 repack 开销。RTX 5090 4096/rank32 BF16 短测中，cache train step 相对 repack 为 `1.056x`，4-step accumulation 为 `1.050x`；额外 qweight 为 dense BF16 权重的 `25%`、forward qweight 的 `1.0x`。
 - `fp4_activation_cache_d_lora_down=True` 是显存/近似训练模式：forward 保存主分支已有的 `qact + ascales` 而不是 BF16/FP16 `x`。`fp4_activation_cache_min_rows=0` 是默认兼容行为，表示启用后所有 row 数都走 FP4 cache；设成如 `4096` 后，flattened row 数低于阈值时自动回落 exact saved-x `dA`，适合让长序列/prefill 省显存、短序列/decode 保持精度和低开销。`fp4_activation_cache_d_lora_down_backend="fused"` 是默认值，直接用 fused CUDA kernel 从 FP4 cache 算 `dA`，避免 backward 临时物化 dense `x_hat`；`"dequant_gemm"` 会先反量化出 dense `x_hat` 再走 torch GEMM，通常更快但有额外 transient 显存。该模式要求 `cache_lora_act=True`，当前不支持 `overlap_lora_grad` 或 `reuse_fused_dy_up_for_d_lora_down`。
@@ -1495,7 +1495,7 @@ python benchmarks/benchmark_fp4_lora_saved_tensors.py \
   --iters 10
 ```
 
-可选加 `--fp4-activation-cache-d-lora-down-backend dequant_gemm` 测“临时物化 dense `x_hat` + GEMM”的训练 wrapper 开销；默认 `fused` 测最低 transient memory 路径。可选加 `--fp4-activation-cache-min-rows 4096` 测小 row 数自动回 exact saved-x 的门控行为。
+可选加 `--fp4-activation-cache-d-lora-down-backend dequant_gemm` 测“临时物化 dense `x_hat` + GEMM”的训练 wrapper 开销；默认 `fused` 测最低 transient memory 路径。可选加 `--fp4-activation-cache-min-rows 4096` 测小 row 数自动回 exact saved-x 的门控行为。可选加 `--init zero` 验证 zero-up fast path 不保存 `qact/ascales`。
 
 输出：
 
@@ -1509,6 +1509,9 @@ python benchmarks/benchmark_fp4_lora_saved_tensors.py \
 - `saved_bytes.all_saved_tensors_reduction`
 - `speedups.fp4_activation_cache_d_lora_down_vs_exact_cached_pack`
 - `errors.d_lora_down_vs_exact`
+- `checks.zero_up_does_not_save_qact_when_active`
+- `checks.zero_up_does_not_save_ascales_when_active`
+- `all_passed`
 
 这个脚本用 `torch.autograd.graph.saved_tensors_hooks` 只包住 `module(x)`，直接检查 `_FP4LoRALinearFunction` 的 `ctx.save_for_backward`，不会把 loss backward 的额外临时保存算进去。
 

@@ -245,7 +245,7 @@ optimizer 边界：
 - `cache_lora_act`：是否保存 forward 的 `x @ A.T`，避免 backward 计算 `dB` 时重算。
 - `activation_checkpoint`：逐 `NunchakuFP4LoRALinear` 的局部 checkpoint。它只省该算子内部 saved tensors；要显著降低多层输入 activation，应该在 transformer block/segment 外层做 checkpoint。
 - `fuse_lowrank_forward`：opt-in forward 消融选项。当 `lowrank_dtype == weight dtype` 时走 Nunchaku 原生 `quantize_w4a4_act_fuse_lora + gemm_w4a4` low-rank epilogue，把 trainable task LoRA forward 并入 FP4 主分支；有 frozen residual 时，residual 仍作为 dense side branch 追加。该路径会改变低秩分支的累加/量化侧调度，验证脚本用 `native_fused_forward` 标记并用 `5e-4` rel_l2 tolerance 报告相对当前 BF16/FP16 调度公式的差异；默认关闭。
-- `zero_lora_up_fast_path`：默认开启的 zero-init 首步优化。仅当 `init="zero"` 后 `lora_up` 的 parameter version 仍匹配初始化零张量时触发；forward 跳过 LoRA out/native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只计算 `dB=dY.T@(x@A.T)`。初始 cache refresh 不生成 packed LoRA forward/dX cache；`optimizer.step()` 或 adapter load 改变版本后自动回到常规路径。若 `overlap_lora_grad=True` 且行数达到门槛，则 zero-up backward 会把 FP4 main dX、`dB` 和可选 frozen residual dX 分流到多 CUDA stream。
+- `zero_lora_up_fast_path`：默认开启的 zero-init 首步优化。仅当 `init="zero"` 后 `lora_up` 的 parameter version 仍匹配初始化零张量时触发；forward 跳过 LoRA out/native low-rank epilogue，backward 跳过 LoRA dX 和 `dA`，只计算 `dB=dY.T@(x@A.T)`。初始 cache refresh 不生成 packed LoRA forward/dX cache；若同时使用 FP4 activation cache，首步也不把 `qact/ascales` 存进 autograd context。`optimizer.step()` 或 adapter load 改变版本后自动回到常规路径。若 `overlap_lora_grad=True` 且行数达到门槛，则 zero-up backward 会把 FP4 main dX、`dB` 和可选 frozen residual dX 分流到多 CUDA stream。
 - `fuse_frozen_residual_dx`：FP16-only 实验选项，把 task LoRA 和 frozen residual 的 dX 合并为同一个 packed low-rank epilogue。BF16 下同一路径目前 `dX` rel_l2 约 `2.1e-3`，不作为默认。
 - `target_policy/target_modules/exclude_modules/config_overrides`：模型级替换时用于控制哪些 Linear 进入 FP4 LoRA，以及每个 projection 的 rank/init/fusion/residual 策略。
 
@@ -495,8 +495,8 @@ RTX 5090 短测，`benchmark_fp4_lora_activation_checkpoint.py --batch 512 --hid
 - 新增 `native_fp4.fp4_activation_cache_lora_down_grad(qact, ascales, dy_up, in_features)`；CUDA kernel 直接从 native FP4 activation cache 计算 `dA`，避免 backward 物化 dense `x_hat`。
 - `NunchakuFP4LoRALinear(..., fp4_activation_cache_d_lora_down_backend=...)` 已支持 `"fused"` 与 `"dequant_gemm"` 两种 backend；`FP4LoRAConfig`、`fp4_lora_finetune_config` 和 `prepare_fp4_lora_finetuning` 同步暴露该字段。
 - 新增 `benchmark_fp4_lora_activation_cache_policy.py`，比较 saved BF16/FP16 `x` 与 FP4 activation cache 对 `dA` 的显存、速度和精度影响。
-- 新增 `benchmark_fp4_lora_saved_tensors.py`，用 `torch.autograd.graph.saved_tensors_hooks` 直接检查训练 wrapper 的 autograd context，确认 `fp4_activation_cache_d_lora_down=True` 不再保存 BF16/FP16 `x`。
-- `NunchakuFP4LoRALinear(fp4_activation_cache_d_lora_down=True)` 已接入该模式：forward 不把 BF16/FP16 `x` 存入 autograd context，而是保存 `qact + ascales`；`dB` 仍依赖 `cache_lora_act=True` 保存的 LoRA activation。`fp4_activation_cache_min_rows` 可在运行时按 row 数门控，小 row 数自动保存原始 `x` 并走 exact `dA`。
+- 新增 `benchmark_fp4_lora_saved_tensors.py`，用 `torch.autograd.graph.saved_tensors_hooks` 直接检查训练 wrapper 的 autograd context，确认 `fp4_activation_cache_d_lora_down=True` 不再保存 BF16/FP16 `x`，并用 `--init zero` 覆盖 zero-up 首步不保存 `qact/ascales` 的路径。
+- `NunchakuFP4LoRALinear(fp4_activation_cache_d_lora_down=True)` 已接入该模式：非 zero-up forward 不把 BF16/FP16 `x` 存入 autograd context，而是保存 `qact + ascales`；zero-up 首步因为不计算 `dA`，只保存 `lora_act` 而不保存 `qact/ascales`。`dB` 仍依赖 `cache_lora_act=True` 保存的 LoRA activation。`fp4_activation_cache_min_rows` 可在运行时按 row 数门控，小 row 数自动保存原始 `x` 并走 exact `dA`。
 
 RTX 5090 BF16 短测：
 

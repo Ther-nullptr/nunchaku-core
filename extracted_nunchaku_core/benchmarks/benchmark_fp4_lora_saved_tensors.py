@@ -112,12 +112,21 @@ def summarize_saved(records: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def saved_bytes_by_name(records: list[dict[str, Any]]) -> dict[str, int]:
+    return {record["name"]: int(record["bytes"]) for record in records}
+
+
+def safe_ratio(numerator: int | float, denominator: int | float) -> float | None:
+    return None if denominator == 0 else float(numerator) / float(denominator)
+
+
 def make_module(
     weight: torch.Tensor,
     bias: torch.Tensor,
     rank: int,
     lowrank_dtype: torch.dtype,
     fp4_activation_cache_d_lora_down: bool,
+    init: str,
     fp4_activation_cache_min_rows: int = 0,
     fp4_activation_cache_d_lora_down_backend: str = "fused",
 ) -> NunchakuFP4LoRALinear:
@@ -126,7 +135,7 @@ def make_module(
         bias=bias,
         rank=rank,
         lowrank_dtype=lowrank_dtype,
-        init="gaussian",
+        init=init,
         cache_lora_act=True,
         fuse_lora_dx=True,
         cache_fused_lora_dx=True,
@@ -140,6 +149,8 @@ def sync_lora(dst: NunchakuFP4LoRALinear, src: NunchakuFP4LoRALinear) -> None:
     with torch.no_grad():
         dst.lora_down.copy_(src.lora_down)
         dst.lora_up.copy_(src.lora_up)
+    if dst.init_mode == "zero" and src.init_mode == "zero":
+        dst.mark_lora_up_zero_fast_path()
     dst.clear_fused_lora_dx_cache()
     dst.refresh_fused_lora_dx_cache()
 
@@ -172,6 +183,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     p.add_argument("--lowrank-dtype", choices=["fp16", "bf16"], default="bf16")
+    p.add_argument("--init", choices=["zero", "gaussian"], default="gaussian")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
@@ -194,13 +206,21 @@ def main() -> None:
     weight = torch.randn(args.out_features, args.in_features, device="cuda", dtype=dtype)
     bias = torch.randn(args.out_features, device="cuda", dtype=dtype)
 
-    exact = make_module(weight, bias, args.rank, lowrank_dtype, fp4_activation_cache_d_lora_down=False)
+    exact = make_module(
+        weight,
+        bias,
+        args.rank,
+        lowrank_dtype,
+        fp4_activation_cache_d_lora_down=False,
+        init=args.init,
+    )
     fp4_cache = make_module(
         weight,
         bias,
         args.rank,
         lowrank_dtype,
         fp4_activation_cache_d_lora_down=True,
+        init=args.init,
         fp4_activation_cache_min_rows=args.fp4_activation_cache_min_rows,
         fp4_activation_cache_d_lora_down_backend=args.fp4_activation_cache_d_lora_down_backend,
     )
@@ -211,6 +231,7 @@ def main() -> None:
     fp4_cache_saved = capture_saved_tensors(fp4_cache, x_base.detach().clone().requires_grad_(True), dy)
     exact_summary = summarize_saved(exact_saved)
     fp4_cache_summary = summarize_saved(fp4_cache_saved)
+    fp4_cache_saved_by_name = saved_bytes_by_name(fp4_cache_saved)
 
     exact_outputs = run_once(exact, x_base.detach().clone().requires_grad_(True), dy)
     fp4_cache_outputs = run_once(fp4_cache, x_base.detach().clone().requires_grad_(True), dy)
@@ -219,6 +240,35 @@ def main() -> None:
     x_fp4_cache_time = x_base.detach().clone().requires_grad_(True)
     exact_ms = time_cuda(lambda: train_step(exact, x_exact_time, dy), args.warmup, args.iters)
     fp4_cache_ms = time_cuda(lambda: train_step(fp4_cache, x_fp4_cache_time, dy), args.warmup, args.iters)
+    fp4_cache_active = bool(args.m >= args.fp4_activation_cache_min_rows)
+
+    errors = {
+        "forward_vs_exact": tensor_error(fp4_cache_outputs["y"], exact_outputs["y"]),
+        "dx_vs_exact": tensor_error(fp4_cache_outputs["dx"], exact_outputs["dx"]),
+        "d_lora_up_vs_exact": tensor_error(fp4_cache_outputs["d_lora_up"], exact_outputs["d_lora_up"]),
+        "d_lora_down_vs_exact": tensor_error(
+            fp4_cache_outputs["d_lora_down"],
+            exact_outputs["d_lora_down"],
+        ),
+    }
+    checks = {
+        "latency_positive": exact_ms > 0.0 and fp4_cache_ms > 0.0,
+        "saved_tensor_reduction_positive": fp4_cache_summary["activation_context"] > 0
+        and exact_summary["activation_context"] >= fp4_cache_summary["activation_context"],
+        "fp4_cache_does_not_save_x_when_active": (
+            (not fp4_cache_active) or fp4_cache_saved_by_name.get("saved_x", 0) == 0
+        ),
+        "zero_up_does_not_save_qact_when_active": (
+            args.init != "zero" or (not fp4_cache_active) or fp4_cache_saved_by_name.get("qact", 0) == 0
+        ),
+        "zero_up_does_not_save_ascales_when_active": (
+            args.init != "zero" or (not fp4_cache_active) or fp4_cache_saved_by_name.get("ascales", 0) == 0
+        ),
+        "forward_error_finite": bool(torch.isfinite(torch.tensor(errors["forward_vs_exact"]["rel_l2"]))),
+        "dx_error_finite": bool(torch.isfinite(torch.tensor(errors["dx_vs_exact"]["rel_l2"]))),
+        "d_lora_up_error_finite": bool(torch.isfinite(torch.tensor(errors["d_lora_up_vs_exact"]["rel_l2"]))),
+        "d_lora_down_error_finite": bool(torch.isfinite(torch.tensor(errors["d_lora_down_vs_exact"]["rel_l2"]))),
+    }
 
     payload = {
         "shape": {
@@ -229,8 +279,9 @@ def main() -> None:
             "effective_rank": exact.rank,
             "dtype": args.dtype,
             "lowrank_dtype": args.lowrank_dtype,
+            "init": args.init,
             "fp4_activation_cache_min_rows": args.fp4_activation_cache_min_rows,
-            "fp4_activation_cache_active_for_forward": bool(args.m >= args.fp4_activation_cache_min_rows),
+            "fp4_activation_cache_active_for_forward": fp4_cache_active,
             "fp4_activation_cache_d_lora_down_backend": args.fp4_activation_cache_d_lora_down_backend,
         },
         "saved_tensors": {
@@ -240,12 +291,18 @@ def main() -> None:
         "saved_bytes": {
             "exact_cached_pack": exact_summary,
             "fp4_activation_cache_d_lora_down": fp4_cache_summary,
-            "activation_context_reduction": exact_summary["activation_context"]
-            / fp4_cache_summary["activation_context"],
-            "x_or_fp4_cache_reduction": exact_summary["x_or_fp4_cache"]
-            / fp4_cache_summary["x_or_fp4_cache"],
-            "all_saved_tensors_reduction": exact_summary["all_saved_tensors"]
-            / fp4_cache_summary["all_saved_tensors"],
+            "activation_context_reduction": safe_ratio(
+                exact_summary["activation_context"],
+                fp4_cache_summary["activation_context"],
+            ),
+            "x_or_fp4_cache_reduction": safe_ratio(
+                exact_summary["x_or_fp4_cache"],
+                fp4_cache_summary["x_or_fp4_cache"],
+            ),
+            "all_saved_tensors_reduction": safe_ratio(
+                exact_summary["all_saved_tensors"],
+                fp4_cache_summary["all_saved_tensors"],
+            ),
         },
         "latency_ms": {
             "exact_cached_pack_train_step": exact_ms,
@@ -254,15 +311,9 @@ def main() -> None:
         "speedups": {
             "fp4_activation_cache_d_lora_down_vs_exact_cached_pack": exact_ms / fp4_cache_ms,
         },
-        "errors": {
-            "forward_vs_exact": tensor_error(fp4_cache_outputs["y"], exact_outputs["y"]),
-            "dx_vs_exact": tensor_error(fp4_cache_outputs["dx"], exact_outputs["dx"]),
-            "d_lora_up_vs_exact": tensor_error(fp4_cache_outputs["d_lora_up"], exact_outputs["d_lora_up"]),
-            "d_lora_down_vs_exact": tensor_error(
-                fp4_cache_outputs["d_lora_down"],
-                exact_outputs["d_lora_down"],
-            ),
-        },
+        "errors": errors,
+        "checks": checks,
+        "all_passed": bool(all(checks.values())),
     }
 
     print(json.dumps(payload, indent=2))
@@ -276,6 +327,8 @@ def main() -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
     print(f"Wrote {latest}")
+    if not payload["all_passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
